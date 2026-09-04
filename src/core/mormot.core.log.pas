@@ -1856,7 +1856,10 @@ type
     fArm64CPU: TArm64HwCaps;
     procedure SetLogProcMerged(const Value: boolean);
     function GetEventText(index: integer): RawUtf8;
-    function GetLogLevelFromText(LineBeg: PUtf8Char): TSynLogLevel;
+    function GetLogLevelFromText(LineBeg: PUtf8Char;
+      LevelOffset: PtrInt = 0): TSynLogLevel;
+      {$ifdef HASINLINE} inline; {$endif}
+    function GetLineTextOffset(Index: PtrInt): PtrInt;
       {$ifdef HASINLINE} inline; {$endif}
     /// retrieve headers + fLevels[] + fLogProcNatural[], and delete invalid fLines[]
     procedure LoadFromMap(AverageLineLength: integer = 32); override;
@@ -7461,10 +7464,31 @@ begin
   SetLength(fLogProcStackCount, 256);
 end;
 
-function TSynLogFile.GetLogLevelFromText(LineBeg: PUtf8Char): TSynLogLevel;
+function TSynLogFile.GetLogLevelFromText(LineBeg: PUtf8Char;
+  LevelOffset: PtrInt): TSynLogLevel;
 begin // very fast lookup, using SSE2 on Intel/AMD
+  if LevelOffset = 0 then
+    LevelOffset := fLineLevelOffset;
   result := TSynLogLevel(IntegerScanIndex(@fLogLevelsTextMap[succ(sllNone)],
-         ord(high(TSynLogLevel)), PCardinal(LineBeg + fLineLevelOffset)^) + 1);
+    ord(high(TSynLogLevel)), PCardinal(LineBeg + LevelOffset)^) + 1);
+end;
+
+function TSynLogFile.GetLineTextOffset(Index: PtrInt): PtrInt;
+var
+  line: PUtf8Char;
+begin
+  line := fLines[Index];
+  if line[8] = ' ' then
+  begin
+    result := 23; // YYYYMMDD HHMMSSXX + 7-char level
+    if line[17] = 'Z' then
+      inc(result); // TSynLogFamily.ZonedTimestamp
+  end
+  else
+    result := 22; // 16-char high-resolution timestamp + 7-char level
+  if (fThreads <> nil) and
+     (fThreads[Index] <> 0) then
+    inc(result, 3);
 end;
 
 function TSynLogFile.EventCount(const aSet: TSynLogLevels): integer;
@@ -7480,13 +7504,13 @@ end;
 
 function TSynLogFile.LineContains(const aUpperSearch: RawUtf8;
   aIndex: integer): boolean;
-begin // overriden to take fLineTextOffset into account
+begin // overridden to take the actual line text offset into account
   if (self = nil) or
      (cardinal(aIndex) >= cardinal(fCount)) or
      (aUpperSearch = '') then
     result := false
   else
-    result := GetLineContains(PUtf8Char(fLines[aIndex]) + fLineTextOffset,
+    result := GetLineContains(PUtf8Char(fLines[aIndex]) + GetLineTextOffset(aIndex),
       fMapEnd, pointer(aUpperSearch));
 end;
 
@@ -7926,10 +7950,14 @@ begin
 end;
 
 function TSynLogFile.LogProcSortCompByName(A, B: PtrInt): PtrInt;
+var
+  ia, ib: PtrInt;
 begin
+  ia := LogProc[A].Index;
+  ib := LogProc[B].Index;
   result := StrICompLeftTrim(
-    PUtf8Char(fLines[LogProc[A].Index]) + fLineTextOffset,
-    PUtf8Char(fLines[LogProc[B].Index]) + fLineTextOffset);
+    PUtf8Char(fLines[ia]) + GetLineTextOffset(ia),
+    PUtf8Char(fLines[ib]) + GetLineTextOffset(ib));
 end;
 
 function TSynLogFile.LogProcSortCompByOccurrence(A, B: PtrInt): PtrInt;
@@ -8005,9 +8033,11 @@ end;
 procedure TSynLogFile.ProcessOneLine(LineBeg, LineEnd: PUtf8Char);
 var
   thread: PtrUInt;
+  leveloffset: PtrInt;
   MS: integer;
   L: TSynLogLevel;
   p: PCardinalArray;
+  hasthread, lowres: boolean;
 begin
   inherited ProcessOneLine(LineBeg, LineEnd);
   if length(fLevels) < fLinesMax then
@@ -8015,49 +8045,69 @@ begin
   if (fCount <= fLineHeaderCountToIgnore) or
      (LineEnd - LineBeg < 24) then
     exit;
-  if fLineLevelOffset = 0 then // detect the line layout (once)
+  if (fLineLevelOffset = 0) and
+     ((fCount > 50) or
+      not (LineBeg[0] in ['0'..'9'])) then
+    exit; // definitively does not sound like a .log content
+  // Detect the layout for every row: a remote stream may mix LogView's own
+  // rows without a thread ID with TSynLog ptIdentifiedInOneFile rows.
+  lowres := LineBeg[8] = ' ';
+  if lowres then
   begin
-    if (fCount > 50) or
-       not (LineBeg[0] in ['0'..'9']) then
-      exit; // definitively does not sound like a .log content
-    if LineBeg[8] = ' ' then
-    begin
-      // YYYYMMDD HHMMSSXX[Z] is one/two chars bigger than Timestamp
-      fLineLevelOffset := 19;
-      if LineBeg[fLineLevelOffset] = 'Z' then
-        inc(fLineLevelOffset); // did have TSynLogFamily.ZonedTimestamp
-      fDayCurrent := PInt64(LineBeg)^;
-      AddInteger(fDayChangeIndex, fCount - 1);
-    end
+    // YYYYMMDD HHMMSSXX[Z] is one/two chars bigger than Timestamp
+    leveloffset := 19;
+    if LineBeg[leveloffset - 2] = 'Z' then
+      inc(leveloffset); // did have TSynLogFamily.ZonedTimestamp
+  end
+  else
+    leveloffset := 18;
+  hasthread := fThreads <> nil; // favor the already detected layout
+  if hasthread then
+    inc(leveloffset, 3);
+  L := GetLogLevelFromText(LineBeg, leveloffset);
+  if L = sllNone then
+  begin
+    if hasthread then
+      dec(leveloffset, 3)
     else
-      fLineLevelOffset := 18;
-    if (LineBeg[fLineLevelOffset] = '!') or // ! = thread 1
-       (GetLogLevelFromText(LineBeg) = sllNone) then // may be thread > 1
-    begin
-      inc(fLineLevelOffset, 3);
-      fThreadsCount := fLinesMax;
-      SetLength(fThreads, fLinesMax);
-    end;
-    fLineTextOffset := fLineLevelOffset + 4;
+      inc(leveloffset, 3);
+    hasthread := not hasthread;
+    L := GetLogLevelFromText(LineBeg, leveloffset);
   end;
-  L := GetLogLevelFromText(LineBeg);
   if L = sllNone then
     exit;
+  if fLineLevelOffset = 0 then // remember the first valid row layout
+  begin
+    fLineLevelOffset := leveloffset;
+    fLineTextOffset := leveloffset + 4;
+    if lowres then
+    begin
+      fDayCurrent := PInt64(LineBeg)^;
+      AddInteger(fDayChangeIndex, fCount - 1);
+    end;
+  end;
   if (fDayChangeIndex <> nil) and
      (fDayCurrent <> PInt64(LineBeg)^) then
   begin
     fDayCurrent := PInt64(LineBeg)^;
     AddInteger(fDayChangeIndex, fCount - 1);
   end;
-  if fThreads <> nil then
+  thread := 0;
+  if hasthread and
+     (fThreads = nil) then
   begin
-    if fThreadsCount < fLinesMax then
-    begin
-      fThreadsCount := fLinesMax;
-      SetLength(fThreads, fLinesMax);
-    end;
-    thread := Chars3ToInt18(LineBeg + fLineLevelOffset - 5);
-    fThreads[fCount - 1] := thread;
+    fThreadsCount := fLinesMax;
+    SetLength(fThreads, fLinesMax);
+  end;
+  if (fThreads <> nil) and
+     (fThreadsCount < fLinesMax) then
+  begin
+    fThreadsCount := fLinesMax;
+    SetLength(fThreads, fLinesMax);
+  end;
+  if hasthread then
+  begin
+    thread := Chars3ToInt18(LineBeg + leveloffset - 5);
     if thread > fThreadMax then
     begin
       fThreadMax := thread;
@@ -8073,16 +8123,16 @@ begin
     if L = sllInfo then
     begin
       // fast detect the exact TSynLog.AddLogThreadName pattern
-      p := pointer(LineBeg + fLineLevelOffset + 5); // from LogHeaderNoRecursion
+      p := pointer(LineBeg + leveloffset + 5); // from LogHeaderNoRecursion
       if (p^[0] = ord('S') + ord('e') shl 8 + ord('t') shl 16 + ord('T') shl 24) and
          (p^[1] = ord('h') + ord('r') shl 8 + ord('e') shl 16 + ord('a') shl 24) and
          (p^[2] = ord('d') + ord('N') shl 8 + ord('a') shl 16 + ord('m') shl 24) and
          ((p^[3] and $ffff) = ord('e') + ord(' ') shl 8) then
         PtrArrayAdd(fThreadInfo[thread].SetThreadName, LineBeg); // from now on
     end;
-  end
-  else
-    thread := 0;
+  end;
+  if fThreads <> nil then
+    fThreads[fCount - 1] := thread;
   fLevels[fCount - 1] := L; // need exact match of level text
   include(fLevelUsed, L);
   case L of
@@ -8184,7 +8234,7 @@ end;
 
 function TSynLogFile.GetEventText(index: integer): RawUtf8;
 var
-  L: cardinal;
+  L, offset: cardinal;
 begin
   if (self = nil) or
      (cardinal(index) >= cardinal(fCount)) then
@@ -8192,11 +8242,11 @@ begin
   else
   begin
     L := GetLineSize(fLines[index], fMapEnd);
-    if L <= fLineTextOffset then
+    offset := GetLineTextOffset(index);
+    if L <= offset then
       FastAssignNew(result)
     else
-      FastSetString(result, PAnsiChar(fLines[index]) + fLineTextOffset,
-        L - fLineTextOffset);
+      FastSetString(result, PAnsiChar(fLines[index]) + offset, L - offset);
   end;
 end;
 
@@ -8226,7 +8276,7 @@ begin
     {$endif UNICODE}
   if includeFirstColumns then
   begin
-    Utf8DecodeToString(fLines[index], fLineTextOffset, header);
+    Utf8DecodeToString(fLines[index], GetLineTextOffset(index), header);
     result := header + result;
   end;
 end;
@@ -8360,7 +8410,8 @@ begin
     dt := EventDateTime(aRow);
     FormatString('% %'#9'%'#9, [DateToStr(dt), FormatDateTime(TIME_FORMAT, dt),
       ToCaption(EventLevel[aRow])], result);
-    if fThreads <> nil then
+    if (fThreads <> nil) and
+       (fThreads[aRow] <> 0) then
       result := result + IntToString(cardinal(fThreads[aRow])) + #9;
     result := result + EventString(aRow, '   ');
   end;
@@ -8381,7 +8432,8 @@ begin
         1:
           result := ToCaption(EventLevel[aRow]);
         2:
-          if fThreads <> nil then
+          if (fThreads <> nil) and
+             (fThreads[aRow] <> 0) then
             result := IntToString(cardinal(fThreads[aRow]));
         3:
           result := EventString(aRow, '   ', MAXLOGLINES);
@@ -8665,6 +8717,7 @@ begin
     for i := 0 to Count - 1 do
       if fLevels[i] in fEvents then
         if (fThreads = nil) or
+           (fThreads[i] = 0) or
            GetThreads(fThreads[i]) then
         begin
           if search <= i then

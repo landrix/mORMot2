@@ -10801,6 +10801,88 @@ procedure TTestCoreBase.Debugging;
     end;
   end;
 
+  procedure TestRemoteLogLayouts;
+  const
+    REMOTE_START =
+      '20250213 16410200 info  Remote Logging Server started';
+    THREAD_ONE =
+      '20250213 16410201  ! info  Thread one';
+    THREAD_TWO =
+      '20250213 16410201  " warn  Thread two';
+    ZONED =
+      '20250213 16410202Z info  Zoned timestamp';
+    ZONED_THREAD_ONE =
+      '20250213 16410203Z  ! debug Zoned thread one';
+    HIGHRES =
+      '0123456789abcdef info  High resolution';
+    HIGHRES_THREAD_ONE =
+      '0123456789abcdef  ! trace High resolution thread one';
+  var
+    L: TSynLogFileView;
+    level: TSynLogLevel;
+  begin
+    L := TSynLogFileView.Create;
+    try
+      L.Events := LOG_VERBOSE;
+      L.AddInMemoryLine(REMOTE_START);
+      L.AddInMemoryLine(THREAD_ONE);
+      L.AddInMemoryLine(THREAD_TWO);
+      L.AddInMemoryLine(ZONED);
+      L.AddInMemoryLine(ZONED_THREAD_ONE);
+      CheckEqual(L.Count, 5);
+      CheckEqual(L.SelectedCount, 5);
+      CheckEqual(L.ThreadsCount, 2);
+      CheckEqual(L.ThreadRows(1), 2);
+      CheckEqual(L.ThreadRows(2), 1);
+      Check(L.EventLevel[0] = sllInfo);
+      Check(L.EventLevel[1] = sllInfo);
+      Check(L.EventLevel[2] = sllWarning);
+      Check(L.EventLevel[3] = sllInfo);
+      Check(L.EventLevel[4] = sllDebug);
+      CheckEqual(L.EventThread[0], 0);
+      CheckEqual(L.EventThread[1], 1);
+      CheckEqual(L.EventThread[2], 2);
+      CheckEqual(L.EventThread[3], 0);
+      CheckEqual(L.EventThread[4], 1);
+      CheckEqual(L.EventText[0], ' Remote Logging Server started');
+      CheckEqual(L.EventText[1], ' Thread one');
+      CheckEqual(L.EventText[2], ' Thread two');
+      CheckEqual(L.EventText[3], ' Zoned timestamp');
+      CheckEqual(L.EventText[4], ' Zoned thread one');
+      Check(L.GetCell(2, 0, level) = '');
+      Check(L.GetCell(2, 1, level) = '1');
+      Check(L.LineContains('THREAD ONE', 1));
+      L.Threads[1] := false;
+      L.Select(0);
+      CheckEqual(L.SelectedCount, 3); // keep rows without a thread ID visible
+      L.Threads[1] := true;
+      L.Select(0);
+      CheckEqual(L.SelectedCount, 5);
+    finally
+      L.Free;
+    end;
+    // Also validate a thread-aware row before rows without a thread ID.
+    L := TSynLogFileView.Create;
+    try
+      L.Events := LOG_VERBOSE;
+      L.AddInMemoryLine(HIGHRES_THREAD_ONE);
+      L.AddInMemoryLine(HIGHRES);
+      CheckEqual(L.Count, 2);
+      CheckEqual(L.SelectedCount, 2);
+      CheckEqual(L.ThreadsCount, 1);
+      Check(L.EventLevel[0] = sllTrace);
+      Check(L.EventLevel[1] = sllInfo);
+      CheckEqual(L.EventThread[0], 1);
+      CheckEqual(L.EventThread[1], 0);
+      CheckEqual(L.EventText[0], ' High resolution thread one');
+      CheckEqual(L.EventText[1], ' High resolution');
+      L.Select(0);
+      CheckEqual(L.SelectedCount, 2);
+    finally
+      L.Free;
+    end;
+  end;
+
 var
   tmp: TBuffer2K;
   dst, up: PUtf8Char;
@@ -10931,6 +11013,7 @@ begin
   Check(dst[len] = #0, 'ending #0');
   Check(dst[len + 1] = #1, 'buffer');
   // validate TSynLogFile
+  TestRemoteLogLayouts;
   Test('D:\Dev\lib\SQLite3\exe\TestSQL3.exe 1.2.3.4 (2011-04-07 11:09:06)'#13#10 +
     'Host=MyPC User=MySelf CPU=2*0-15-1027 OS=2.3=5.1.2600 Wow64=0 Freq=3579545 ' +
     'Instance=D:\Dev\MyLibrary.dll'#13#10 +
