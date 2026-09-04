@@ -10817,9 +10817,19 @@ procedure TTestCoreBase.Debugging;
       '0123456789abcdef info  High resolution';
     HIGHRES_THREAD_ONE =
       '0123456789abcdef  ! trace High resolution thread one';
+    MINIMAL_THREAD_INFO =
+      '20250213 16410204  ! info ';
+    BUFFER_HEADER =
+      'C:\mormot2tests.exe 1.0.0 (2025-02-13 16:41:00)'#13#10 +
+      'Host=Test User=Test CPU=1 OS=0 Wow64=0 Freq=0'#13#10 +
+      'TSynLog 2.0 2025-02-13T16:41:00'#13#10#13#10;
   var
     L: TSynLogFileView;
+    F: TSynLogFile;
     level: TSynLogLevel;
+    i: PtrInt;
+    log, invalid: RawUtf8;
+    clip: string;
   begin
     L := TSynLogFileView.Create;
     try
@@ -10852,12 +10862,41 @@ procedure TTestCoreBase.Debugging;
       Check(L.GetCell(2, 0, level) = '');
       Check(L.GetCell(2, 1, level) = '1');
       Check(L.LineContains('THREAD ONE', 1));
+      Check(L.LineContains('ZONED THREAD ONE', 4));
+      Check(L.EventString(4, '', 0, true) = ZONED_THREAD_ONE);
+      clip := L.GetLineForClipboard(0);
+      Check(Pos(#9#9' Remote Logging Server started', clip) > 0);
+      clip := L.GetLineForClipboard(1);
+      Check(Pos(#9'1'#9' Thread one', clip) > 0);
       L.Threads[1] := false;
       L.Select(0);
       CheckEqual(L.SelectedCount, 3); // keep rows without a thread ID visible
       L.Threads[1] := true;
       L.Select(0);
       CheckEqual(L.SelectedCount, 5);
+      // A minimal info row must not make SetThreadName detection read past its end.
+      L.AddInMemoryLine(MINIMAL_THREAD_INFO);
+      CheckEqual(L.Count, 6);
+      Check(L.EventLevel[5] = sllInfo);
+      CheckEqual(L.EventThread[5], 1);
+      CheckEqual(L.EventText[5], '');
+      // Truncated levels and invalid Int18 thread IDs are rejected safely.
+      L.AddInMemoryLine(copy(HIGHRES_THREAD_ONE, 1, 24));
+      L.AddInMemoryLine(copy(THREAD_ONE, 1, 24));
+      L.AddInMemoryLine(copy(ZONED_THREAD_ONE, 1, 25));
+      invalid := '20250213 16410204 ' + AnsiChar($7f) + '! info  Invalid thread';
+      L.AddInMemoryLine(invalid);
+      invalid := '20250213 16410204' + Int18ToChars3(MAX_SYNLOGTHREADS + 1) +
+        ' info  Oversized thread';
+      L.AddInMemoryLine(invalid);
+      CheckEqual(L.Count, 11);
+      CheckEqual(L.SelectedCount, 6);
+      for i := 6 to 10 do
+      begin
+        Check(L.EventLevel[i] = sllNone);
+        CheckEqual(L.EventText[i], '');
+        Check(not L.LineContains('THREAD', i));
+      end;
     finally
       L.Free;
     end;
@@ -10880,6 +10919,30 @@ procedure TTestCoreBase.Debugging;
       CheckEqual(L.SelectedCount, 2);
     finally
       L.Free;
+    end;
+    // Exercise LoadFromMap/CleanLevels, profile merging and append after arrays
+    // were shrunk from a deliberately oversized initial line estimate.
+    log := BUFFER_HEADER + RawUtf8OfChar('x', 1700000) + #13#10 +
+      '20250213 16410201  +    TService.Run'#13#10 +
+      '20250213 16410202  !  +    TService.Run'#13#10 +
+      '20250213 16410203  !  -    TService.Run 00.002.000'#13#10 +
+      '20250213 16410204  -    TService.Run 00.001.000';
+    F := TSynLogFile.Create(pointer(log), length(log));
+    try
+      CheckEqual(F.Count, 4);
+      CheckEqual(F.ThreadsCount, 1);
+      CheckEqual(F.EventThread[0], 0);
+      CheckEqual(F.EventThread[1], 1);
+      CheckEqual(F.LogProcCount, 2);
+      F.LogProcMerged := true;
+      CheckEqual(F.LogProcCount, 1);
+      CheckEqual(F.LogProc[0].Time, 3000);
+      F.AddInMemoryLine('20250213 16410205  ! info  Appended');
+      CheckEqual(F.Count, 5);
+      Check(F.EventLevel[4] = sllInfo);
+      CheckEqual(F.EventThread[4], 1);
+    finally
+      F.Free;
     end;
   end;
 
