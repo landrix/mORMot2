@@ -1857,6 +1857,7 @@ type
     procedure SetLogProcMerged(const Value: boolean);
     procedure LogProcInvalidate;
     function LogProcStackOpen: boolean;
+    procedure LogProcStackTrim;
     function GetEventText(index: integer): RawUtf8;
     function GetLogLevelFromText(LineBeg: PUtf8Char;
       LevelOffset: PtrInt = 0): TSynLogLevel;
@@ -1867,7 +1868,7 @@ type
     procedure LoadFromMap(AverageLineLength: integer = 32); override;
     procedure CleanLevels;
     procedure RecomputeTime(p: PSynLogFileProc);
-    function ComputeProperTime(start: PSynLogFileProc): PSynLogFileProc;
+    procedure ComputeProperTime(start: PSynLogFileProc);
     /// compute fLevels[] + fLogProcNatural[] for each .log line during initial reading
     procedure ProcessOneLine(LineBeg, LineEnd: PUtf8Char); override;
     /// called by LogProcSort method
@@ -1900,6 +1901,8 @@ type
     /// add a new line to the already parsed content
     // - overriden method which would identify the freq=%,%,% pseudo-header
     procedure AddInMemoryLine(const aNewLine: RawUtf8); override;
+    /// clear all in-memory appended rows and rebuild derived parsing state
+    procedure AddInMemoryLinesClear; override;
     /// returns the name of a given thread, according to the position in the log
     function ThreadName(ThreadID, CurrentLogIndex: integer): RawUtf8;
     /// returns the name of all threads, according to the position in the log
@@ -2053,6 +2056,8 @@ type
     /// add a new line to the already parsed content
     // - overriden method would add the inserted index to Selected[]
     procedure AddInMemoryLine(const aNewLine: RawUtf8); override;
+    /// clear all in-memory appended rows and rebuild the current selection
+    procedure AddInMemoryLinesClear; override;
     /// search for the next matching TSynLogLevel, from the current row index
     // - returns -1 if no match was found
     function SearchNextEvent(aEvent: TSynLogLevel; aRow: integer): PtrInt;
@@ -7617,7 +7622,7 @@ begin // only called when out-of-range '99.xxx.xxx' was written in sllLeave
     inc(ndx);
     if ndx = fCount then
       break;
-    if (thd = 0) or
+    if (fThreads = nil) or
        (fThreads[ndx] = thd) then
       case fLevels[ndx] of
         sllEnter:
@@ -7650,43 +7655,49 @@ begin // only called when out-of-range '99.xxx.xxx' was written in sllLeave
   until false;
 end;
 
-function TSynLogFile.ComputeProperTime(start: PSynLogFileProc): PSynLogFileProc;
+procedure TSynLogFile.ComputeProperTime(start: PSynLogFileProc);
 var
-  ndx: PtrInt;
+  i, ndx, leave, level: PtrInt;
+  proper: Int64;
   thd: cardinal;
 begin
-  result := start;
-  result^.ProperTime := result^.Time;
-  ndx := result^.Index;
+  start^.ProperTime := start^.Time;
+  ndx := start^.Index;
   if fThreads <> nil then
     thd := fThreads[ndx] // will only check sllEnter/sllLeave in this thread
   else
     thd := 0;
+  leave := fCount;
+  level := 0;
   repeat
     inc(ndx);
     if ndx = fCount then
       break;
-    if (thd = 0) or
+    if (fThreads = nil) or
        (fThreads[ndx] = thd) then
       case fLevels[ndx] of
         sllEnter:
-          begin
-            inc(result);
-            result := ComputeProperTime(result);
-          end;
+          inc(level);
         sllLeave:
+          if level = 0 then
           begin
-            while PtrUInt(result) > PtrUInt(start) do
-            begin
-              if (thd = 0) or
-                 (fThreads[result^.Index] = thd) then
-                dec(start^.ProperTime, result^.ProperTime);
-              dec(result);
-            end;
+            leave := ndx;
             break;
-          end;
+          end
+          else
+            dec(level);
       end;
-  until false;
+  until false; // nested calls are accounted for from their proper time below
+  proper := start^.Time;
+  for i := 0 to fLogProcNaturalCount - 1 do
+    if (fLogProcNatural[i].Index > start^.Index) and
+       (fLogProcNatural[i].Index < leave) and
+       ((fThreads = nil) or
+        (fThreads[fLogProcNatural[i].Index] = thd)) then
+      dec(proper, fLogProcNatural[i].ProperTime);
+  if proper < 0 then
+    proper := 0;
+  start^.ProperTime := proper;
 end;
 
 function StrPosILen(P, PEnd: PUtf8Char; SearchUp: PAnsiChar): PUtf8Char;
@@ -7728,15 +7739,14 @@ var
   f: PAnsiChar;
   i: PtrInt;
   fp, fpe: PSynLogFileProc;
-  OK: boolean;
+  OK, recompute: boolean;
 begin
   // 1. calculate fLines[] + fCount and fLevels[] + fLogProcNatural[] from .log content
   fLineHeaderCountToIgnore := 3;
   // call ProcessOneLine() in one pass
   inherited LoadFromMap(100);
-  // cleanup transient working arrays memory
-  fLogProcStack := nil;
-  fLogProcStackCount := nil;
+  // Keep per-thread stacks: the mapped file may end with an sllEnter whose
+  // matching sllLeave arrives later through AddInMemoryLine().
   // 2. fast retrieval of header
   OK := false;
   try
@@ -7853,6 +7863,9 @@ begin
       exit;
     // 3. compute fCount and fLines[] so that all fLevels[]<>sllNone
     CleanLevels;
+    // fCount now contains event rows only, so live appends no longer need to
+    // skip the header count (which could hide all appends in a short log).
+    fLineHeaderCountToIgnore := 0;
     if Length(fLevels) - fCount > 16384 then
     begin
       // size down only if worth it
@@ -7868,19 +7881,27 @@ begin
     SetLength(fLogProcNatural, fLogProcNaturalCount); // exact resize
     fp := pointer(fLogProcNatural);
     fpe := @fLogProcNatural[fLogProcNaturalCount];
+    recompute := false;
     while PtrUInt(fp) < PtrUInt(fpe) do
     begin
       if fp^.Time >= 99000000 then
+      begin
         // 99.xxx.xxx means over range -> compute fp^.Time from nested calls
         RecomputeTime(fp);
+        recompute := true;
+      end;
       inc(fp);
     end;
-    fp := pointer(fLogProcNatural);
-    while PtrUInt(fp) < PtrUInt(fpe) do
+    if recompute then
     begin
-      fp := ComputeProperTime(fp);
-      inc(fp);
+      fp := fpe;
+      while PtrUInt(fp) > PtrUInt(pointer(fLogProcNatural)) do
+      begin
+        dec(fp);
+        ComputeProperTime(fp);
+      end;
     end;
+    LogProcStackTrim;
     LogProcMerged := false; // set LogProp[]
     OK := true;
   finally
@@ -7888,7 +7909,27 @@ begin
     begin
       Finalize(fLevels); // mark not a valid .log
       Finalize(fThreads);
+      fThreadsCount := 0;
+      fThreadMax := 0;
+      fThreadInfo := nil;
+      SetLength(fThreadInfo, 256);
+      fLevelUsed := [];
+      fDayCurrent := 0;
+      fDayChangeIndex := nil;
+      fDayCount := nil;
+      fLogProcCurrent := nil;
+      fLogProcCurrentCount := 0;
+      fLogProcNatural := nil;
+      fLogProcNaturalCount := 0;
+      fLogProcMerged := nil;
+      fLogProcIsMerged := false;
+      fLogProcSortInternalOrder := soNone;
+      fLogProcStack := nil;
+      fLogProcStackCount := nil;
+      SetLength(fLogProcStack, 256);
+      SetLength(fLogProcStackCount, 256);
       fLineLevelOffset := 0;
+      fLineTextOffset := 0;
     end;
   end;
 end;
@@ -7913,6 +7954,86 @@ begin
   end
   else
     inherited AddInMemoryLine(aNewLine);
+end;
+
+procedure TSynLogFile.AddInMemoryLinesClear;
+var
+  retained: TPointerDynArray;
+  line: PUtf8Char;
+  i, n: PtrInt;
+  oldignore: byte;
+  fp, fpe: PSynLogFileProc;
+  recompute: boolean;
+begin
+  if fAppendedLinesCount = 0 then
+    exit;
+  n := fCount - fAppendedLinesCount;
+  SetLength(retained, n);
+  if n <> 0 then
+    MoveFast(fLines[0], retained[0], n * SizeOf(pointer));
+  inherited AddInMemoryLinesClear;
+  // All arrays below contain indexes or pointers derived from fLines[]. Some
+  // may point into the just released fAppendedLines strings, so rebuild them
+  // from the retained mapped rows instead of trying to adjust them in place.
+  fCount := 0;
+  fLevels := nil;
+  fThreads := nil;
+  fThreadsCount := 0;
+  fThreadMax := 0;
+  fThreadInfo := nil;
+  SetLength(fThreadInfo, 256);
+  fLevelUsed := [];
+  fDayCurrent := 0;
+  fDayChangeIndex := nil;
+  fDayCount := nil;
+  fLineLevelOffset := 0;
+  fLineTextOffset := 0;
+  fLogProcCurrent := nil;
+  fLogProcCurrentCount := 0;
+  fLogProcNatural := nil;
+  fLogProcNaturalCount := 0;
+  fLogProcMerged := nil;
+  fLogProcIsMerged := false;
+  fLogProcSortInternalOrder := soNone;
+  fLogProcStack := nil;
+  fLogProcStackCount := nil;
+  SetLength(fLogProcStack, 256);
+  SetLength(fLogProcStackCount, 256);
+  oldignore := fLineHeaderCountToIgnore;
+  fLineHeaderCountToIgnore := 0; // retained rows were cleaned from headers
+  try
+    for i := 0 to n - 1 do
+    begin
+      line := retained[i];
+      ProcessOneLine(line, line + GetLineSize(line, GetLineEnd(line)));
+    end;
+  finally
+    fLineHeaderCountToIgnore := oldignore;
+  end;
+  SetLength(fLogProcNatural, fLogProcNaturalCount);
+  fp := pointer(fLogProcNatural);
+  fpe := @fLogProcNatural[fLogProcNaturalCount];
+  recompute := false;
+  while PtrUInt(fp) < PtrUInt(fpe) do
+  begin
+    if fp^.Time >= 99000000 then
+    begin
+      RecomputeTime(fp);
+      recompute := true;
+    end;
+    inc(fp);
+  end;
+  if recompute then
+  begin
+    fp := fpe;
+    while PtrUInt(fp) > PtrUInt(pointer(fLogProcNatural)) do
+    begin
+      dec(fp);
+      ComputeProperTime(fp);
+    end;
+  end;
+  LogProcStackTrim;
+  LogProcInvalidate;
 end;
 
 procedure TSynLogFile.LogProcSort(Order: TLogProcSortOrder);
@@ -8044,7 +8165,8 @@ end;
 procedure TSynLogFile.ProcessOneLine(LineBeg, LineEnd: PUtf8Char);
 var
   thread: PtrUInt;
-  baseoffset, leveloffset: PtrInt;
+  baseoffset, leveloffset, procindex, i: PtrInt;
+  proper: Int64;
   MS: integer;
   L: TSynLogLevel;
   p: PCardinalArray;
@@ -8170,11 +8292,12 @@ begin
     fThreads[fCount - 1] := thread;
   fLevels[fCount - 1] := L; // need exact match of level text
   include(fLevelUsed, L);
-  if lowres then
-    if newday then
-      AddInteger(fDayCount, 1)
-    else if fDayCount <> nil then
-      inc(fDayCount[high(fDayCount)]);
+  if newday then
+    AddInteger(fDayCount, 1)
+  else if fDayCount <> nil then
+    // Match CleanLevels(): any valid row after a known low-resolution day
+    // belongs to that day, even if the row itself uses a high-res timestamp.
+    inc(fDayCount[high(fDayCount)]);
   if (L in [sllEnter, sllLeave]) and
      (PtrInt(thread) >= length(fLogProcStack)) then
   begin
@@ -8207,8 +8330,18 @@ begin
         if MS >= 0 then
         begin
           dec(fLogProcStackCount[thread]);
-          fLogProcNatural[fLogProcStack[thread]
-            [fLogProcStackCount[thread]]].Time := MS;
+          procindex := fLogProcStack[thread][fLogProcStackCount[thread]];
+          fLogProcNatural[procindex].Time := MS;
+          proper := MS;
+          // Every later call in this still-open same-thread interval is a
+          // descendant. Their proper times add up to the total child time.
+          for i := procindex + 1 to fLogProcNaturalCount - 1 do
+            if (fThreads = nil) or
+               (fThreads[fLogProcNatural[i].Index] = thread) then
+              dec(proper, fLogProcNatural[i].ProperTime);
+          if proper < 0 then
+            proper := 0;
+          fLogProcNatural[procindex].ProperTime := proper;
           LogProcInvalidate;
         end;
       end;
@@ -8356,6 +8489,27 @@ begin
   result := false;
 end;
 
+procedure TSynLogFile.LogProcStackTrim;
+var
+  i, last: PtrInt;
+begin
+  last := high(fLogProcStackCount);
+  while (last >= 0) and
+        (fLogProcStackCount[last] = 0) do
+    dec(last);
+  if last < 0 then
+  begin
+    fLogProcStack := nil;
+    fLogProcStackCount := nil;
+    exit;
+  end;
+  for i := 0 to last do
+    if fLogProcStackCount[i] = 0 then
+      fLogProcStack[i] := nil;
+  SetLength(fLogProcStack, last + 1);
+  SetLength(fLogProcStackCount, last + 1);
+end;
+
 procedure TSynLogFile.SetLogProcMerged(const Value: boolean);
 var
   i, n, previousindex, currentindex: PtrInt;
@@ -8463,6 +8617,26 @@ begin
       GetThreads(thread)) then
   begin
     AddInteger(fSelected, fSelectedCount, index);
+  end;
+end;
+
+procedure TSynLogFileView.AddInMemoryLinesClear;
+begin
+  if fAppendedLinesCount = 0 then
+    exit;
+  inherited AddInMemoryLinesClear;
+  if fThreads = nil then
+    fThreadSelected := nil
+  else
+    SetLength(fThreadSelected, (fThreadMax shr 3) + 1);
+  fSelectedCount := 0;
+  if integer(fEvents) <> 0 then
+    Select(0)
+  else
+  begin
+    SetLength(fSelected, fCount);
+    fSelectedCount := fCount;
+    FillIncreasing(pointer(fSelected), 0, fCount);
   end;
 end;
 
@@ -8740,11 +8914,11 @@ begin
         ndx := fSelected[result];
         case EventLevel[ndx] of
           sllEnter:
-            if (currentThreadID = 0) or
+            if (EventThread = nil) or
                (EventThread[ndx] = currentThreadID) then
               inc(Level);
           sllLeave:
-            if (currentThreadID = 0) or
+            if (EventThread = nil) or
                (EventThread[ndx] = currentThreadID) then
               if Level = 0 then
                 exit
@@ -8760,11 +8934,11 @@ begin
         ndx := fSelected[result];
         case EventLevel[ndx] of
           sllLeave:
-            if (currentThreadID = 0) or
+            if (EventThread = nil) or
                (EventThread[ndx] = currentThreadID) then
               inc(Level);
           sllEnter:
-            if (currentThreadID = 0) or
+            if (EventThread = nil) or
                (EventThread[ndx] = currentThreadID) then
               if Level = 0 then
                 exit

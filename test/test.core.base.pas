@@ -10825,11 +10825,11 @@ procedure TTestCoreBase.Debugging;
       'TSynLog 2.0 2025-02-13T16:41:00'#13#10#13#10;
   var
     L: TSynLogFileView;
-    F: TSynLogFile;
+    F: TSynLogFileView;
     level: TSynLogLevel;
     i, found: PtrInt;
-    total: Int64;
-    log, invalid: RawUtf8;
+    total, propertotal: Int64;
+    log, openlog, badlog, invalid: RawUtf8;
     clip: string;
   begin
     L := TSynLogFileView.Create;
@@ -10898,6 +10898,23 @@ procedure TTestCoreBase.Debugging;
         CheckEqual(L.EventText[i], '');
         Check(not L.LineContains('THREAD', i));
       end;
+      L.AddInMemoryLine(HIGHRES);
+      CheckEqual(L.Count, 12);
+      CheckEqual(L.SelectedCount, 7);
+      CheckEqual(length(L.DayCount), 1);
+      CheckEqual(L.DayCount[0], 7); // also count mixed high-res valid rows
+      L.AddInMemoryLinesClear;
+      CheckEqual(L.Count, 0);
+      CheckEqual(L.SelectedCount, 0);
+      CheckEqual(L.ThreadsCount, 0);
+      CheckEqual(L.LogProcCount, 0);
+      CheckEqual(length(L.DayChangeIndex), 0);
+      CheckEqual(length(L.DayCount), 0);
+      L.AddInMemoryLine('20250214 00000000 info  After clear');
+      CheckEqual(L.Count, 1);
+      CheckEqual(L.SelectedCount, 1);
+      CheckEqual(L.DayChangeIndex[0], 0);
+      CheckEqual(L.DayCount[0], 1);
     finally
       L.Free;
     end;
@@ -10947,18 +10964,31 @@ procedure TTestCoreBase.Debugging;
     log := BUFFER_HEADER + RawUtf8OfChar('x', 1700000) + #13#10 +
       '20250213 16410201  +    TService.Run'#13#10 +
       '20250213 16410202  !  +    TService.Run'#13#10 +
-      '20250213 16410203  !  -    TService.Run 00.002.000'#13#10 +
-      '20250213 16410204  -    TService.Run 00.001.000';
-    F := TSynLogFile.Create(pointer(log), length(log));
+      '20250213 16410203  -    TService.Run 00.001.000'#13#10 +
+      '20250213 16410204  !  -    TService.Run 00.002.000';
+    F := TSynLogFileView.Create(pointer(log), length(log));
     try
+      F.Events := LOG_VERBOSE;
       CheckEqual(F.Count, 4);
+      CheckEqual(F.SelectedCount, 4);
       CheckEqual(F.ThreadsCount, 1);
       CheckEqual(F.EventThread[0], 0);
       CheckEqual(F.EventThread[1], 1);
       CheckEqual(F.LogProcCount, 2);
+      CheckEqual(F.LogProc[0].Index, 0);
+      CheckEqual(F.LogProc[0].Time, 1000);
+      CheckEqual(F.LogProc[0].ProperTime, 1000);
+      CheckEqual(F.LogProc[1].Index, 1);
+      CheckEqual(F.LogProc[1].Time, 2000);
+      CheckEqual(F.LogProc[1].ProperTime, 2000);
+      CheckEqual(F.SearchEnterLeave(0), 2);
+      CheckEqual(F.SearchEnterLeave(1), 3);
+      CheckEqual(F.SearchEnterLeave(2), 0);
+      CheckEqual(F.SearchEnterLeave(3), 1);
       F.LogProcMerged := true;
       CheckEqual(F.LogProcCount, 1);
       CheckEqual(F.LogProc[0].Time, 3000);
+      CheckEqual(F.LogProc[0].ProperTime, 3000);
       for i := 1 to 10 do
       begin
         invalid := FormatUtf8('20250213 16410205  ! info  Appended %', [i]);
@@ -10998,26 +11028,35 @@ procedure TTestCoreBase.Debugging;
       F.AddInMemoryLine(
         '20250213 16410213  !  -    TService.NestedZ 00.007.000');
       CheckEqual(F.LogProcCount, 6);
+      CheckEqual(F.LogProc[4].Time, 7000);
+      CheckEqual(F.LogProc[4].ProperTime, 1000);
+      CheckEqual(F.LogProc[5].Time, 6000);
+      CheckEqual(F.LogProc[5].ProperTime, 6000);
       F.LogProcMerged := true;
       CheckEqual(F.LogProcCount, 5);
       total := 0;
+      propertotal := 0;
       found := 0;
       for i := 0 to F.LogProcCount - 1 do
       begin
         inc(total, F.LogProc[i].Time);
+        inc(propertotal, F.LogProc[i].ProperTime);
         if F.LineContains('NESTEDA', F.LogProc[i].Index) then
         begin
           CheckEqual(F.LogProc[i].Time, 6000);
+          CheckEqual(F.LogProc[i].ProperTime, 6000);
           inc(found);
         end
         else if F.LineContains('NESTEDZ', F.LogProc[i].Index) then
         begin
           CheckEqual(F.LogProc[i].Time, 7000);
+          CheckEqual(F.LogProc[i].ProperTime, 1000);
           inc(found);
         end;
       end;
       CheckEqual(found, 2);
       CheckEqual(total, 25000);
+      CheckEqual(propertotal, 19000);
       CheckEqual(F.DayCount[0], 22);
       F.AddInMemoryLine('20250214 00000000  ! info  Next day');
       CheckEqual(F.Count, 23);
@@ -11026,6 +11065,91 @@ procedure TTestCoreBase.Debugging;
       CheckEqual(length(F.DayCount), 2);
       CheckEqual(F.DayCount[0], 22);
       CheckEqual(F.DayCount[1], 1);
+      // Clearing appended strings must rebuild every pointer/index based view.
+      F.AddInMemoryLine(
+        '20250214 00000001  " info  SetThreadName Worker');
+      Check(Pos('Worker', string(F.ThreadName(2, F.Count - 1))) > 0);
+      F.AddInMemoryLinesClear;
+      CheckEqual(F.Count, 4);
+      CheckEqual(F.SelectedCount, 4);
+      CheckEqual(F.ThreadsCount, 1);
+      CheckEqual(F.ThreadRows(1), 2);
+      CheckEqual(length(F.DayChangeIndex), 1);
+      CheckEqual(F.DayChangeIndex[0], 0);
+      CheckEqual(F.DayCount[0], 4);
+      CheckEqual(F.LogProcCount, 2);
+      CheckEqual(F.LogProc[0].ProperTime, 1000);
+      CheckEqual(F.LogProc[1].ProperTime, 2000);
+      CheckEqual(F.EventText[0], ' TService.Run');
+      Check(F.GetCell(3, 0, level) <> '');
+      CheckEqual(F.ThreadName(2, F.Count - 1), 'unnamed');
+      F.AddInMemoryLine('20250214 00000000  ! info  Reappended');
+      CheckEqual(F.Count, 5);
+      CheckEqual(F.SelectedCount, 5);
+      CheckEqual(length(F.DayChangeIndex), 2);
+      CheckEqual(F.DayChangeIndex[1], 4);
+      CheckEqual(F.DayCount[0], 4);
+      CheckEqual(F.DayCount[1], 1);
+    finally
+      F.Free;
+    end;
+    // Tiny mapped buffers must not be over-read by BOM detection.
+    invalid := 'x';
+    F := TSynLogFileView.Create(pointer(invalid), length(invalid));
+    try
+      CheckEqual(F.Count, 1);
+    finally
+      F.Free;
+    end;
+    invalid := 'xy';
+    F := TSynLogFileView.Create(pointer(invalid), length(invalid));
+    try
+      CheckEqual(F.Count, 1);
+    finally
+      F.Free;
+    end;
+    invalid := #$ef#$bb#$bf;
+    F := TSynLogFileView.Create(pointer(invalid), length(invalid));
+    try
+      CheckEqual(F.Count, 0);
+    finally
+      F.Free;
+    end;
+    // A rejected mapped header must not expose partially parsed log state.
+    badlog := 'invalid.exe 1.0.0 (2025-02-13 16:41:00)'#13#10 +
+      'Invalid header'#13#10 +
+      'TSynLog 2.0 2025-02-13T16:41:00'#13#10#13#10 +
+      '20250213 16410201  !  +    TService.Invalid';
+    F := TSynLogFileView.Create(pointer(badlog), length(badlog));
+    try
+      Check(F.EventLevel = nil);
+      CheckEqual(F.LogProcCount, 0);
+      CheckEqual(F.ThreadsCount, 0);
+      CheckEqual(length(F.DayChangeIndex), 0);
+      CheckEqual(length(F.DayCount), 0);
+      F.Events := LOG_VERBOSE;
+      F.AddInMemoryLine(
+        '20250213 16410202  !  +    TService.AfterInvalid');
+      CheckEqual(F.LogProcCount, 1);
+    finally
+      F.Free;
+    end;
+    // An Enter at the mapped tail must remain open for a later live Leave.
+    openlog := BUFFER_HEADER +
+      '20250213 16410201  !  +    TService.SplitCall';
+    F := TSynLogFileView.Create(pointer(openlog), length(openlog));
+    try
+      F.Events := LOG_VERBOSE;
+      CheckEqual(F.Count, 1);
+      CheckEqual(F.LogProcCount, 1);
+      CheckEqual(F.LogProc[0].Time, 0);
+      F.AddInMemoryLine(
+        '20250213 16410202  !  -    TService.SplitCall 00.007.000');
+      CheckEqual(F.Count, 2);
+      CheckEqual(F.SelectedCount, 2);
+      CheckEqual(F.LogProcCount, 1);
+      CheckEqual(F.LogProc[0].Time, 7000);
+      CheckEqual(F.LogProc[0].ProperTime, 7000);
     finally
       F.Free;
     end;

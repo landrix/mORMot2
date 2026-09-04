@@ -9245,11 +9245,21 @@ end;
 function TMemoryMapText.LineSizeSmallerThan(aIndex, aMinimalCount: integer): boolean;
 var
   line, lineend: PUtf8Char;
+  n: PtrInt;
 begin
   line := fLines[aIndex];
   lineend := GetLineEnd(line);
   if lineend = nil then
-    result := GetLineSize(line, nil) < cardinal(aMinimalCount)
+  begin
+    // appended strings are zero-terminated: don't scan their whole content
+    n := 0;
+    while (n < aMinimalCount) and
+          (line[n] <> #0) and
+          (line[n] <> #10) and
+          (line[n] <> #13) do
+      inc(n);
+    result := n < aMinimalCount;
+  end
   else
     result := GetLineSizeSmallerThan(line, lineend, aMinimalCount);
 end;
@@ -9309,7 +9319,9 @@ begin
   GetMem(fLines, fLinesMax * SizeOf(pointer));
   P := pointer(fMap.Buffer);
   fMapEnd := P + fMap.Size;
-  if PCardinal(P)^ and $00ffffff = BOM_UTF8 then
+  if (fMap.Size >= 3) and
+     (PWord(P)^ = $bbef) and
+     (P[2] = AnsiChar($bf)) then
     inc(P, 3); // ignore any UTF-8 BOM (still appears on Windows)
   ParseLines(P, fMapEnd, self);
   if fLinesMax > fCount + 16384 then
