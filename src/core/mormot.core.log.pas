@@ -1855,6 +1855,8 @@ type
     fArm32CPU: TArm32HwCaps;
     fArm64CPU: TArm64HwCaps;
     procedure SetLogProcMerged(const Value: boolean);
+    procedure LogProcInvalidate;
+    function LogProcStackOpen: boolean;
     function GetEventText(index: integer): RawUtf8;
     function GetLogLevelFromText(LineBeg: PUtf8Char;
       LevelOffset: PtrInt = 0): TSynLogLevel;
@@ -7476,15 +7478,12 @@ end;
 function TSynLogFile.GetLineTextOffset(Index: PtrInt): PtrInt;
 var
   line: PUtf8Char;
-  len: PtrInt;
 begin
   line := fLines[Index];
-  len := GetLineSize(line, fMapEnd);
   if (cardinal(Index) >= cardinal(length(fLevels))) or
-     (fLevels[Index] = sllNone) or
-     (len <= 17) then
+     (fLevels[Index] = sllNone) then
   begin
-    result := len;
+    result := GetLineSize(line, GetLineEnd(line));
     exit;
   end;
   if line[8] = ' ' then
@@ -7498,8 +7497,6 @@ begin
   if (cardinal(Index) < cardinal(length(fThreads))) and
      (fThreads[Index] <> 0) then
     inc(result, 3);
-  if result > len then
-    result := len;
 end;
 
 function TSynLogFile.EventCount(const aSet: TSynLogLevels): integer;
@@ -7522,7 +7519,7 @@ begin // overridden to take the actual line text offset into account
     result := false
   else
     result := GetLineContains(PUtf8Char(fLines[aIndex]) + GetLineTextOffset(aIndex),
-      fMapEnd, pointer(aUpperSearch));
+      GetLineEnd(fLines[aIndex]), pointer(aUpperSearch));
 end;
 
 function TSynLogFile.EventDateTime(aIndex: integer): TDateTime;
@@ -7903,7 +7900,8 @@ begin
   if aNewLine = '' then
     exit;
   P := pointer(aNewLine);
-  if (PInteger(P)^ =
+  if (length(aNewLine) >= 5) and
+     (PInteger(P)^ =
       ord('f') + ord('r') shl 8 + ord('e') shl 16 + ord('q') shl 24) and
      (P[4] = '=') then
   begin
@@ -7920,6 +7918,7 @@ end;
 procedure TSynLogFile.LogProcSort(Order: TLogProcSortOrder);
 begin
   if (fLogProcNaturalCount <= 1) or
+     LogProcStackOpen or // in-place sorting would invalidate open stack indexes
      (Order = fLogProcSortInternalOrder) then
     exit;
   fLogProcSortInternalOrder := Order;
@@ -8049,7 +8048,7 @@ var
   MS: integer;
   L: TSynLogLevel;
   p: PCardinalArray;
-  hasthread, lowres: boolean;
+  hasthread, lowres, newday: boolean;
 
   function TryLogLayout(WithThread: boolean; out Offset: PtrInt;
     out ThreadID: PtrUInt): TSynLogLevel;
@@ -8091,6 +8090,7 @@ begin
   // Detect the layout for every row: a remote stream may mix LogView's own
   // rows without a thread ID with TSynLog ptIdentifiedInOneFile rows.
   lowres := LineBeg[8] = ' ';
+  newday := false;
   if lowres then
   begin
     // YYYYMMDD HHMMSSXX[Z] is one/two chars bigger than Timestamp
@@ -8117,13 +8117,16 @@ begin
     begin
       fDayCurrent := PInt64(LineBeg)^;
       AddInteger(fDayChangeIndex, fCount - 1);
+      newday := true;
     end;
   end;
-  if (fDayChangeIndex <> nil) and
+  if lowres and
+     (fDayChangeIndex <> nil) and
      (fDayCurrent <> PInt64(LineBeg)^) then
   begin
     fDayCurrent := PInt64(LineBeg)^;
     AddInteger(fDayChangeIndex, fCount - 1);
+    newday := true;
   end;
   if hasthread and
      (fThreads = nil) then
@@ -8167,14 +8170,31 @@ begin
     fThreads[fCount - 1] := thread;
   fLevels[fCount - 1] := L; // need exact match of level text
   include(fLevelUsed, L);
+  if lowres then
+    if newday then
+      AddInteger(fDayCount, 1)
+    else if fDayCount <> nil then
+      inc(fDayCount[high(fDayCount)]);
+  if (L in [sllEnter, sllLeave]) and
+     (PtrInt(thread) >= length(fLogProcStack)) then
+  begin
+    SetLength(fLogProcStack, NextGrow(thread));
+    SetLength(fLogProcStackCount, length(fLogProcStack));
+  end;
   case L of
     sllEnter:
       begin
         AddInteger(fLogProcStack[thread], fLogProcStackCount[thread], fLogProcNaturalCount);
         if fLogProcNaturalCount >= length(fLogProcNatural) then
           SetLength(fLogProcNatural, NextGrow(fLogProcNaturalCount));
-        // fLogProcNatural[].### fields will be set later during parsing
+        with fLogProcNatural[fLogProcNaturalCount] do
+        begin
+          Index := fCount - 1;
+          Time := 0;
+          ProperTime := 0;
+        end;
         inc(fLogProcNaturalCount);
+        LogProcInvalidate;
       end;
     sllLeave:
       if (LineEnd - LineBeg > 10) and
@@ -8189,6 +8209,7 @@ begin
           dec(fLogProcStackCount[thread]);
           fLogProcNatural[fLogProcStack[thread]
             [fLogProcStackCount[thread]]].Time := MS;
+          LogProcInvalidate;
         end;
       end;
   end;
@@ -8231,7 +8252,7 @@ begin
               break;
             end;
         end;
-        FastSetString(result, found, GetLineSize(found, fMapEnd));
+        FastSetString(result, found, GetLineSize(found, GetLineEnd(found)));
         delete(result, 1, PosEx('=', result, 40)); // raw thread name
       end;
     end;
@@ -8273,7 +8294,7 @@ begin
     FastAssignNew(result)
   else
   begin
-    L := GetLineSize(fLines[index], fMapEnd);
+    L := GetLineSize(fLines[index], GetLineEnd(fLines[index]));
     offset := GetLineTextOffset(index);
     if L <= offset then
       FastAssignNew(result)
@@ -8313,14 +8334,50 @@ begin
   end;
 end;
 
+procedure TSynLogFile.LogProcInvalidate;
+begin
+  fLogProcMerged := nil;
+  fLogProcIsMerged := false;
+  fLogProcCurrent := pointer(fLogProcNatural);
+  fLogProcCurrentCount := fLogProcNaturalCount;
+  fLogProcSortInternalOrder := soNone;
+end;
+
+function TSynLogFile.LogProcStackOpen: boolean;
+var
+  i: PtrInt;
+begin
+  for i := 0 to high(fLogProcStackCount) do
+    if fLogProcStackCount[i] <> 0 then
+    begin
+      result := true;
+      exit;
+    end;
+  result := false;
+end;
+
 procedure TSynLogFile.SetLogProcMerged(const Value: boolean);
 var
   i, n, previousindex, currentindex: PtrInt;
   P, M: PSynLogFileProc;
   O: TLogProcSortOrder;
 begin
+  if Value and
+     LogProcStackOpen then
+  begin
+    fLogProcIsMerged := false; // merging would invalidate open stack indexes
+    exit;
+  end;
   fLogProcIsMerged := Value;
   O := fLogProcSortInternalOrder;
+  if Value and
+     (fLogProcNaturalCount = 0) then
+  begin
+    fLogProcCurrent := nil;
+    fLogProcCurrentCount := 0;
+    fLogProcSortInternalOrder := soNone;
+    exit;
+  end;
   if Value then // set TSynLogFile.LogProcMerged=true profiling merged info
   begin
     if fLogProcMerged = nil then
@@ -8381,20 +8438,31 @@ end;
 
 procedure TSynLogFileView.AddInMemoryLine(const aNewLine: RawUtf8);
 var
-  index: integer;
-  tm: cardinal;
+  index, previouscount: integer;
+  thread, oldthreadmax: cardinal;
 begin
-  tm := fThreadMax;
+  previouscount := Count;
+  oldthreadmax := fThreadMax;
   inherited AddInMemoryLine(aNewLine);
+  if Count = previouscount then
+    exit; // '' or a freq= pseudo-header did not append any row
   index := Count - 1;
-  if EventLevel[index] in fEvents then
-    AddInteger(fSelected, fSelectedCount, index);
-  if tm <> fThreadMax then
+  if oldthreadmax <> fThreadMax then
   begin
-    tm := (fThreadMax shr 3) + 1;
-    if integer(tm) <> length(fThreadSelected) then
-      SetLength(fThreadSelected, tm);
-    SetBitPtr(pointer(fThreadSelected), fThreadMax - 1)
+    SetLength(fThreadSelected, (fThreadMax shr 3) + 1);
+    for thread := oldthreadmax + 1 to fThreadMax do
+      SetBitPtr(pointer(fThreadSelected), thread - 1);
+  end;
+  if cardinal(index) >= cardinal(length(fThreads)) then
+    thread := 0
+  else
+    thread := fThreads[index];
+  if (EventLevel[index] in fEvents) and
+     ((fThreads = nil) or
+      (thread = 0) or
+      GetThreads(thread)) then
+  begin
+    AddInteger(fSelected, fSelectedCount, index);
   end;
 end;
 

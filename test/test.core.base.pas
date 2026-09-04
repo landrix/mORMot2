@@ -10827,7 +10827,8 @@ procedure TTestCoreBase.Debugging;
     L: TSynLogFileView;
     F: TSynLogFile;
     level: TSynLogLevel;
-    i: PtrInt;
+    i, found: PtrInt;
+    total: Int64;
     log, invalid: RawUtf8;
     clip: string;
   begin
@@ -10904,6 +10905,13 @@ procedure TTestCoreBase.Debugging;
     L := TSynLogFileView.Create;
     try
       L.Events := LOG_VERBOSE;
+      L.LogProcMerged := true; // no profile rows should remain an empty view
+      CheckEqual(L.LogProcCount, 0);
+      L.LogProcMerged := false;
+      L.AddInMemoryLine('');
+      L.AddInMemoryLine('freq=1000,46000,remote.log');
+      CheckEqual(L.Count, 0);
+      CheckEqual(L.SelectedCount, 0);
       L.AddInMemoryLine(HIGHRES_THREAD_ONE);
       L.AddInMemoryLine(HIGHRES);
       CheckEqual(L.Count, 2);
@@ -10917,6 +10925,20 @@ procedure TTestCoreBase.Debugging;
       CheckEqual(L.EventText[1], ' High resolution');
       L.Select(0);
       CheckEqual(L.SelectedCount, 2);
+      L.Threads[1] := false;
+      L.AddInMemoryLine(HIGHRES_THREAD_ONE);
+      CheckEqual(L.Count, 3);
+      CheckEqual(L.SelectedCount, 2);
+      L.AddInMemoryLine(HIGHRES);
+      CheckEqual(L.Count, 4);
+      CheckEqual(L.SelectedCount, 3); // rows without a thread stay visible
+      L.AddInMemoryLine('f');
+      L.AddInMemoryLine('fre');
+      L.AddInMemoryLine('freq');
+      CheckEqual(L.Count, 7);
+      CheckEqual(L.SelectedCount, 3);
+      for i := 4 to 6 do
+        Check(L.EventLevel[i] = sllNone);
     finally
       L.Free;
     end;
@@ -10937,10 +10959,73 @@ procedure TTestCoreBase.Debugging;
       F.LogProcMerged := true;
       CheckEqual(F.LogProcCount, 1);
       CheckEqual(F.LogProc[0].Time, 3000);
-      F.AddInMemoryLine('20250213 16410205  ! info  Appended');
-      CheckEqual(F.Count, 5);
-      Check(F.EventLevel[4] = sllInfo);
-      CheckEqual(F.EventThread[4], 1);
+      for i := 1 to 10 do
+      begin
+        invalid := FormatUtf8('20250213 16410205  ! info  Appended %', [i]);
+        F.AddInMemoryLine(invalid);
+        CheckEqual(F.Lines[F.Count - 1], invalid);
+        CheckEqual(F.LineSize(F.Count - 1), length(invalid));
+        Check(not F.LineSizeSmallerThan(F.Count - 1, length(invalid)));
+        Check(F.LineSizeSmallerThan(F.Count - 1, length(invalid) + 1));
+        Check(F.EventLevel[F.Count - 1] = sllInfo);
+        CheckEqual(F.EventThread[F.Count - 1], 1);
+        CheckEqual(F.EventText[F.Count - 1], FormatUtf8(' Appended %', [i]));
+        Check(F.LineContains('APPENDED', F.Count - 1));
+      end;
+      CheckEqual(F.Count, 14);
+      CheckEqual(length(F.DayCount), 1);
+      CheckEqual(F.DayCount[0], 14);
+      // Profiling rows appended after LoadFromMap need a fresh per-thread stack
+      // and must invalidate any previous merged/sorted view.
+      F.AddInMemoryLine('20250213 16410206  !  +    TService.LiveThread');
+      F.AddInMemoryLine(
+        '20250213 16410207  !  -    TService.LiveThread 00.004.000');
+      F.AddInMemoryLine('20250213 16410208  +    TService.LiveMain');
+      F.AddInMemoryLine(
+        '20250213 16410209  -    TService.LiveMain 00.005.000');
+      CheckEqual(F.LogProcCount, 4);
+      CheckEqual(F.DayCount[0], 18);
+      // Sorting or merging while calls are open must be deferred so that the
+      // stack indexes still refer to their original profiling records.
+      F.AddInMemoryLine('20250213 16410210  !  +    TService.NestedZ');
+      F.AddInMemoryLine('20250213 16410211  !  +    TService.NestedA');
+      F.LogProcSort(soByName);
+      Check(F.LogProcOrder = soNone);
+      F.LogProcMerged := true;
+      Check(not F.LogProcMerged);
+      F.AddInMemoryLine(
+        '20250213 16410212  !  -    TService.NestedA 00.006.000');
+      F.AddInMemoryLine(
+        '20250213 16410213  !  -    TService.NestedZ 00.007.000');
+      CheckEqual(F.LogProcCount, 6);
+      F.LogProcMerged := true;
+      CheckEqual(F.LogProcCount, 5);
+      total := 0;
+      found := 0;
+      for i := 0 to F.LogProcCount - 1 do
+      begin
+        inc(total, F.LogProc[i].Time);
+        if F.LineContains('NESTEDA', F.LogProc[i].Index) then
+        begin
+          CheckEqual(F.LogProc[i].Time, 6000);
+          inc(found);
+        end
+        else if F.LineContains('NESTEDZ', F.LogProc[i].Index) then
+        begin
+          CheckEqual(F.LogProc[i].Time, 7000);
+          inc(found);
+        end;
+      end;
+      CheckEqual(found, 2);
+      CheckEqual(total, 25000);
+      CheckEqual(F.DayCount[0], 22);
+      F.AddInMemoryLine('20250214 00000000  ! info  Next day');
+      CheckEqual(F.Count, 23);
+      CheckEqual(length(F.DayChangeIndex), 2);
+      CheckEqual(F.DayChangeIndex[1], 22);
+      CheckEqual(length(F.DayCount), 2);
+      CheckEqual(F.DayCount[0], 22);
+      CheckEqual(F.DayCount[1], 1);
     finally
       F.Free;
     end;

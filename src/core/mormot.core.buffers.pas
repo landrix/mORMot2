@@ -1996,6 +1996,8 @@ type
     fFileName: TFileName;
     fAppendedLines: TRawUtf8DynArray;
     fAppendedLinesCount: integer;
+    function GetLineEnd(Line: PUtf8Char): PUtf8Char;
+      {$ifdef HASINLINE}inline;{$endif}
     function GetLine(aIndex: integer): RawUtf8;
       {$ifdef HASINLINE}inline;{$endif}
     function GetString(aIndex: integer): string;
@@ -9194,13 +9196,23 @@ begin
   end;
 end;
 
+function TMemoryMapText.GetLineEnd(Line: PUtf8Char): PUtf8Char;
+begin
+  if (PtrUInt(Line) >= PtrUInt(fMap.Buffer)) and
+     (PtrUInt(Line) < PtrUInt(fMapEnd)) then
+    result := fMapEnd
+  else
+    result := nil; // an AddInMemoryLine() entry is a standalone #0 string
+end;
+
 function TMemoryMapText.GetLine(aIndex: integer): RawUtf8;
 begin
   if (self = nil) or
      (cardinal(aIndex) >= cardinal(fCount)) then
     FastAssignNew(result)
   else
-    FastSetString(result, fLines[aIndex], GetLineSize(fLines[aIndex], fMapEnd));
+    FastSetString(result, fLines[aIndex],
+      GetLineSize(fLines[aIndex], GetLineEnd(fLines[aIndex])));
 end;
 
 function TMemoryMapText.GetString(aIndex: integer): string;
@@ -9209,7 +9221,8 @@ begin
      (cardinal(aIndex) >= cardinal(fCount)) then
     result := ''
   else
-    Utf8DecodeToString(fLines[aIndex], GetLineSize(fLines[aIndex], fMapEnd), result);
+    Utf8DecodeToString(fLines[aIndex],
+      GetLineSize(fLines[aIndex], GetLineEnd(fLines[aIndex])), result);
 end;
 
 function TMemoryMapText.LineContains(const aUpperSearch: RawUtf8;
@@ -9220,17 +9233,25 @@ begin
      (aUpperSearch = '') then
     result := false
   else
-    result := GetLineContains(fLines[aIndex], fMapEnd, pointer(aUpperSearch));
+    result := GetLineContains(fLines[aIndex], GetLineEnd(fLines[aIndex]),
+      pointer(aUpperSearch));
 end;
 
 function TMemoryMapText.LineSize(aIndex: integer): integer;
 begin
-  result := GetLineSize(fLines[aIndex], fMapEnd);
+  result := GetLineSize(fLines[aIndex], GetLineEnd(fLines[aIndex]));
 end;
 
 function TMemoryMapText.LineSizeSmallerThan(aIndex, aMinimalCount: integer): boolean;
+var
+  line, lineend: PUtf8Char;
 begin
-  result := GetLineSizeSmallerThan(fLines[aIndex], fMapEnd, aMinimalCount);
+  line := fLines[aIndex];
+  lineend := GetLineEnd(line);
+  if lineend = nil then
+    result := GetLineSize(line, nil) < cardinal(aMinimalCount)
+  else
+    result := GetLineSizeSmallerThan(line, lineend, aMinimalCount);
 end;
 
 procedure TMemoryMapText.ProcessOneLine(LineBeg, LineEnd: PUtf8Char);
@@ -9292,7 +9313,10 @@ begin
     inc(P, 3); // ignore any UTF-8 BOM (still appears on Windows)
   ParseLines(P, fMapEnd, self);
   if fLinesMax > fCount + 16384 then
+  begin
     ReallocMem(fLines, fCount * SizeOf(pointer)); // size down only if worth it
+    fLinesMax := fCount;
+  end;
 end;
 
 procedure TMemoryMapText.AddInMemoryLine(const aNewLine: RawUtf8);
