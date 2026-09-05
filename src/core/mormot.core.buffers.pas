@@ -9319,9 +9319,7 @@ begin
   GetMem(fLines, fLinesMax * SizeOf(pointer));
   P := pointer(fMap.Buffer);
   fMapEnd := P + fMap.Size;
-  if (fMap.Size >= 3) and
-     (PWord(P)^ = $bbef) and
-     (P[2] = AnsiChar($bf)) then
+  if PCardinal(P)^ and $00ffffff = BOM_UTF8 then
     inc(P, 3); // ignore any UTF-8 BOM (still appears on Windows)
   ParseLines(P, fMapEnd, self);
   if fLinesMax > fCount + 16384 then

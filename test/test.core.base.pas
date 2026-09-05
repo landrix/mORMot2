@@ -308,6 +308,60 @@ type
 
 implementation
 
+type
+  TRemoteLogTestClient = class(TRestClientUri)
+  protected
+    fCaptured: RawUtf8;
+    fCaptureLock: TLightLock;
+    procedure InternalUri(var Call: TRestUriParams); override;
+    function InternalIsOpen: boolean; override;
+    procedure InternalOpen; override;
+    procedure InternalClose; override;
+  public
+    function Captured: RawUtf8;
+  end;
+
+  TRemoteLogTestLog = class(TSynLog);
+
+procedure TRemoteLogTestClient.InternalUri(var Call: TRestUriParams);
+begin
+  Call.OutStatus := HTTP_SUCCESS;
+  if Call.Method = 'GET' then
+  begin
+    Call.OutBody := Int64ToUtf8(TimeLogNowUtc);
+    exit;
+  end;
+  fCaptureLock.Lock;
+  try
+    fCaptured := Call.InBody;
+  finally
+    fCaptureLock.UnLock;
+  end;
+end;
+
+function TRemoteLogTestClient.InternalIsOpen: boolean;
+begin
+  result := true;
+end;
+
+procedure TRemoteLogTestClient.InternalOpen;
+begin
+end;
+
+procedure TRemoteLogTestClient.InternalClose;
+begin
+end;
+
+function TRemoteLogTestClient.Captured: RawUtf8;
+begin
+  fCaptureLock.Lock;
+  try
+    result := fCaptured;
+  finally
+    fCaptureLock.UnLock;
+  end;
+end;
+
 
 { TOrmPeople }
 
@@ -10761,6 +10815,144 @@ end;
 
 procedure TTestCoreBase.Debugging;
 
+  procedure TestRemoteLog;
+  const
+    STAMPS: array[0..2] of RawUtf8 = (
+      '20250213 16410200', '20250213 16410200Z', '0000000000001234');
+    THREADS: array[0..5] of integer = (0, 1, 2, 64, 4096, MAX_SYNLOGTHREADS);
+    START = '20250213 16410200 info  Remote Logging Server started';
+    HEADER = 'C:\mormot2tests.exe 1.0.0 (2025-02-13 16:41:00)'#13#10 +
+      'Host=Test User=Test CPU=1 OS=0 Wow64=0 Freq=1000000'#13#10 +
+      'TSynLog 2.0 2025-02-13T16:41:00'#13#10#13#10;
+  var
+    client: TRemoteLogTestClient;
+    model: TOrmModel;
+    view: TSynLogFileView;
+    mapped: TSynLogFile;
+    level: TSynLogLevel;
+    s, t, i: integer;
+    input, original, output, body, expected, source, local: RawUtf8;
+  begin
+    model := TOrmModel.Create([]);
+    client := TRemoteLogTestClient.Create(model);
+    try
+      client.SetLogClass(TSynLog.Void);
+      for s := low(STAMPS) to high(STAMPS) do
+        for t := low(THREADS) to high(THREADS) do
+          for level := succ(sllNone) to high(TSynLogLevel) do
+          begin
+            body := '  payload ! ' + StringToUtf8('Grüße') + #9 + 'tail';
+            input := STAMPS[s];
+            if THREADS[t] <> 0 then
+              input := input + Int18ToChars3(THREADS[t]);
+            input := input + LOG_LEVEL_TEXT[level] + body;
+            original := input;
+            if CheckFailed(client.ServerRemoteLog(nil, level, input)) then
+              exit;
+            output := client.Captured;
+            CheckEqual(input, original, 'local log remains unchanged');
+            expected := body;
+            if THREADS[t] <> 0 then
+              expected := FormatUtf8('[thread %] ', [THREADS[t]]) + expected;
+            CheckEqual(copy(output, 18, 7), LOG_LEVEL_TEXT[level]);
+            CheckEqual(copy(output, 25, MaxInt), expected);
+            if s < 2 then
+              CheckEqual(copy(output, 1, 17), STAMPS[0]);
+            if (s = 0) and (t = 0) then
+              CheckEqual(output, input);
+            // Keep the legacy parser's once-only layout detection. Its own
+            // status row must not hide a later ptIdentifiedInOneFile event.
+            view := TSynLogFileView.Create;
+            try
+              view.Events := LOG_VERBOSE;
+              view.AddInMemoryLine(START);
+              view.AddInMemoryLine(output);
+              CheckEqual(view.Count, 2);
+              CheckEqual(view.SelectedCount, 2);
+              Check(view.EventLevel[1] = level);
+              CheckEqual(view.EventText[1], ' ' + expected);
+              Check(view.EventThread = nil);
+              Check(view.EventDateTime(1) > 0);
+              Check(view.LineContains('PAYLOAD', 1));
+            finally
+              view.Free;
+            end;
+          end;
+      // Empty/minimal/custom messages and pseudo-headers are not sliced.
+      for i := 0 to 26 do
+      begin
+        input := copy(STAMPS[0] + '  ! info  text', 1, i);
+        Check(client.ServerRemoteLog(nil, sllWarning, input));
+        CheckEqual(client.Captured, input);
+      end;
+      input := 'freq=1000000,46000,remote.log';
+      Check(client.ServerRemoteLog(nil, sllNone, input));
+      CheckEqual(client.Captured, input);
+      input := STAMPS[0] + Int18ToChars3(MAX_SYNLOGTHREADS + 1) + ' info  text';
+      Check(client.ServerRemoteLog(nil, sllInfo, input));
+      CheckEqual(client.Captured, input);
+      Check(client.ServerRemoteLog(sllClient, 'Connected %', [42]));
+      Check(PosEx('Connected 42', client.Captured) > 0);
+      // Mapped files retain their original thread layout, including zoned
+      // timestamps and a first event from a thread other than thread 1.
+      for s := low(STAMPS) to high(STAMPS) do
+        for t := 0 to 2 do
+        begin
+          source := HEADER;
+          input := STAMPS[s];
+          if THREADS[t] <> 0 then
+            input := input + Int18ToChars3(THREADS[t]);
+          input := input + ' info  Mapped payload';
+          for i := 1 to 4 do
+            source := source + input + #13#10;
+          mapped := TSynLogFile.Create(pointer(source), length(source));
+          try
+            CheckEqual(mapped.Count, 4);
+            CheckEqual(mapped.EventText[0], ' Mapped payload');
+            if t = 0 then
+              Check(mapped.EventThread = nil)
+            else
+              CheckEqual(mapped.EventThread[0], THREADS[t]);
+            mapped.AddInMemoryLine(input);
+            CheckEqual(mapped.Lines[4], input);
+            CheckEqual(mapped.LineSize(4), length(input));
+            Check(not mapped.LineSizeSmallerThan(4, 4));
+            Check(mapped.LineSizeSmallerThan(4, length(input) + 1));
+            CheckEqual(mapped.EventText[4], ' Mapped payload');
+            Check(mapped.LineContains('PAYLOAD', 4));
+          finally
+            mapped.Free;
+          end;
+        end;
+      // Exercise actual logger echoing plus the queued remote send path.
+      with TRemoteLogTestLog.Family do
+      begin
+        Level := [sllInfo];
+        PerThreadLog := ptIdentifiedInOneFile;
+        DestinationPath := Executable.ProgramFilePath;
+      end;
+      client.ServerRemoteLogStart(TRemoteLogTestLog, false);
+      TRemoteLogTestLog.Add.Log(sllInfo, 'issue344 queued payload');
+      for i := 1 to 500 do
+      begin
+        output := client.Captured;
+        if PosEx('issue344 queued payload', output) > 0 then
+          break;
+        SleepHiRes(10);
+      end;
+      Check(PosEx('issue344 queued payload', output) > 0);
+      Check(PosEx('[thread ', output) > 0);
+      TRemoteLogTestLog.Family.EchoRemoteStop;
+      TRemoteLogTestLog.Add.Flush;
+      local := StringFromFile(TRemoteLogTestLog.Add.FileName);
+      Check(PosEx('issue344 queued payload', local) > 0);
+      Check(PosEx('[thread ', local) = 0);
+    finally
+      client.Free;
+      model.Free;
+    end;
+  end;
+
   procedure Test(const LOG: RawUtf8; ExpectedDate: TDateTime);
   var
     L: TSynLogFile;
@@ -10798,360 +10990,6 @@ procedure TTestCoreBase.Debugging;
         L.LogProcSort(o);
     finally
       L.Free;
-    end;
-  end;
-
-  procedure TestRemoteLogLayouts;
-  const
-    REMOTE_START =
-      '20250213 16410200 info  Remote Logging Server started';
-    THREAD_ONE =
-      '20250213 16410201  ! info  Thread one';
-    THREAD_TWO =
-      '20250213 16410201  " warn  Thread two';
-    ZONED =
-      '20250213 16410202Z info  Zoned timestamp';
-    ZONED_THREAD_ONE =
-      '20250213 16410203Z  ! debug Zoned thread one';
-    HIGHRES =
-      '0123456789abcdef info  High resolution';
-    HIGHRES_THREAD_ONE =
-      '0123456789abcdef  ! trace High resolution thread one';
-    MINIMAL_THREAD_INFO =
-      '20250213 16410204  ! info ';
-    BUFFER_HEADER =
-      'C:\mormot2tests.exe 1.0.0 (2025-02-13 16:41:00)'#13#10 +
-      'Host=Test User=Test CPU=1 OS=0 Wow64=0 Freq=0'#13#10 +
-      'TSynLog 2.0 2025-02-13T16:41:00'#13#10#13#10;
-  var
-    L: TSynLogFileView;
-    F: TSynLogFileView;
-    level: TSynLogLevel;
-    i, found: PtrInt;
-    total, propertotal: Int64;
-    log, openlog, badlog, invalid: RawUtf8;
-    clip: string;
-  begin
-    L := TSynLogFileView.Create;
-    try
-      L.Events := LOG_VERBOSE;
-      L.AddInMemoryLine(REMOTE_START);
-      L.AddInMemoryLine(THREAD_ONE);
-      L.AddInMemoryLine(THREAD_TWO);
-      L.AddInMemoryLine(ZONED);
-      L.AddInMemoryLine(ZONED_THREAD_ONE);
-      CheckEqual(L.Count, 5);
-      CheckEqual(L.SelectedCount, 5);
-      CheckEqual(L.ThreadsCount, 2);
-      CheckEqual(L.ThreadRows(1), 2);
-      CheckEqual(L.ThreadRows(2), 1);
-      Check(L.EventLevel[0] = sllInfo);
-      Check(L.EventLevel[1] = sllInfo);
-      Check(L.EventLevel[2] = sllWarning);
-      Check(L.EventLevel[3] = sllInfo);
-      Check(L.EventLevel[4] = sllDebug);
-      CheckEqual(L.EventThread[0], 0);
-      CheckEqual(L.EventThread[1], 1);
-      CheckEqual(L.EventThread[2], 2);
-      CheckEqual(L.EventThread[3], 0);
-      CheckEqual(L.EventThread[4], 1);
-      CheckEqual(L.EventText[0], ' Remote Logging Server started');
-      CheckEqual(L.EventText[1], ' Thread one');
-      CheckEqual(L.EventText[2], ' Thread two');
-      CheckEqual(L.EventText[3], ' Zoned timestamp');
-      CheckEqual(L.EventText[4], ' Zoned thread one');
-      Check(L.GetCell(2, 0, level) = '');
-      Check(L.GetCell(2, 1, level) = '1');
-      Check(L.LineContains('THREAD ONE', 1));
-      Check(L.LineContains('ZONED THREAD ONE', 4));
-      Check(L.EventString(4, '', 0, true) = ZONED_THREAD_ONE);
-      clip := L.GetLineForClipboard(0);
-      Check(Pos(#9#9' Remote Logging Server started', clip) > 0);
-      clip := L.GetLineForClipboard(1);
-      Check(Pos(#9'1'#9' Thread one', clip) > 0);
-      L.Threads[1] := false;
-      L.Select(0);
-      CheckEqual(L.SelectedCount, 3); // keep rows without a thread ID visible
-      L.Threads[1] := true;
-      L.Select(0);
-      CheckEqual(L.SelectedCount, 5);
-      // A minimal info row must not make SetThreadName detection read past its end.
-      L.AddInMemoryLine(MINIMAL_THREAD_INFO);
-      CheckEqual(L.Count, 6);
-      Check(L.EventLevel[5] = sllInfo);
-      CheckEqual(L.EventThread[5], 1);
-      CheckEqual(L.EventText[5], '');
-      // Truncated levels and invalid Int18 thread IDs are rejected safely.
-      L.AddInMemoryLine(copy(HIGHRES_THREAD_ONE, 1, 24));
-      L.AddInMemoryLine(copy(THREAD_ONE, 1, 24));
-      L.AddInMemoryLine(copy(ZONED_THREAD_ONE, 1, 25));
-      invalid := '20250213 16410204 ' + AnsiChar($7f) + '! info  Invalid thread';
-      L.AddInMemoryLine(invalid);
-      invalid := '20250213 16410204' + Int18ToChars3(MAX_SYNLOGTHREADS + 1) +
-        ' info  Oversized thread';
-      L.AddInMemoryLine(invalid);
-      CheckEqual(L.Count, 11);
-      CheckEqual(L.SelectedCount, 6);
-      for i := 6 to 10 do
-      begin
-        Check(L.EventLevel[i] = sllNone);
-        CheckEqual(L.EventText[i], '');
-        Check(not L.LineContains('THREAD', i));
-      end;
-      L.AddInMemoryLine(HIGHRES);
-      CheckEqual(L.Count, 12);
-      CheckEqual(L.SelectedCount, 7);
-      CheckEqual(length(L.DayCount), 1);
-      CheckEqual(L.DayCount[0], 7); // also count mixed high-res valid rows
-      L.AddInMemoryLinesClear;
-      CheckEqual(L.Count, 0);
-      CheckEqual(L.SelectedCount, 0);
-      CheckEqual(L.ThreadsCount, 0);
-      CheckEqual(L.LogProcCount, 0);
-      CheckEqual(length(L.DayChangeIndex), 0);
-      CheckEqual(length(L.DayCount), 0);
-      L.AddInMemoryLine('20250214 00000000 info  After clear');
-      CheckEqual(L.Count, 1);
-      CheckEqual(L.SelectedCount, 1);
-      CheckEqual(L.DayChangeIndex[0], 0);
-      CheckEqual(L.DayCount[0], 1);
-    finally
-      L.Free;
-    end;
-    // Also validate a thread-aware row before rows without a thread ID.
-    L := TSynLogFileView.Create;
-    try
-      L.Events := LOG_VERBOSE;
-      L.LogProcMerged := true; // no profile rows should remain an empty view
-      CheckEqual(L.LogProcCount, 0);
-      L.LogProcMerged := false;
-      L.AddInMemoryLine('');
-      L.AddInMemoryLine('freq=1000,46000,remote.log');
-      CheckEqual(L.Count, 0);
-      CheckEqual(L.SelectedCount, 0);
-      L.AddInMemoryLine(HIGHRES_THREAD_ONE);
-      L.AddInMemoryLine(HIGHRES);
-      CheckEqual(L.Count, 2);
-      CheckEqual(L.SelectedCount, 2);
-      CheckEqual(L.ThreadsCount, 1);
-      Check(L.EventLevel[0] = sllTrace);
-      Check(L.EventLevel[1] = sllInfo);
-      CheckEqual(L.EventThread[0], 1);
-      CheckEqual(L.EventThread[1], 0);
-      CheckEqual(L.EventText[0], ' High resolution thread one');
-      CheckEqual(L.EventText[1], ' High resolution');
-      L.Select(0);
-      CheckEqual(L.SelectedCount, 2);
-      L.Threads[1] := false;
-      L.AddInMemoryLine(HIGHRES_THREAD_ONE);
-      CheckEqual(L.Count, 3);
-      CheckEqual(L.SelectedCount, 2);
-      L.AddInMemoryLine(HIGHRES);
-      CheckEqual(L.Count, 4);
-      CheckEqual(L.SelectedCount, 3); // rows without a thread stay visible
-      L.AddInMemoryLine('f');
-      L.AddInMemoryLine('fre');
-      L.AddInMemoryLine('freq');
-      CheckEqual(L.Count, 7);
-      CheckEqual(L.SelectedCount, 3);
-      for i := 4 to 6 do
-        Check(L.EventLevel[i] = sllNone);
-    finally
-      L.Free;
-    end;
-    // Exercise LoadFromMap/CleanLevels, profile merging and append after arrays
-    // were shrunk from a deliberately oversized initial line estimate.
-    log := BUFFER_HEADER + RawUtf8OfChar('x', 1700000) + #13#10 +
-      '20250213 16410201  +    TService.Run'#13#10 +
-      '20250213 16410202  !  +    TService.Run'#13#10 +
-      '20250213 16410203  -    TService.Run 00.001.000'#13#10 +
-      '20250213 16410204  !  -    TService.Run 00.002.000';
-    F := TSynLogFileView.Create(pointer(log), length(log));
-    try
-      F.Events := LOG_VERBOSE;
-      CheckEqual(F.Count, 4);
-      CheckEqual(F.SelectedCount, 4);
-      CheckEqual(F.ThreadsCount, 1);
-      CheckEqual(F.EventThread[0], 0);
-      CheckEqual(F.EventThread[1], 1);
-      CheckEqual(F.LogProcCount, 2);
-      CheckEqual(F.LogProc[0].Index, 0);
-      CheckEqual(F.LogProc[0].Time, 1000);
-      CheckEqual(F.LogProc[0].ProperTime, 1000);
-      CheckEqual(F.LogProc[1].Index, 1);
-      CheckEqual(F.LogProc[1].Time, 2000);
-      CheckEqual(F.LogProc[1].ProperTime, 2000);
-      CheckEqual(F.SearchEnterLeave(0), 2);
-      CheckEqual(F.SearchEnterLeave(1), 3);
-      CheckEqual(F.SearchEnterLeave(2), 0);
-      CheckEqual(F.SearchEnterLeave(3), 1);
-      F.LogProcMerged := true;
-      CheckEqual(F.LogProcCount, 1);
-      CheckEqual(F.LogProc[0].Time, 3000);
-      CheckEqual(F.LogProc[0].ProperTime, 3000);
-      for i := 1 to 10 do
-      begin
-        invalid := FormatUtf8('20250213 16410205  ! info  Appended %', [i]);
-        F.AddInMemoryLine(invalid);
-        CheckEqual(F.Lines[F.Count - 1], invalid);
-        CheckEqual(F.LineSize(F.Count - 1), length(invalid));
-        Check(not F.LineSizeSmallerThan(F.Count - 1, length(invalid)));
-        Check(F.LineSizeSmallerThan(F.Count - 1, length(invalid) + 1));
-        Check(F.EventLevel[F.Count - 1] = sllInfo);
-        CheckEqual(F.EventThread[F.Count - 1], 1);
-        CheckEqual(F.EventText[F.Count - 1], FormatUtf8(' Appended %', [i]));
-        Check(F.LineContains('APPENDED', F.Count - 1));
-      end;
-      CheckEqual(F.Count, 14);
-      CheckEqual(length(F.DayCount), 1);
-      CheckEqual(F.DayCount[0], 14);
-      // Profiling rows appended after LoadFromMap need a fresh per-thread stack
-      // and must invalidate any previous merged/sorted view.
-      F.AddInMemoryLine('20250213 16410206  !  +    TService.LiveThread');
-      F.AddInMemoryLine(
-        '20250213 16410207  !  -    TService.LiveThread 00.004.000');
-      F.AddInMemoryLine('20250213 16410208  +    TService.LiveMain');
-      F.AddInMemoryLine(
-        '20250213 16410209  -    TService.LiveMain 00.005.000');
-      CheckEqual(F.LogProcCount, 4);
-      CheckEqual(F.DayCount[0], 18);
-      // Sorting or merging while calls are open must be deferred so that the
-      // stack indexes still refer to their original profiling records.
-      F.AddInMemoryLine('20250213 16410210  !  +    TService.NestedZ');
-      F.AddInMemoryLine('20250213 16410211  !  +    TService.NestedA');
-      F.LogProcSort(soByName);
-      Check(F.LogProcOrder = soNone);
-      F.LogProcMerged := true;
-      Check(not F.LogProcMerged);
-      F.AddInMemoryLine(
-        '20250213 16410212  !  -    TService.NestedA 00.006.000');
-      F.AddInMemoryLine(
-        '20250213 16410213  !  -    TService.NestedZ 00.007.000');
-      CheckEqual(F.LogProcCount, 6);
-      CheckEqual(F.LogProc[4].Time, 7000);
-      CheckEqual(F.LogProc[4].ProperTime, 1000);
-      CheckEqual(F.LogProc[5].Time, 6000);
-      CheckEqual(F.LogProc[5].ProperTime, 6000);
-      F.LogProcMerged := true;
-      CheckEqual(F.LogProcCount, 5);
-      total := 0;
-      propertotal := 0;
-      found := 0;
-      for i := 0 to F.LogProcCount - 1 do
-      begin
-        inc(total, F.LogProc[i].Time);
-        inc(propertotal, F.LogProc[i].ProperTime);
-        if F.LineContains('NESTEDA', F.LogProc[i].Index) then
-        begin
-          CheckEqual(F.LogProc[i].Time, 6000);
-          CheckEqual(F.LogProc[i].ProperTime, 6000);
-          inc(found);
-        end
-        else if F.LineContains('NESTEDZ', F.LogProc[i].Index) then
-        begin
-          CheckEqual(F.LogProc[i].Time, 7000);
-          CheckEqual(F.LogProc[i].ProperTime, 1000);
-          inc(found);
-        end;
-      end;
-      CheckEqual(found, 2);
-      CheckEqual(total, 25000);
-      CheckEqual(propertotal, 19000);
-      CheckEqual(F.DayCount[0], 22);
-      F.AddInMemoryLine('20250214 00000000  ! info  Next day');
-      CheckEqual(F.Count, 23);
-      CheckEqual(length(F.DayChangeIndex), 2);
-      CheckEqual(F.DayChangeIndex[1], 22);
-      CheckEqual(length(F.DayCount), 2);
-      CheckEqual(F.DayCount[0], 22);
-      CheckEqual(F.DayCount[1], 1);
-      // Clearing appended strings must rebuild every pointer/index based view.
-      F.AddInMemoryLine(
-        '20250214 00000001  " info  SetThreadName Worker');
-      Check(Pos('Worker', string(F.ThreadName(2, F.Count - 1))) > 0);
-      F.AddInMemoryLinesClear;
-      CheckEqual(F.Count, 4);
-      CheckEqual(F.SelectedCount, 4);
-      CheckEqual(F.ThreadsCount, 1);
-      CheckEqual(F.ThreadRows(1), 2);
-      CheckEqual(length(F.DayChangeIndex), 1);
-      CheckEqual(F.DayChangeIndex[0], 0);
-      CheckEqual(F.DayCount[0], 4);
-      CheckEqual(F.LogProcCount, 2);
-      CheckEqual(F.LogProc[0].ProperTime, 1000);
-      CheckEqual(F.LogProc[1].ProperTime, 2000);
-      CheckEqual(F.EventText[0], ' TService.Run');
-      Check(F.GetCell(3, 0, level) <> '');
-      CheckEqual(F.ThreadName(2, F.Count - 1), 'unnamed');
-      F.AddInMemoryLine('20250214 00000000  ! info  Reappended');
-      CheckEqual(F.Count, 5);
-      CheckEqual(F.SelectedCount, 5);
-      CheckEqual(length(F.DayChangeIndex), 2);
-      CheckEqual(F.DayChangeIndex[1], 4);
-      CheckEqual(F.DayCount[0], 4);
-      CheckEqual(F.DayCount[1], 1);
-    finally
-      F.Free;
-    end;
-    // Tiny mapped buffers must not be over-read by BOM detection.
-    invalid := 'x';
-    F := TSynLogFileView.Create(pointer(invalid), length(invalid));
-    try
-      CheckEqual(F.Count, 1);
-    finally
-      F.Free;
-    end;
-    invalid := 'xy';
-    F := TSynLogFileView.Create(pointer(invalid), length(invalid));
-    try
-      CheckEqual(F.Count, 1);
-    finally
-      F.Free;
-    end;
-    invalid := #$ef#$bb#$bf;
-    F := TSynLogFileView.Create(pointer(invalid), length(invalid));
-    try
-      CheckEqual(F.Count, 0);
-    finally
-      F.Free;
-    end;
-    // A rejected mapped header must not expose partially parsed log state.
-    badlog := 'invalid.exe 1.0.0 (2025-02-13 16:41:00)'#13#10 +
-      'Invalid header'#13#10 +
-      'TSynLog 2.0 2025-02-13T16:41:00'#13#10#13#10 +
-      '20250213 16410201  !  +    TService.Invalid';
-    F := TSynLogFileView.Create(pointer(badlog), length(badlog));
-    try
-      Check(F.EventLevel = nil);
-      CheckEqual(F.LogProcCount, 0);
-      CheckEqual(F.ThreadsCount, 0);
-      CheckEqual(length(F.DayChangeIndex), 0);
-      CheckEqual(length(F.DayCount), 0);
-      F.Events := LOG_VERBOSE;
-      F.AddInMemoryLine(
-        '20250213 16410202  !  +    TService.AfterInvalid');
-      CheckEqual(F.LogProcCount, 1);
-    finally
-      F.Free;
-    end;
-    // An Enter at the mapped tail must remain open for a later live Leave.
-    openlog := BUFFER_HEADER +
-      '20250213 16410201  !  +    TService.SplitCall';
-    F := TSynLogFileView.Create(pointer(openlog), length(openlog));
-    try
-      F.Events := LOG_VERBOSE;
-      CheckEqual(F.Count, 1);
-      CheckEqual(F.LogProcCount, 1);
-      CheckEqual(F.LogProc[0].Time, 0);
-      F.AddInMemoryLine(
-        '20250213 16410202  !  -    TService.SplitCall 00.007.000');
-      CheckEqual(F.Count, 2);
-      CheckEqual(F.SelectedCount, 2);
-      CheckEqual(F.LogProcCount, 1);
-      CheckEqual(F.LogProc[0].Time, 7000);
-      CheckEqual(F.LogProc[0].ProperTime, 7000);
-    finally
-      F.Free;
     end;
   end;
 
@@ -11285,7 +11123,7 @@ begin
   Check(dst[len] = #0, 'ending #0');
   Check(dst[len + 1] = #1, 'buffer');
   // validate TSynLogFile
-  TestRemoteLogLayouts;
+  TestRemoteLog;
   Test('D:\Dev\lib\SQLite3\exe\TestSQL3.exe 1.2.3.4 (2011-04-07 11:09:06)'#13#10 +
     'Host=MyPC User=MySelf CPU=2*0-15-1027 OS=2.3=5.1.2600 Wow64=0 Freq=3579545 ' +
     'Instance=D:\Dev\MyLibrary.dll'#13#10 +

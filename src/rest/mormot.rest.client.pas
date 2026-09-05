@@ -865,6 +865,9 @@ type
     function ServerTimestampSynchronize: boolean;
     /// asynchronous call a 'RemoteLog' remote logging method on the server
     // - as implemented by mORMot's LogView tool in server mode
+    // - uses the legacy viewer's fixed calendar timestamp/no-thread-column
+    // layout; thread IDs are kept as [thread N] in the message text, and
+    // high-resolution timestamps use the calendar time of this echo callback
     // - to be used via ServerRemoteLogStart/ServerRemoteLogStop methods
     // - a dedicated background thread will run the transmission process without
     // blocking the main program execution, gathering log rows in chunks in case
@@ -2957,12 +2960,61 @@ end;
 
 function TRestClientUri.ServerRemoteLog(Sender: TEchoWriter;
   Level: TSynLogLevel; const Text: RawUtf8): boolean;
+var
+  row, timestamp, threadtext: RawUtf8;
+  p: PUtf8Char;
+  stamp, offset: PtrInt;
+  thread: cardinal;
 begin
+  row := Text;
+  // LogView (mORMot 1) starts with its own calendar/no-thread status row.
+  // Normalize only this outgoing transport, leaving local files and their
+  // single-layout parser untouched. Match the supplied level before slicing.
+  if (Level <> sllNone) and
+     (length(Text) >= 23) then
+  begin
+    p := pointer(Text);
+    if p[8] = ' ' then
+      stamp := 17
+    else
+      stamp := 16;
+    offset := stamp;
+    if (stamp = 17) and
+       (p[17] = 'Z') then
+      inc(offset);
+    thread := 0;
+    if (length(Text) < offset + 7) or
+       not CompareMem(p + offset, @LOG_LEVEL_TEXT[Level][1], 7) then
+      if (length(Text) >= offset + 10) and
+         (p[offset] in [#32..#95]) and
+         (p[offset + 1] in [#32..#95]) and
+         (p[offset + 2] in [#32..#95]) and
+         CompareMem(p + offset + 3, @LOG_LEVEL_TEXT[Level][1], 7) then
+      begin
+        thread := Chars3ToInt18(p + offset);
+        if (thread > 0) and
+           (thread <= MAX_SYNLOGTHREADS) then
+          inc(offset, 3);
+      end;
+    if (length(Text) >= offset + 7) and
+       CompareMem(p + offset, @LOG_LEVEL_TEXT[Level][1], 7) and
+       ((stamp = 16) or (offset <> 17)) then
+    begin
+      if stamp = 17 then
+        timestamp := copy(Text, 1, 17)
+      else
+        timestamp := NowToString(false) + '00';
+      if thread <> 0 then
+        threadtext := FormatUtf8('[thread %] ', [thread]);
+      row := timestamp + copy(Text, offset + 1, 7) + threadtext +
+        copy(Text, offset + 8, MaxInt);
+    end;
+  end;
   if fRemoteLogThread = nil then
-    result := InternalRemoteLogSend(Text)
+    result := InternalRemoteLogSend(row)
   else
   begin
-    TRemoteLogThread(fRemoteLogThread).AddRow(Text);
+    TRemoteLogThread(fRemoteLogThread).AddRow(row);
     result := true;
   end;
 end;
