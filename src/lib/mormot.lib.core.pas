@@ -11,9 +11,9 @@ unit mormot.lib.core;
    - Font Interfaces: Provider, Enumerator, Shaper, Subsetter
    - Font Services Registration
 
-   No implementation here, and no user yet: the contracts of the font
-   services planned for mormot.lib.uniscribe (Windows), mormot.lib.freetype
-   and mormot.lib.harfbuzz (POSIX), as needed by the cross-platform PDF engine.
+   No implementation here: the contracts of the font services implemented
+   by mormot.lib.freetype and mormot.lib.harfbuzz (POSIX), and planned for
+   mormot.lib.uniscribe (Windows), as needed by the cross-platform PDF engine.
 
   *****************************************************************************
 }
@@ -133,9 +133,9 @@ type
     TextStart: integer;
     /// number of code units of the part
     TextLen: integer;
-    /// glyph indexes of the font, in visual order, only glyphs to be drawn:
-    // the shaper leaves out what draws nothing, e.g. a zero-width glyph which
-    // is no diacritic, and keeps the other arrays aligned with Glyphs
+    /// glyph indexes of the font, in visual order, as they are to be drawn
+    // - a shaper may leave out glyphs which draw nothing, e.g. a zero-width
+    // glyph which is no diacritic, keeping the other arrays aligned with Glyphs
     Glyphs: TWordDynArray;
     /// advance per glyph in 1/1000 em, positioned - empty when the advances
     // of the font apply
@@ -230,7 +230,7 @@ type
     // - glyph indexes are kept, so data built against Face stays valid
     // - returns false if the font cannot be subset: the caller keeps Face
     function Subset(const Face: RawByteString; const Request: TFontSubsetRequest;
-      Font: TFontHandle; out Subset: RawByteString): boolean;
+      Font: TFontHandle; out Output: RawByteString): boolean;
   end;
 
 
