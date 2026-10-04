@@ -32,6 +32,7 @@ implementation
 {$else}
 
 uses
+  SysUtils,
   mormot.core.base,
   mormot.core.os,
   mormot.lib.core,
@@ -146,12 +147,13 @@ type
   Thb_buffer_get_glyph_positions = function(
     buffer: hb_buffer_t; out length: cardinal): Phb_glyph_position_array; cdecl;
 
-  /// holds loaded HarfBuzz library handle and all required function pointers
-  THarfBuzzLib = record
-    Handle:          TLibHandle;
+  /// the loaded libharfbuzz and the function pointers of the shaper
+  // - the function fields are resolved in their declaration order
+  THarfBuzzLib = class(TSynLibrary)
+  protected
+    fLoaded: boolean;
+  public
     ft_font_create:  Thb_ft_font_create;
-    // optional - available since HarfBuzz 0.9.5; used to set FT_LOAD_NO_HINTING
-    ft_font_set_load_flags: Thb_ft_font_set_load_flags;
     font_destroy:    Thb_font_destroy;
     buffer_create:   Thb_buffer_create;
     buffer_destroy:  Thb_buffer_destroy;
@@ -161,76 +163,70 @@ type
     shape:           Thb_shape;
     buffer_get_glyph_infos: Thb_buffer_get_glyph_infos;
     buffer_get_glyph_positions: Thb_buffer_get_glyph_positions;
-    Loaded:          boolean;
+    // optional - available since HarfBuzz 0.9.5; used to set FT_LOAD_NO_HINTING
+    ft_font_set_load_flags: Thb_ft_font_set_load_flags;
+    /// true once the library is loaded - false on nil
+    function Loaded: boolean;
+      {$ifdef HASINLINE} inline; {$endif}
   end;
+
+const
+  /// the libharfbuzz names for the shaper, tried in this order
+  HARFBUZZ_LIB_NAMES: array[0 .. {$ifdef OSDARWIN} 5 {$else} 1 {$endif}] of TFileName = (
+    {$ifdef OSDARWIN}
+    'libharfbuzz.0.dylib',
+    'libharfbuzz.dylib',
+    '/opt/homebrew/lib/libharfbuzz.0.dylib',
+    '/opt/homebrew/lib/libharfbuzz.dylib',
+    '/usr/local/lib/libharfbuzz.0.dylib',
+    '/usr/local/lib/libharfbuzz.dylib');
+    {$else}
+    'libharfbuzz.so.0',
+    'libharfbuzz.so');
+    {$endif OSDARWIN}
+
+  /// the entries of THarfBuzzLib, in the order of its fields
+  HARFBUZZ_ENTRIES: array[0 .. 11] of PAnsiChar = (
+    'ft_font_create',
+    'font_destroy',
+    'buffer_create',
+    'buffer_destroy',
+    'buffer_add_utf16',
+    'buffer_set_direction',
+    'buffer_guess_segment_properties',
+    'shape',
+    'buffer_get_glyph_infos',
+    'buffer_get_glyph_positions',
+    '?ft_font_set_load_flags',
+    nil);
 
 var
   HarfBuzz: THarfBuzzLib;
 
+function THarfBuzzLib.Loaded: boolean;
+begin
+  result := (self <> nil) and
+            fLoaded;
+end;
+
 function LoadHarfBuzz: boolean;
-const
-  {$ifdef OSDARWIN}
-  HBLIB = 'libharfbuzz.0.dylib';
-  {$else}
-  HBLIB = 'libharfbuzz.so.0';
-  {$endif OSDARWIN}
+var
+  lib: THarfBuzzLib;
+  err: string;
 begin
   result := HarfBuzz.Loaded;
   if result then
     exit;
-  HarfBuzz.Handle := LibraryOpen(HBLIB);
-  if HarfBuzz.Handle = 0 then
+  lib := THarfBuzzLib.Create;
+  if lib.TryLoadLibrary(HARFBUZZ_LIB_NAMES) and
+     lib.ResolveAll(@HARFBUZZ_ENTRIES, @@lib.ft_font_create, 'hb_', nil, @err) then
   begin
-    {$ifdef OSDARWIN}
-    HarfBuzz.Handle := LibraryOpen('libharfbuzz.dylib');
-    if HarfBuzz.Handle = 0 then
-      HarfBuzz.Handle := LibraryOpen('/opt/homebrew/lib/libharfbuzz.0.dylib');
-    if HarfBuzz.Handle = 0 then
-      HarfBuzz.Handle := LibraryOpen('/opt/homebrew/lib/libharfbuzz.dylib');
-    if HarfBuzz.Handle = 0 then
-      HarfBuzz.Handle := LibraryOpen('/usr/local/lib/libharfbuzz.0.dylib');
-    if HarfBuzz.Handle = 0 then
-      HarfBuzz.Handle := LibraryOpen('/usr/local/lib/libharfbuzz.dylib');
-    {$else}
-    HarfBuzz.Handle := LibraryOpen('libharfbuzz.so');
-    {$endif OSDARWIN}
-  end;
-  if HarfBuzz.Handle = 0 then
-    exit;
-  @HarfBuzz.ft_font_create   := LibraryResolve(HarfBuzz.Handle, 'hb_ft_font_create');
-  @HarfBuzz.font_destroy     := LibraryResolve(HarfBuzz.Handle, 'hb_font_destroy');
-  @HarfBuzz.buffer_create    := LibraryResolve(HarfBuzz.Handle, 'hb_buffer_create');
-  @HarfBuzz.buffer_destroy   := LibraryResolve(HarfBuzz.Handle, 'hb_buffer_destroy');
-  @HarfBuzz.buffer_add_utf16 := LibraryResolve(HarfBuzz.Handle, 'hb_buffer_add_utf16');
-  @HarfBuzz.buffer_set_direction
-    := LibraryResolve(HarfBuzz.Handle, 'hb_buffer_set_direction');
-  @HarfBuzz.buffer_guess_segment_properties
-    := LibraryResolve(HarfBuzz.Handle, 'hb_buffer_guess_segment_properties');
-  @HarfBuzz.shape              := LibraryResolve(HarfBuzz.Handle, 'hb_shape');
-  @HarfBuzz.buffer_get_glyph_infos
-    := LibraryResolve(HarfBuzz.Handle, 'hb_buffer_get_glyph_infos');
-  @HarfBuzz.buffer_get_glyph_positions
-    := LibraryResolve(HarfBuzz.Handle, 'hb_buffer_get_glyph_positions');
-  // optional symbol - do not abort if missing on older HarfBuzz builds
-  @HarfBuzz.ft_font_set_load_flags
-    := LibraryResolve(HarfBuzz.Handle, 'hb_ft_font_set_load_flags');
-  if (@HarfBuzz.ft_font_create = nil) or
-     (@HarfBuzz.font_destroy = nil) or
-     (@HarfBuzz.buffer_create = nil) or
-     (@HarfBuzz.buffer_destroy = nil) or
-     (@HarfBuzz.buffer_add_utf16 = nil) or
-     (@HarfBuzz.buffer_set_direction = nil) or
-     (@HarfBuzz.buffer_guess_segment_properties = nil) or
-     (@HarfBuzz.shape = nil) or
-     (@HarfBuzz.buffer_get_glyph_infos = nil) or
-     (@HarfBuzz.buffer_get_glyph_positions = nil) then
-  begin
-    LibraryClose(HarfBuzz.Handle);
-    HarfBuzz.Handle := 0;
-    exit;
-  end;
-  HarfBuzz.Loaded := true;
-  result := true;
+    lib.fLoaded := true;
+    HarfBuzz := lib;
+    result := true;
+  end
+  else
+    lib.Free; // the next call tries again
 end;
 
 
@@ -363,12 +359,11 @@ type
   Thb_subset_or_fail = function(source: hb_face_t;
     input: hb_subset_input_t): hb_face_t; cdecl;
 
-  /// holds both library handles and all required function pointers
-  // - hb_blob_*, hb_face_* and hb_set_* live in libharfbuzz, not in
-  // libharfbuzz-subset, so both libraries are opened explicitly
-  THarfBuzzSubsetLib = record
-    Handle: TLibHandle;
-    SubsetHandle: TLibHandle;
+  /// the libharfbuzz functions used by the subsetter
+  // - the function fields are resolved in their declaration order
+  // - loaded on its own: the subsetter does not depend on the shaper
+  THarfBuzzSubsetCoreLib = class(TSynLibrary)
+  public
     blob_create: Thb_blob_create;
     blob_destroy: Thb_blob_destroy;
     blob_get_data: Thb_blob_get_data;
@@ -376,6 +371,16 @@ type
     face_destroy: Thb_face_destroy;
     face_reference_blob: Thb_face_reference_blob;
     set_add: Thb_set_add;
+  end;
+
+  /// the loaded libharfbuzz-subset and its function pointers
+  // - hb_blob_*, hb_face_* and hb_set_* live in libharfbuzz, not in
+  // libharfbuzz-subset, so both libraries are opened: Core holds the first
+  THarfBuzzSubsetLib = class(TSynLibrary)
+  protected
+    fLoaded: boolean;
+    fCore: THarfBuzzSubsetCoreLib;
+  public
     input_create_or_fail: Thb_subset_input_create_or_fail;
     input_destroy: Thb_subset_input_destroy;
     input_unicode_set: Thb_subset_input_get_set;
@@ -383,97 +388,104 @@ type
     input_set: Thb_subset_input_set;
     input_set_flags: Thb_subset_input_set_flags;
     subset_or_fail: Thb_subset_or_fail;
-    Loaded: boolean;
+    destructor Destroy; override;
+    /// true once both libraries are loaded - false on nil
+    function Loaded: boolean;
+      {$ifdef HASINLINE} inline; {$endif}
+    /// the libharfbuzz part
+    property Core: THarfBuzzSubsetCoreLib
+      read fCore;
   end;
+
+const
+  /// the libharfbuzz names for the subsetter, tried in this order
+  HBSUBSET_CORE_LIB_NAMES: array[0 .. {$ifdef OSDARWIN} 2 {$else} 1 {$endif}] of TFileName = (
+    {$ifdef OSDARWIN}
+    'libharfbuzz.0.dylib',
+    '/opt/homebrew/lib/libharfbuzz.0.dylib',
+    '/usr/local/lib/libharfbuzz.0.dylib');
+    {$else}
+    'libharfbuzz.so.0',
+    'libharfbuzz.so');
+    {$endif OSDARWIN}
+
+  /// the libharfbuzz-subset names, tried in this order
+  HBSUBSET_LIB_NAMES: array[0 .. {$ifdef OSDARWIN} 2 {$else} 1 {$endif}] of TFileName = (
+    {$ifdef OSDARWIN}
+    'libharfbuzz-subset.0.dylib',
+    '/opt/homebrew/lib/libharfbuzz-subset.0.dylib',
+    '/usr/local/lib/libharfbuzz-subset.0.dylib');
+    {$else}
+    'libharfbuzz-subset.so.0',
+    'libharfbuzz-subset.so');
+    {$endif OSDARWIN}
+
+  /// the entries of THarfBuzzSubsetCoreLib, in the order of its fields
+  HBSUBSET_CORE_ENTRIES: array[0 .. 7] of PAnsiChar = (
+    'blob_create',
+    'blob_destroy',
+    'blob_get_data',
+    'face_create',
+    'face_destroy',
+    'face_reference_blob',
+    'set_add',
+    nil);
+
+  /// the entries of THarfBuzzSubsetLib, in the order of its fields
+  // - no partial mode: HarfBuzz < 2.9 has only the deprecated subset API
+  HBSUBSET_ENTRIES: array[0 .. 7] of PAnsiChar = (
+    'input_create_or_fail',
+    'input_destroy',
+    'input_unicode_set',
+    'input_glyph_set',
+    'input_set',
+    'input_set_flags',
+    'or_fail',
+    nil);
 
 var
   HbSubset: THarfBuzzSubsetLib;
 
-function LoadFirst(const Names: array of string): TLibHandle;
-var
-  i: PtrInt;
+destructor THarfBuzzSubsetLib.Destroy;
 begin
-  for i := 0 to high(Names) do
-  begin
-    result := LibraryOpen(Names[i]);
-    if result <> 0 then
-      exit;
-  end;
-  result := 0;
+  fCore.Free;
+  inherited Destroy;
+end;
+
+function THarfBuzzSubsetLib.Loaded: boolean;
+begin
+  result := (self <> nil) and
+            fLoaded;
 end;
 
 procedure UnloadHarfBuzzSubset;
 begin
-  if HbSubset.SubsetHandle <> 0 then
-    LibraryClose(HbSubset.SubsetHandle);
-  if HbSubset.Handle <> 0 then
-    LibraryClose(HbSubset.Handle);
-  HbSubset := Default(THarfBuzzSubsetLib);
+  FreeAndNil(HbSubset); // calls FreeLib on both libraries
 end;
 
 function LoadHarfBuzzSubset: boolean;
+var
+  lib: THarfBuzzSubsetLib;
+  err: string;
 begin
   result := HbSubset.Loaded;
   if result then
     exit;
-  {$ifdef OSDARWIN}
-  HbSubset.Handle := LoadFirst(['libharfbuzz.0.dylib',
-    '/opt/homebrew/lib/libharfbuzz.0.dylib',
-    '/usr/local/lib/libharfbuzz.0.dylib']);
-  HbSubset.SubsetHandle := LoadFirst(['libharfbuzz-subset.0.dylib',
-    '/opt/homebrew/lib/libharfbuzz-subset.0.dylib',
-    '/usr/local/lib/libharfbuzz-subset.0.dylib']);
-  {$else}
-  HbSubset.Handle := LoadFirst(['libharfbuzz.so.0', 'libharfbuzz.so']);
-  HbSubset.SubsetHandle := LoadFirst(['libharfbuzz-subset.so.0',
-    'libharfbuzz-subset.so']);
-  {$endif OSDARWIN}
-  if (HbSubset.Handle = 0) or
-     (HbSubset.SubsetHandle = 0) then
+  lib := THarfBuzzSubsetLib.Create;
+  lib.fCore := THarfBuzzSubsetCoreLib.Create;
+  if lib.fCore.TryLoadLibrary(HBSUBSET_CORE_LIB_NAMES) and
+     lib.TryLoadLibrary(HBSUBSET_LIB_NAMES) and
+     lib.fCore.ResolveAll(@HBSUBSET_CORE_ENTRIES, @@lib.fCore.blob_create,
+       'hb_', nil, @err) and
+     lib.ResolveAll(@HBSUBSET_ENTRIES, @@lib.input_create_or_fail,
+       'hb_subset_', nil, @err) then
   begin
-    UnloadHarfBuzzSubset;
-    exit;
-  end;
-  with HbSubset do
-  begin
-    @blob_create := LibraryResolve(Handle, 'hb_blob_create');
-    @blob_destroy := LibraryResolve(Handle, 'hb_blob_destroy');
-    @blob_get_data := LibraryResolve(Handle, 'hb_blob_get_data');
-    @face_create := LibraryResolve(Handle, 'hb_face_create');
-    @face_destroy := LibraryResolve(Handle, 'hb_face_destroy');
-    @face_reference_blob := LibraryResolve(Handle, 'hb_face_reference_blob');
-    @set_add := LibraryResolve(Handle, 'hb_set_add');
-    @input_create_or_fail :=
-      LibraryResolve(SubsetHandle, 'hb_subset_input_create_or_fail');
-    @input_destroy := LibraryResolve(SubsetHandle, 'hb_subset_input_destroy');
-    @input_unicode_set :=
-      LibraryResolve(SubsetHandle, 'hb_subset_input_unicode_set');
-    @input_glyph_set := LibraryResolve(SubsetHandle, 'hb_subset_input_glyph_set');
-    @input_set := LibraryResolve(SubsetHandle, 'hb_subset_input_set');
-    @input_set_flags := LibraryResolve(SubsetHandle, 'hb_subset_input_set_flags');
-    @subset_or_fail := LibraryResolve(SubsetHandle, 'hb_subset_or_fail');
-    // no partial mode: HarfBuzz < 2.9 has only the deprecated subset API
-    if (@blob_create = nil) or
-       (@blob_destroy = nil) or
-       (@blob_get_data = nil) or
-       (@face_create = nil) or
-       (@face_destroy = nil) or
-       (@face_reference_blob = nil) or
-       (@set_add = nil) or
-       (@input_create_or_fail = nil) or
-       (@input_destroy = nil) or
-       (@input_unicode_set = nil) or
-       (@input_glyph_set = nil) or
-       (@input_set = nil) or
-       (@input_set_flags = nil) or
-       (@subset_or_fail = nil) then
-    begin
-      UnloadHarfBuzzSubset;
-      exit;
-    end;
-  end;
-  HbSubset.Loaded := true;
-  result := true;
+    lib.fLoaded := true;
+    HbSubset := lib;
+    result := true;
+  end
+  else
+    lib.Free; // the next call tries again
 end;
 
 
@@ -516,7 +528,7 @@ begin
   if not HbSubset.Loaded or
      not IsEmbeddableOutlines(Face) then
     exit;
-  with HbSubset do
+  with HbSubset, HbSubset.Core do
   begin
     // READONLY: Face outlives the blob, which is destroyed below
     blob := blob_create(pointer(Face), length(Face), HB_MEMORY_MODE_READONLY,
@@ -572,23 +584,44 @@ begin
 end;
 
 
-initialization
+var
+  // what this unit registered, so that only its own services are released
+  RegisteredShaper: IFontShaper;
+  RegisteredSubsetter: IFontSubsetter;
+
+procedure RegisterHarfBuzz;
+begin
   if LoadHarfBuzz then
-    FontShaper := THarfBuzzShaper.Create;
+  begin
+    RegisteredShaper := THarfBuzzShaper.Create;
+    FontShaper := RegisteredShaper;
+  end;
   if LoadHarfBuzzSubset then
-    FontSubsetter := THarfBuzzSubsetter.Create;
+  begin
+    RegisteredSubsetter := THarfBuzzSubsetter.Create;
+    FontSubsetter := RegisteredSubsetter;
+  end;
+end;
+
+procedure UnregisterHarfBuzz;
+begin
+  // release the services before the libraries they call
+  if FontShaper = RegisteredShaper then
+    FontShaper := nil;
+  if FontSubsetter = RegisteredSubsetter then
+    FontSubsetter := nil;
+  RegisteredShaper := nil;
+  RegisteredSubsetter := nil;
+  FreeAndNil(HarfBuzz); // calls FreeLib
+  UnloadHarfBuzzSubset;
+end;
+
+
+initialization
+  RegisterHarfBuzz;
 
 finalization
-  // release the interfaces before unloading their libraries
-  FontShaper := nil;
-  FontSubsetter := nil;
-  if HarfBuzz.Loaded then
-  begin
-    LibraryClose(HarfBuzz.Handle);
-    HarfBuzz.Handle := 0;
-    HarfBuzz.Loaded := false;
-  end;
-  UnloadHarfBuzzSubset;
+  UnregisterHarfBuzz;
 
 {$endif OSWINDOWS}
 

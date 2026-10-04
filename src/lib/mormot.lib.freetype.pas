@@ -146,10 +146,12 @@ const
   FREETYPE_SCREEN_DPI = 96;
 
 type
-  /// holds the loaded FreeType2 library handle and function pointers
-  TFreeTypeLib = record
-    Handle:           TLibHandle;
-    FTLibrary:        FT_Library;
+  /// the loaded FreeType2 library and its function pointers
+  // - the function fields are resolved in their declaration order
+  TFreeTypeLib = class(TSynLibrary)
+  protected
+    fLoaded: boolean;
+  public
     Init:             TFT_Init_FreeType;
     Done:             TFT_Done_FreeType;
     NewFace:          TFT_New_Face;
@@ -157,11 +159,15 @@ type
     SetCharSize:      TFT_Set_Char_Size;
     LoadChar:         TFT_Load_Char;
     LoadSfntTable:    TFT_Load_Sfnt_Table;
-    Loaded:           boolean;
+    /// the FT_Library instance of FT_Init_FreeType
+    FTLibrary:        FT_Library;
+    /// true once the library is loaded and initialized - false on nil
+    function Loaded: boolean;
+      {$ifdef HASINLINE} inline; {$endif}
   end;
 
 var
-  /// global FreeType2 library instance
+  /// global FreeType2 library instance, nil until LoadFreeType succeeds
   FreeType: TFreeTypeLib;
 
 /// load the FreeType2 shared library; returns false if not found
@@ -273,68 +279,59 @@ implementation
 
 { ****************** FreeType2 Minimal API Bindings }
 
-function LoadFreeType: boolean;
 const
-  {$ifdef OSDARWIN}
-  FTLIB = 'libfreetype.6.dylib';
-  {$else}
-  FTLIB = 'libfreetype.so.6';
-  {$endif OSDARWIN}
+  /// the library names, tried in this order
+  // - Homebrew installs to /opt/homebrew on Apple Silicon (ARM64), which is
+  // not in the default dyld search path
+  FREETYPE_LIB_NAMES: array[0 .. {$ifdef OSDARWIN} 5 {$else} 1 {$endif}] of TFileName = (
+    {$ifdef OSDARWIN}
+    'libfreetype.6.dylib',
+    'libfreetype.dylib',
+    '/opt/homebrew/lib/libfreetype.6.dylib',
+    '/opt/homebrew/lib/libfreetype.dylib',
+    '/usr/local/lib/libfreetype.6.dylib',
+    '/usr/local/lib/libfreetype.dylib');
+    {$else}
+    'libfreetype.so.6',
+    'libfreetype.so');
+    {$endif OSDARWIN}
+
+  /// the entries of TFreeTypeLib, in the order of its fields
+  FREETYPE_ENTRIES: array[0 .. 7] of PAnsiChar = (
+    'Init_FreeType',
+    'Done_FreeType',
+    'New_Face',
+    'Done_Face',
+    'Set_Char_Size',
+    'Load_Char',
+    'Load_Sfnt_Table',
+    nil);
+
+function TFreeTypeLib.Loaded: boolean;
+begin
+  result := (self <> nil) and
+            fLoaded;
+end;
+
+function LoadFreeType: boolean;
+var
+  lib: TFreeTypeLib;
+  err: string;
 begin
   result := FreeType.Loaded;
   if result then
     exit;
-  FreeType.Handle := LibraryOpen(FTLIB);
-  if FreeType.Handle = 0 then
+  lib := TFreeTypeLib.Create;
+  if lib.TryLoadLibrary(FREETYPE_LIB_NAMES) and
+     lib.ResolveAll(@FREETYPE_ENTRIES, @@lib.Init, 'FT_', nil, @err) and
+     (lib.Init(lib.FTLibrary) = 0) then
   begin
-    // Try without version suffix
-    {$ifdef OSDARWIN}
-    FreeType.Handle := LibraryOpen('libfreetype.dylib');
-    {$else}
-    FreeType.Handle := LibraryOpen('libfreetype.so');
-    {$endif OSDARWIN}
-  end;
-  {$ifdef OSDARWIN}
-  // On Apple Silicon (ARM64), Homebrew installs to /opt/homebrew which is not
-  // in the default dyld search path - try explicit paths as last resort
-  if FreeType.Handle = 0 then
-    FreeType.Handle := LibraryOpen('/opt/homebrew/lib/libfreetype.6.dylib');
-  if FreeType.Handle = 0 then
-    FreeType.Handle := LibraryOpen('/opt/homebrew/lib/libfreetype.dylib');
-  if FreeType.Handle = 0 then
-    FreeType.Handle := LibraryOpen('/usr/local/lib/libfreetype.6.dylib');
-  if FreeType.Handle = 0 then
-    FreeType.Handle := LibraryOpen('/usr/local/lib/libfreetype.dylib');
-  {$endif OSDARWIN}
-  if FreeType.Handle = 0 then
-    exit;
-  @FreeType.Init          := LibraryResolve(FreeType.Handle, 'FT_Init_FreeType');
-  @FreeType.Done          := LibraryResolve(FreeType.Handle, 'FT_Done_FreeType');
-  @FreeType.NewFace       := LibraryResolve(FreeType.Handle, 'FT_New_Face');
-  @FreeType.DoneFace      := LibraryResolve(FreeType.Handle, 'FT_Done_Face');
-  @FreeType.SetCharSize   := LibraryResolve(FreeType.Handle, 'FT_Set_Char_Size');
-  @FreeType.LoadChar      := LibraryResolve(FreeType.Handle, 'FT_Load_Char');
-  @FreeType.LoadSfntTable := LibraryResolve(FreeType.Handle, 'FT_Load_Sfnt_Table');
-  if (@FreeType.Init = nil) or
-     (@FreeType.Done = nil) or
-     (@FreeType.NewFace = nil) or
-     (@FreeType.DoneFace = nil) or
-     (@FreeType.SetCharSize = nil) or
-     (@FreeType.LoadChar = nil) or
-     (@FreeType.LoadSfntTable = nil) then
-  begin
-    LibraryClose(FreeType.Handle);
-    FreeType.Handle := 0;
-    exit;
-  end;
-  if FreeType.Init(FreeType.FTLibrary) <> 0 then
-  begin
-    LibraryClose(FreeType.Handle);
-    FreeType.Handle := 0;
-    exit;
-  end;
-  FreeType.Loaded := true;
-  result := true;
+    lib.fLoaded := true;
+    FreeType := lib;
+    result := true;
+  end
+  else
+    lib.Free; // the next call tries again
 end;
 
 
@@ -360,7 +357,7 @@ begin
         ScanFontsDir(IncludeTrailingPathDelimiter(ADir) + sr.Name, AMap)
       else
       begin
-        ext := LowerCase(ExtractFileExt(sr.Name));
+        ext := SysUtils.LowerCase(ExtractFileExt(sr.Name));
         if (ext = '.ttf') or (ext = '.otf') or (ext = '.ttc') then
         begin
           if not FreeType.Loaded then
@@ -404,10 +401,8 @@ var
   best:  integer;
   score: integer;
   s:     integer;
-  lname: RawUtf8;
 begin
   result := '';
-  lname  := LowerCase(AFaceName);
   best   := -1;
   score  := -1;
   for i := 0 to high(AMap) do
@@ -561,6 +556,7 @@ end;
 function TFreeTypeFontProvider.CreateFont(
   const Request: TFontRequest): TFontHandle;
 var
+  faceName: RawUtf8;
   filePath: RawUtf8;
   face:     FT_Face;
   ctx:      PFreeTypeFont;
@@ -572,7 +568,8 @@ begin
     exit;
   bold   := Request.Weight >= 600;
   italic := Request.Italic <> 0;
-  filePath := FindFontFile(fFontMap, Request.FaceName, bold, italic);
+  faceName := SynUnicodeToUtf8(Request.FaceName);
+  filePath := FindFontFile(fFontMap, faceName, bold, italic);
   if filePath = '' then
   begin
     // Fallback: try DejaVu Sans
@@ -870,20 +867,44 @@ begin
 end;
 
 
+var
+  // what this unit registered, so that only its own services are released
+  RegisteredProvider: IFontProvider;
+  RegisteredEnumerator: IFontEnumerator;
+  RegisteredDC: IFontDC;
+
+procedure RegisterFreeType;
+begin
+  RegisteredProvider := TFreeTypeFontProvider.Create;
+  RegisteredEnumerator := TFreeTypeFontEnumerator.Create;
+  RegisteredDC := TFreeTypeFontDC.Create;
+  RegisterFontPlatform(RegisteredProvider, RegisteredEnumerator, RegisteredDC);
+end;
+
+procedure UnregisterFreeType;
+begin
+  // release the services before the library they call
+  if FontProvider = RegisteredProvider then
+    FontProvider := nil;
+  if FontEnumerator = RegisteredEnumerator then
+    FontEnumerator := nil;
+  if FontDC = RegisteredDC then
+    FontDC := nil;
+  RegisteredProvider := nil;
+  RegisteredEnumerator := nil;
+  RegisteredDC := nil;
+  if FreeType.Loaded then
+    FreeType.Done(FreeType.FTLibrary);
+  FreeAndNil(FreeType); // calls FreeLib
+end;
+
+
 initialization
   if LoadFreeType then
-    RegisterFontPlatform(
-      TFreeTypeFontProvider.Create,
-      TFreeTypeFontEnumerator.Create,
-      TFreeTypeFontDC.Create);
+    RegisterFreeType;
 
 finalization
-  if FreeType.Loaded then
-  begin
-    FreeType.Done(FreeType.FTLibrary);
-    LibraryClose(FreeType.Handle);
-    FreeType.Loaded := false;
-  end;
+  UnregisterFreeType;
 
 {$endif OSWINDOWS}
 
