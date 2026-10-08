@@ -116,22 +116,26 @@ type
   TFontCharAbcArray = array of TFontCharAbc;
 
   /// how to draw one part of a shaped text
+  // - fskPlain: draw the part unshaped - first, so that a run whose Kind was
+  // never set falls back to the plain text
   // - fskShaped: Glyphs (and maybe Advances/Offsets/YOffsets) hold the result
-  // - fskPlain: draw the part unshaped
   // - fskSkip: draw nothing for the part
   // - Outcome says why, e.g. fskPlain for fsoNotNeeded or fsoFailed
   TFontShapeKind = (
-    fskShaped,
     fskPlain,
+    fskShaped,
     fskSkip);
 
   /// why IFontShaper.Shape gave one part of the text its TFontShapeKind
+  // - fsoUnknown: never set by a shaper - a run left zeroed; a caller draws
+  // such a part unshaped, whatever its Kind
   // - fsoDone: the shaper did its work - including leaving out on purpose a
   // part which draws nothing
   // - fsoNotNeeded: the part needs no shaping
   // - fsoFailed: the shaper could not shape the part; Kind says what to draw
   // instead, e.g. fskSkip where the platform API used to drop it
   TFontShapeOutcome = (
+    fsoUnknown,
     fsoDone,
     fsoNotNeeded,
     fsoFailed);
@@ -238,7 +242,8 @@ type
     // - returns false when the whole text should be drawn unshaped, e.g.
     // because no part of it needs shaping or the shaper failed
     // - otherwise the runs cover every code unit of Text once, in visual
-    // order, a part left out included (Kind = fskSkip)
+    // order, a part left out included (Kind = fskSkip); every run has its
+    // Kind and Outcome set
     function Shape(Text: PWideChar; Len: integer; Font: TFontHandle;
       RightToLeft: boolean; out Runs: TFontShapedRuns): boolean;
   end;
