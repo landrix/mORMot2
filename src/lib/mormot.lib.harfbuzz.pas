@@ -241,9 +241,33 @@ begin // round half away from zero, the sign being kept for the offsets
     result := -((32 - AValue) shr 6);
 end;
 
+// true if the text holds a character of a script that needs OpenType shaping:
+// what Uniscribe's ScriptItemize marks as complex, so that a Latin text is
+// left to the caller unshaped on both platforms
+function NeedsShaping(Text: PWideChar; Len: integer): boolean;
+var
+  i: integer;
+  c: cardinal;
+begin
+  result := true;
+  for i := 0 to Len - 1 do
+  begin
+    c := ord(Text[i]);
+    if ((c >= $0590) and (c <= $109F)) or // Hebrew, Arabic, Indic ... Myanmar
+       ((c >= $1780) and (c <= $18AF)) or // Khmer, Mongolian
+       ((c >= $A800) and (c <= $ABFF)) or // Syloti Nagri ... Meetei Mayek
+       ((c >= $FB1D) and (c <= $FDFF)) or // Hebrew and Arabic presentation forms A
+       ((c >= $FE70) and (c <= $FEFE)) then // Arabic presentation forms B
+      exit;
+  end;
+  result := false;
+end;
+
 type
   /// HarfBuzz implementation of IFontShaper
   // - shapes the whole text in one call: one fskShaped run, every glyph kept
+  // - returns false for a text which is not RightToLeft and has no character
+  // of a script that needs shaping (NeedsShaping)
   THarfBuzzShaper = class(TInterfacedObject, IFontShaper)
   public
     function Shape(Text: PWideChar; Len: integer; Font: TFontHandle;
@@ -264,7 +288,8 @@ begin
   result := false;
   Runs   := nil;
   if not HarfBuzz.Loaded or (Font = nil) or
-     (Text = nil) or (Len <= 0) then
+     (Text = nil) or (Len <= 0) or
+     not (RightToLeft or NeedsShaping(Text, Len)) then
     exit;
   ctx := PFreeTypeFont(Font);
   if ctx^.Face = nil then
@@ -501,7 +526,15 @@ type
   public
     function Subset(const Face: RawByteString; const Request: TFontSubsetRequest;
       Font: TFontHandle; out Output: RawByteString): boolean;
+    /// false: the request holds WinAnsi code points, while a symbol font maps
+    // its glyphs at U+F0xx - hb-subset would drop them
+    function SupportsSymbolic: boolean;
   end;
+
+function THarfBuzzSubsetter.SupportsSymbolic: boolean;
+begin
+  result := false;
+end;
 
 // both outline flavours are embeddable: glyf goes to /FontFile2, CFF to
 // /FontFile3 with /Subtype /OpenType - the caller tells them apart by the

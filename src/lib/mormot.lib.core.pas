@@ -12,8 +12,8 @@ unit mormot.lib.core;
    - Font Services Registration
 
    No implementation here: the contracts of the font services implemented
-   by mormot.lib.freetype and mormot.lib.harfbuzz (POSIX), and planned for
-   mormot.lib.uniscribe (Windows), as needed by the cross-platform PDF engine.
+   by mormot.lib.uniscribe (Windows), mormot.lib.freetype and
+   mormot.lib.harfbuzz (POSIX), as needed by the cross-platform PDF engine.
 
   *****************************************************************************
 }
@@ -257,6 +257,10 @@ type
     // - returns false if the font cannot be subset: the caller keeps Face
     function Subset(const Face: RawByteString; const Request: TFontSubsetRequest;
       Font: TFontHandle; out Output: RawByteString): boolean;
+    /// true if Subset keeps the glyphs of a symbol font, which reaches them
+    // through a (3,0) cmap at U+F0xx rather than through Request.Unicodes
+    // - a caller embeds a symbol font whole when this is false
+    function SupportsSymbolic: boolean;
   end;
 
 

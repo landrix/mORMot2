@@ -12,6 +12,7 @@ unit mormot.lib.uniscribe;
    - UniScribe API Functions
    - FontSub API for font sunset embedding
    - GDI Font Services: IFontProvider, IFontEnumerator and IFontDC
+   - Uniscribe Shaper and FontSub Subsetter: IFontShaper and IFontSubsetter
 
   *****************************************************************************
 
@@ -309,8 +310,29 @@ function ScriptApplyDigitSubstitution(
     const psState: pointer): HRESULT;
   stdcall; external Usp10;
 
+/// Uniscribe function to release a font metric cache filled by ScriptShape
+function ScriptFreeCache(var psc: pointer): HRESULT;
+  stdcall; external Usp10;
+
 
 { ****************** FontSub API for font sunset embedding }
+
+const
+  /// CreateFontPackage() usFlags: make a subset
+  TTFCFP_FLAGS_SUBSET = 1;
+  /// CreateFontPackage() usFlags: the source is a .ttc collection
+  TTFCFP_FLAGS_TTC = 4;
+  /// CreateFontPackage() usFlags: the keep list holds glyph indexes, not
+  // code points - glyphs of shaped text have no code point of their own
+  TTFCFP_FLAGS_GLYPHLIST = 8;
+  /// CreateFontPackage() usSubsetFormat: a subset keeping the glyph indexes
+  TTFMFP_SUBSET = 0;
+  /// CreateFontPackage() usSubsetPlatform: Microsoft
+  TTFCFP_MS_PLATFORMID = 3;
+  /// CreateFontPackage() usSubsetEncoding: any
+  TTFCFP_DONT_CARE = 65535;
+  /// GetFontData() table tag of a whole .ttc collection: 'ttcf'
+  TTCF_TABLE = $66637474;
 
 var
   /// font subset embedding using Windows XP CreateFontPackage() FontSub.dll
@@ -366,6 +388,47 @@ type
     procedure DeleteDC(DC: TFontDC);
     function GetScreenLogPixels(DC: TFontDC): integer;
   end;
+
+
+{ ****************** Uniscribe Shaper and FontSub Subsetter: IFontShaper and IFontSubsetter }
+
+type
+  /// Uniscribe implementation of IFontShaper
+  // - returns false when no item of the text is complex or right-to-left
+  // - otherwise one run per item, in visual order (ScriptLayout); ScriptShape
+  // runs without a DC first, with one on E_PENDING or USP_E_SCRIPT_NOT_IN_FONT
+  // - an item ScriptShape fails on is fskPlain + fsoFailed after E_OUTOFMEMORY
+  // or a failed retry, fskSkip + fsoFailed after any other error, and an item
+  // shaped to no glyph at all is fskSkip + fsoDone
+  // - zero-width glyphs which are no diacritic are left out; Advances and
+  // Offsets stay empty, the advances of the font apply
+  TUniscribeShaper = class(TInterfacedObject, IFontShaper)
+  public
+    function Shape(Text: PWideChar; Len: integer; Font: TFontHandle;
+      RightToLeft: boolean; out Runs: TFontShapedRuns): boolean;
+  end;
+
+  /// FontSub implementation of IFontSubsetter, through CreateFontPackage
+  // - keeps glyph indexes (TTFCFP_FLAGS_GLYPHLIST): Request.Unicodes are
+  // resolved through the cmap of Font with GetGlyphIndicesW, so Font is needed
+  // - a face of a .ttc collection is subset from the whole collection, at the
+  // index of its table directory in the collection header (TtcFaceIndex)
+  TFontSubSubsetter = class(TInterfacedObject, IFontSubsetter)
+  public
+    function Subset(const Face: RawByteString; const Request: TFontSubsetRequest;
+      Font: TFontHandle; out Output: RawByteString): boolean;
+    function SupportsSymbolic: boolean;
+  end;
+
+/// the index of a face in a .ttc collection, from the bytes
+// - Face is the face as GetFontData(DC, 0, ...) returns it: its table
+// directory is the one at the offset of its index in the collection header
+// - returns -1 if no face, or more than one, matches
+function TtcFaceIndex(const Ttc, Face: RawByteString): integer;
+
+/// keep only the tables a PDF needs of a CreateFontPackage subset
+procedure ReduceTtf(out Ttf: RawByteString; SubsetData: pointer;
+  SubsetSize: integer);
 
 
 implementation
@@ -590,16 +653,446 @@ begin
 end;
 
 
-initialization
+{ ****************** Uniscribe Shaper and FontSub Subsetter: IFontShaper and IFontSubsetter }
+
+{ TUniscribeShaper }
+
+function TUniscribeShaper.Shape(Text: PWideChar; Len: integer;
+  Font: TFontHandle; RightToLeft: boolean; out Runs: TFontShapedRuns): boolean;
+var
+  i, j, n, L, max, maxglyphs, count, numSp, glyphsCount: integer;
+  res: HRESULT;
+  Sp: PScriptPropertiesArray;
+  items: array of TScriptItem;
+  level: array of byte;
+  VisualToLogical: array of integer;
+  psc: pointer; // opaque Uniscribe font metric cache
+  complex, R2L: boolean;
+  attrs: array of TScriptVisAttr;
+  glyphs, logclust: array of word;
+  control: TScriptControl;
+  state: TScriptState;
+  dc: HDC;
+  old: HGDIOBJ;
+
+  procedure AddRun(Kind: TFontShapeKind; Outcome: TFontShapeOutcome);
+  begin
+    SetLength(Runs, n + 1);
+    Runs[n].Kind := Kind;
+    Runs[n].Outcome := Outcome;
+    Runs[n].TextStart := items[i].iCharPos;
+    Runs[n].TextLen := L;
+    inc(n);
+  end;
+
+  procedure AddShaped;
+  var
+    g, k: integer;
+  begin
+    if glyphsCount = 0 then
+    begin
+      AddRun(fskSkip, fsoDone); // nothing to draw
+      exit;
+    end;
+    AddRun(fskShaped, fsoDone);
+    SetLength(Runs[n - 1].Glyphs, glyphsCount);
+    k := 0;
+    for g := 0 to glyphsCount - 1 do
+      // a zero-width glyph which is no diacritic draws nothing
+      if attrs[g].fFlags * [fDiacritic, fZeroWidth] <> [fZeroWidth] then
+      begin
+        Runs[n - 1].Glyphs[k] := glyphs[g];
+        inc(k);
+      end;
+    SetLength(Runs[n - 1].Glyphs, k);
+  end;
+
+begin
+  result := false;
+  Runs := nil;
+  if (Text = nil) or
+     (Len <= 0) or
+     (Font = nil) then
+    exit;
+  // 1. break the text into individually shapeable items
+  max := Len + 3;
+  SetLength(items, max + 1); // ScriptItemize adds a terminal item
+  count := 0;
+  FillCharFast(control, SizeOf(control), 0);
+  FillCharFast(state, SizeOf(state), 0);
+  if ScriptApplyDigitSubstitution(nil, @control, @state) <> 0 then
+    exit;
+  if RightToLeft then
+    state.uBidiLevel := 1;
+  if (ScriptItemize(Text, Len, max, @control, @state,
+       pointer(items), count) <> 0) or
+     (count <= 0) then
+    exit;
+  // 2. leave the text to the caller unless an item needs shaping or layout
+  ScriptGetProperties(Sp, numSp);
+  complex := false;
+  R2L := false;
+  for i := 0 to count - 1 do
+    if fComplex in Sp^[items[i].a.eScript and (1 shl 10 - 1)]^.fFlags then
+      complex := true
+    else if fRtl in items[i].a.fFlags then
+      R2L := true;
+  if not complex and
+     not R2L then
+    exit;
+  // 3. the visual order of the items
+  SetLength(level, count);
+  for i := 0 to count - 1 do
+    level[i] := items[i].a.s.uBidiLevel;
+  SetLength(VisualToLogical, count);
+  if ScriptLayout(count, pointer(level), pointer(VisualToLogical), nil) <> 0 then
+    exit;
+  // 4. shape every item; one buffer size for all, as large as the whole text
+  // with its terminating #0 needs
+  maxglyphs := ((Len + 1) * 3) shr 1 + 32;
+  SetLength(attrs, maxglyphs);
+  SetLength(glyphs, maxglyphs);
+  SetLength(logclust, maxglyphs);
+  psc := nil; // cached for the same font
+  dc := 0;
+  old := 0;
+  n := 0;
+  try
+    for j := 0 to count - 1 do
+    begin
+      i := VisualToLogical[j];
+      L := items[i + 1].iCharPos - items[i].iCharPos;
+      if L <= 0 then
+        continue; // covers no code unit
+      res := ScriptShape(0, psc, Text + items[i].iCharPos, L, maxglyphs,
+        @items[i].a, pointer(glyphs), pointer(logclust), pointer(attrs),
+        glyphsCount);
+      case res of
+        0:
+          AddShaped;
+        E_OUTOFMEMORY:
+          AddRun(fskPlain, fsoFailed); // maxglyphs too small
+        E_PENDING,
+        USP_E_SCRIPT_NOT_IN_FONT:
+          begin
+            // the font has to be selected into a DC
+            if dc = 0 then
+            begin
+              dc := CreateCompatibleDC(0);
+              old := SelectObject(dc, HGDIOBJ(Font));
+            end;
+            res := ScriptShape(dc, psc, Text + items[i].iCharPos, L, maxglyphs,
+              @items[i].a, pointer(glyphs), pointer(logclust), pointer(attrs),
+              glyphsCount);
+            if res = 0 then
+              AddShaped
+            else
+              // the script is not in this font: no font of its own is chosen
+              // here, see https://learn.microsoft.com/windows/win32/intl/
+              // displaying-text-with-uniscribe
+              AddRun(fskPlain, fsoFailed);
+          end;
+      else
+        AddRun(fskSkip, fsoFailed);
+      end;
+    end;
+  finally
+    if dc <> 0 then
+    begin
+      SelectObject(dc, old);
+      DeleteDC(dc);
+    end;
+    if psc <> nil then
+      ScriptFreeCache(psc);
+  end;
+  result := true;
+end;
+
+
+{ TFontSubSubsetter }
+
+const
+  /// GetGlyphIndicesW() flag: unmapped code points come back as $ffff
+  // - without it they resolve to glyph 0, which would keep .notdef for them
+  GGI_MARK_NONEXISTING_GLYPHS = 1;
+
+// not declared by the FPC windows unit nor by Delphi 7
+function GetGlyphIndicesW(DC: HDC; Str: PWideChar; Count: integer;
+  Glyphs: PWord; Flags: cardinal): cardinal; stdcall;
+  external 'gdi32.dll' name 'GetGlyphIndicesW';
+
+function BigEndian32(P: PAnsiChar): cardinal;
+begin
+  result := (cardinal(ord(P[0])) shl 24) or (cardinal(ord(P[1])) shl 16) or
+            (cardinal(ord(P[2])) shl 8) or cardinal(ord(P[3]));
+end;
+
+function TtcFaceIndex(const Ttc, Face: RawByteString): integer;
+var
+  n, i, ofs, dirlen: cardinal;
+begin
+  result := -1;
+  if (length(Face) < 12) or
+     (length(Ttc) < 16) or
+     (BigEndian32(pointer(Ttc)) <> $74746366) then // 'ttcf'
+    exit;
+  dirlen := 12 + 16 * ((cardinal(ord(Face[5])) shl 8) or cardinal(ord(Face[6])));
+  if cardinal(length(Face)) < dirlen then
+    exit;
+  n := BigEndian32(@Ttc[9]);
+  if (n = 0) or
+     (n > (cardinal(length(Ttc)) - 12) div 4) then // no overflow of n * 4
+    exit;
+  for i := 0 to n - 1 do
+  begin
+    ofs := BigEndian32(@Ttc[13 + i * 4]);
+    if (ofs <= cardinal(length(Ttc))) and
+       (dirlen <= cardinal(length(Ttc)) - ofs) and
+       CompareMem(@Ttc[ofs + 1], pointer(Face), dirlen) then
+      if result >= 0 then
+      begin
+        result := -1; // ambiguous: no reliable index
+        exit;
+      end
+      else
+        result := i;
+  end;
+end;
+
+type
+  TTtfTableDirectory = packed record
+    sfntVersion: cardinal; // 0x00010000 for version 1.0
+    numTables: word;       // number of tables
+    searchRange: word;     // HighBit(NumTables) x 16
+    entrySelector: word;   // Log2(HighBit(NumTables))
+    rangeShift: word;      // NumTables x 16 - SearchRange
+  end;
+  PTtfTableDirectory = ^TTtfTableDirectory;
+
+  TTtfTableEntry = packed record
+    tag: cardinal;      // table identifier
+    checksum: cardinal; // checksum for this table
+    offset: cardinal;   // offset from start of font file
+    length: cardinal;   // length of this table
+  end;
+  PTtfTableEntry = ^TTtfTableEntry;
+
+const
+  // see http://www.4real.gr/technical-documents-ttf-subset.html and
+  // https://developer.apple.com/fonts/TrueType-Reference-Manual/RM06/Chap6.html
+  TTF_SUBSET: array[0..9] of array[0..3] of AnsiChar = (
+    'head', 'cvt ', 'fpgm', 'prep', 'hhea', 'maxp', 'hmtx', 'cmap', 'loca', 'glyf');
+  HEAD_TABLE = $64616568; // 'head'
+
+procedure ReduceTtf(out Ttf: RawByteString; SubsetData: pointer;
+  SubsetSize: integer);
+var
+  dir: PTtfTableDirectory;
+  d, e: PTtfTableEntry;
+  head: PAnsiChar;
+  n, i, len: PtrInt;
+  checksum: cardinal;
+begin
+  Ttf := ''; // an out parameter: no former content to keep
+  SetLength(Ttf, SubsetSize); // maximum size
+  d := pointer(Ttf);
+  inc(PTtfTableDirectory(d));
+  // identify the tables to be included
+  e := SubsetData;
+  inc(PTtfTableDirectory(e));
+  n := 0;
+  if SubsetSize > SizeOf(PTtfTableDirectory) then
+    for i := 1 to bswap16(PTtfTableDirectory(SubsetData)^.numTables) do
+    begin
+      if IntegerScanIndex(@TTF_SUBSET, length(TTF_SUBSET), e^.tag) >= 0 then
+      begin
+        d^ := e^;
+        inc(d);
+        inc(n);
+      end;
+      inc(e);
+    end;
+  if n < 8 then // pdf expects 10 tables, and 8..15 for our fixed dir^ values
+  begin
+    MoveFast(SubsetData^, pointer(Ttf)^, SubsetSize); // paranoid
+    exit;
+  end;
+  // update the main directory
+  dir := pointer(Ttf);
+  dir^.sfntVersion := PTtfTableDirectory(SubsetData)^.sfntVersion;
+  dir^.numTables := bswap16(n);
+  dir^.searchRange := 32768; // pre-computed values for n in 8..15
+  dir^.entrySelector := 768;
+  dir^.rangeShift := 8192;
+  // include the associated data
+  checksum := 0;
+  head := nil;
+  e := pointer(Ttf);
+  inc(PTtfTableDirectory(e));
+  for i := 1 to n do
+  begin
+    len := bswap32(e^.length);
+    MoveFast(PByteArray(SubsetData)[bswap32(e^.offset)], d^, len);
+    e^.offset := bswap32(PtrUInt(d) - PtrUInt(Ttf));
+    if e^.tag = HEAD_TABLE then
+      head := pointer(d);
+    while len and 3 <> 0 do
+    begin // 32-bit padding
+      PByteArray(d)[len] := 0;
+      inc(len);
+    end;
+    inc(checksum, bswap32(e^.checksum)); // we didn't change the table itself
+    inc(PByte(d), len);
+    inc(e);
+  end;
+  // finalize the generated content
+  for i := 0 to ((SizeOf(dir^) + (n * SizeOf(e^))) shr 2) - 1 do
+    inc(checksum, PCardinalArray(Ttf)[i]);
+  if head <> nil then // head.checkSumAdjustment is at offset 8
+    PCardinal(head + 8)^ := bswap32($B1B0AFBA - checksum);
+  SetLength(Ttf, PtrUInt(d) - PtrUInt(Ttf));
+end;
+
+function TFontSubSubsetter.Subset(const Face: RawByteString;
+  const Request: TFontSubsetRequest; Font: TFontHandle;
+  out Output: RawByteString): boolean;
+var
+  dc: HDC;
+  old: HGDIOBJ;
+  keep: TSortedWordArray;
+  data: RawByteString;
+  size, submem, subsize: cardinal;
+  subdata: PAnsiChar;
+  flags, index: word;
+  idx: integer;
+  wide: array of WideChar;
+  gid: array of word;
+  i, n: PtrInt;
+  c: integer;
+begin
+  result := false;
+  Output := '';
+  if (Font = nil) or
+     (Face = '') or
+     not HasCreateFontPackage then
+    exit;
+  // the keep list has to be sorted and free of duplicates
+  keep.Count := 0;
+  for i := 0 to high(Request.Glyphs) do
+    keep.Add(Request.Glyphs[i]);
+  dc := CreateCompatibleDC(0);
+  if dc = 0 then
+    exit;
+  old := SelectObject(dc, HGDIOBJ(Font));
+  try
+    // the code points through the cmap of the font, as GDI maps them
+    SetLength(wide, length(Request.Unicodes));
+    n := 0;
+    for i := 0 to high(Request.Unicodes) do
+    begin
+      c := Request.Unicodes[i];
+      if (c > 0) and
+         (c <= $ffff) and
+         ((c < $d800) or (c > $dfff)) then
+      begin
+        wide[n] := WideChar(c);
+        inc(n);
+      end;
+    end;
+    if n > 0 then
+    begin
+      SetLength(gid, n);
+      if GetGlyphIndicesW(dc, pointer(wide), n, pointer(gid),
+           GGI_MARK_NONEXISTING_GLYPHS) <> GDI_ERROR then
+        for i := 0 to n - 1 do
+          if gid[i] <> $ffff then // not in this face: nothing to keep
+            keep.Add(gid[i]);
+    end;
+    if keep.Count = 0 then
+      exit;
+    // a face of a .ttc collection: CreateFontPackage wants the collection
+    size := Windows.GetFontData(dc, TTCF_TABLE, 0, nil, 0);
+    if size <> GDI_ERROR then
+    begin
+      SetLength(data, size);
+      if Windows.GetFontData(dc, TTCF_TABLE, 0, pointer(data), size) <> size then
+        exit;
+      idx := TtcFaceIndex(data, Face);
+      if idx < 0 then
+        exit; // no reliable index: the caller embeds the face whole
+      flags := TTFCFP_FLAGS_SUBSET or TTFCFP_FLAGS_TTC;
+      index := idx;
+    end
+    else
+    begin
+      data := Face;
+      flags := TTFCFP_FLAGS_SUBSET;
+      index := 0;
+    end;
+  finally
+    SelectObject(dc, old);
+    DeleteDC(dc);
+  end;
+  if CreateFontPackage(pointer(data), length(data), subdata, submem, subsize,
+       flags or TTFCFP_FLAGS_GLYPHLIST, index, TTFMFP_SUBSET, 0,
+       TTFCFP_MS_PLATFORMID, TTFCFP_DONT_CARE, pointer(keep.Values),
+       keep.Count, @lpfnAllocate, @lpfnReAllocate, @lpfnFree, nil) <> 0 then
+    exit;
+  try
+    ReduceTtf(Output, subdata, subsize);
+  finally
+    FreeMem(subdata);
+  end;
+  result := Output <> '';
+end;
+
+function TFontSubSubsetter.SupportsSymbolic: boolean;
+begin
+  result := true; // GetGlyphIndicesW maps the WinAnsi bytes of a symbol font
+end;
+
+
+var
+  RegisteredShaper: IFontShaper;
+  RegisteredSubsetter: IFontSubsetter;
+
+procedure RegisterUniscribe;
+begin
   RegisterFontPlatform(
     TGdiFontProvider.Create,
     TGdiFontEnumerator.Create,
     TGdiFontDC.Create);
+  {$ifndef NO_USE_UNISCRIBE} // set project-wide: no shaping, no subsetting
+  RegisteredShaper := TUniscribeShaper.Create;
+  FontShaper := RegisteredShaper;
+  if HasCreateFontPackage then
+  begin
+    RegisteredSubsetter := TFontSubSubsetter.Create;
+    FontSubsetter := RegisteredSubsetter;
+  end;
+  {$endif NO_USE_UNISCRIBE}
+end;
 
-finalization
+procedure UnregisterUniscribe;
+begin
+  // release the services before the library they call
+  if FontShaper = RegisteredShaper then
+    FontShaper := nil;
+  if FontSubsetter = RegisteredSubsetter then
+    FontSubsetter := nil;
+  RegisteredShaper := nil;
+  RegisteredSubsetter := nil;
   if (FontSub <> 0) and
      (FontSub <> INVALID_HANDLE_VALUE) then
     FreeLibrary(FontSub);
+end;
+
+
+initialization
+  RegisterUniscribe;
+
+finalization
+  UnregisterUniscribe;
 
 {$endif OSPOSIX}
 

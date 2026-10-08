@@ -36,7 +36,7 @@ Abstract Types and Interfaces Implemented by `mormot.lib.*` Units
 - Font Interfaces: Provider, Enumerator, Shaper, Subsetter
 - Font Services Registration
 
-No external library here: the contracts of the font services implemented by `mormot.lib.freetype` and `mormot.lib.harfbuzz` on POSIX, and planned for `mormot.lib.uniscribe` on Windows, as needed by the cross-platform PDF engine.
+No external library here: the contracts of the font services implemented by `mormot.lib.uniscribe` on Windows, and `mormot.lib.freetype` and `mormot.lib.harfbuzz` on POSIX, as needed by the cross-platform PDF engine.
 
 ### mormot.lib.freetype
 
@@ -53,6 +53,14 @@ HarfBuzz Text Shaping and Font Subsetting for POSIX
 - IFontShaper Implementation, using the `mormot.lib.freetype` face
 - hb-subset Minimal API Bindings (dynamic loading)
 - IFontSubsetter Implementation, retaining the glyph IDs
+
+### mormot.lib.uniscribe
+
+Uniscribe Typography, FontSub Subsetting and GDI Font Services for Windows
+- UniScribe Shared Types and API Functions
+- FontSub API (`CreateFontPackage`) for font subset embedding
+- GDI Font Services: IFontProvider, IFontEnumerator and IFontDC
+- Uniscribe Shaper and FontSub Subsetter: IFontShaper and IFontSubsetter
 
 ### mormot.lib.z
 
