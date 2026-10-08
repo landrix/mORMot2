@@ -234,7 +234,7 @@ end;
 
 function From26Dot6(AValue: hb_position_t): integer;
   {$ifdef HASINLINE} inline; {$endif}
-begin // round half away from zero, the sign being kept for x_offset
+begin // round half away from zero, the sign being kept for the offsets
   if AValue >= 0 then
     result := (AValue + 32) shr 6
   else
@@ -297,11 +297,13 @@ begin
     with Runs[0] do
     begin
       Kind      := fskShaped;
+      Outcome   := fsoDone;
       TextStart := 0;
       TextLen   := Len;
       SetLength(Glyphs,   count);
       SetLength(Advances, count);
       SetLength(Offsets,  count);
+      SetLength(YOffsets, count);
       SetLength(Clusters, count);
       for i := 0 to integer(count) - 1 do
       begin
@@ -310,6 +312,7 @@ begin
         // one em = 1000 units, so the 26.6 values are PDF units shifted by 6 bits
         Advances[i] := From26Dot6(positions[i].x_advance);
         Offsets[i]  := From26Dot6(positions[i].x_offset);
+        YOffsets[i] := From26Dot6(positions[i].y_offset);
       end;
     end;
     result := true;

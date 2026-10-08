@@ -34,8 +34,8 @@ type
   TFontHandle = type pointer;
 
   /// opaque device context of an IFontDC implementation
-  // - transitional: a HDC on Windows, a dummy on POSIX - to be replaced by a
-  // font face object owning its state
+  // - transitional: a HDC on Windows, a record holding the selected font on
+  // POSIX - to be replaced by a font face object owning its state
   TFontDC = type pointer;
 
   /// the requested font, as a Windows LOGFONTW gives it
@@ -115,20 +115,35 @@ type
   /// TFontCharAbc of consecutive characters
   TFontCharAbcArray = array of TFontCharAbc;
 
-  /// what IFontShaper.Shape did with one part of the text
-  // - fskShaped: Glyphs (and maybe Advances/Offsets) hold the result
-  // - fskPlain: the part needs no shaping - draw it unshaped
-  // - fskSkip: the part could not be shaped - draw nothing for it
+  /// how to draw one part of a shaped text
+  // - fskShaped: Glyphs (and maybe Advances/Offsets/YOffsets) hold the result
+  // - fskPlain: draw the part unshaped
+  // - fskSkip: draw nothing for the part
+  // - Outcome says why, e.g. fskPlain for fsoNotNeeded or fsoFailed
   TFontShapeKind = (
     fskShaped,
     fskPlain,
     fskSkip);
 
+  /// why IFontShaper.Shape gave one part of the text its TFontShapeKind
+  // - fsoDone: the shaper did its work - including leaving out on purpose a
+  // part which draws nothing
+  // - fsoNotNeeded: the part needs no shaping
+  // - fsoFailed: the shaper could not shape the part; Kind says what to draw
+  // instead, e.g. fskSkip where the platform API used to drop it
+  TFontShapeOutcome = (
+    fsoDone,
+    fsoNotNeeded,
+    fsoFailed);
+
   /// one part of a shaped text, in visual order
   // - positions count UTF-16 code units of the whole source text
+  // - horizontal layout: offsets move a glyph without moving the pen
   TFontShapedRun = record
-    /// what the shaper did with this part
+    /// how to draw this part
     Kind: TFontShapeKind;
+    /// why this part is drawn as Kind says
+    Outcome: TFontShapeOutcome;
     /// first code unit of the part in the source text, 0-based
     TextStart: integer;
     /// number of code units of the part
@@ -140,8 +155,12 @@ type
     /// advance per glyph in 1/1000 em, positioned - empty when the advances
     // of the font apply
     Advances: TIntegerDynArray;
-    /// horizontal offset per glyph in 1/1000 em - empty when there is none
+    /// horizontal offset per glyph in 1/1000 em, positive to the right
+    // - empty when there is none
     Offsets: TIntegerDynArray;
+    /// vertical offset per glyph in 1/1000 em, positive upwards, e.g. for a
+    // mark placed by the font's GPOS table - empty when there is none
+    YOffsets: TIntegerDynArray;
     /// source code unit of each glyph, in the whole text - empty when not known
     Clusters: TIntegerDynArray;
   end;
@@ -218,6 +237,8 @@ type
     // - RightToLeft forces the direction; false lets the script decide
     // - returns false when the whole text should be drawn unshaped, e.g.
     // because no part of it needs shaping or the shaper failed
+    // - otherwise the runs cover every code unit of Text once, in visual
+    // order, a part left out included (Kind = fskSkip)
     function Shape(Text: PWideChar; Len: integer; Font: TFontHandle;
       RightToLeft: boolean; out Runs: TFontShapedRuns): boolean;
   end;
