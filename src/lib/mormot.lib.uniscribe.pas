@@ -370,6 +370,8 @@ type
       out Metrics: TFontOutlineMetrics): boolean;
     function GetCharAbcWidths(DC: TFontDC; FirstChar, LastChar: cardinal;
       out Widths: TFontCharAbcArray): boolean;
+    function GetGlyphAdvance(DC: TFontDC; Glyph: cardinal;
+      out Advance: integer): boolean;
     function GetFontData(DC: TFontDC; TableTag, Offset: cardinal;
       Buffer: pointer; BufferSize: cardinal): cardinal;
     function FontDataError: cardinal;
@@ -583,6 +585,22 @@ begin
       Widths[i].abcC := W[i].abcC;
     end;
   end;
+end;
+
+// gdi32 since Windows 2000; FPC's Windows unit leaves it commented out
+function GetCharABCWidthsI(DC: HDC; giFirst, cgi: cardinal; pgi: PWord;
+  lpabc: PABC): BOOL; stdcall; external 'gdi32.dll' name 'GetCharABCWidthsI';
+
+function TGdiFontProvider.GetGlyphAdvance(DC: TFontDC; Glyph: cardinal;
+  out Advance: integer): boolean;
+var
+  abc: TABC;
+begin
+  result := GetCharABCWidthsI(HDC(DC), Glyph, 1, nil, @abc);
+  if result then
+    Advance := abc.abcA + integer(abc.abcB) + abc.abcC
+  else
+    Advance := 0;
 end;
 
 function TGdiFontProvider.GetFontData(DC: TFontDC; TableTag, Offset: cardinal;

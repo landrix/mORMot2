@@ -136,6 +136,8 @@ type
                             load_flags: FT_Int): FT_Error; cdecl;
   TFT_Load_Sfnt_Table   = function(face: FT_Face; tag: FT_ULong; offset: FT_Long;
                             buffer: pointer; var length: FT_ULong): FT_Error; cdecl;
+  TFT_Load_Glyph        = function(face: FT_Face; glyph_index: FT_UInt;
+                            load_flags: FT_Int): FT_Error; cdecl;
 
 const
   FT_LOAD_DEFAULT         = 0;
@@ -159,6 +161,7 @@ type
     SetCharSize:      TFT_Set_Char_Size;
     LoadChar:         TFT_Load_Char;
     LoadSfntTable:    TFT_Load_Sfnt_Table;
+    LoadGlyph:        TFT_Load_Glyph;
     /// the FT_Library instance of FT_Init_FreeType
     FTLibrary:        FT_Library;
     /// true once the library is loaded and initialized - false on nil
@@ -242,6 +245,8 @@ type
       out Metrics: TFontOutlineMetrics): boolean;
     function GetCharAbcWidths(DC: TFontDC; FirstChar, LastChar: cardinal;
       out Widths: TFontCharAbcArray): boolean;
+    function GetGlyphAdvance(DC: TFontDC; Glyph: cardinal;
+      out Advance: integer): boolean;
     function GetFontData(DC: TFontDC; TableTag, Offset: cardinal;
       Buffer: pointer; BufferSize: cardinal): cardinal;
     function FontDataError: cardinal;
@@ -290,7 +295,7 @@ const
     {$endif OSDARWIN}
 
   /// the entries of TFreeTypeLib, in the order of its fields
-  FREETYPE_ENTRIES: array[0 .. 7] of PAnsiChar = (
+  FREETYPE_ENTRIES: array[0 .. 8] of PAnsiChar = (
     'Init_FreeType',
     'Done_FreeType',
     'New_Face',
@@ -298,6 +303,7 @@ const
     'Set_Char_Size',
     'Load_Char',
     'Load_Sfnt_Table',
+    'Load_Glyph',
     nil);
 
 function TFreeTypeLib.Loaded: boolean;
@@ -679,6 +685,27 @@ begin
       Widths[i].abcC := c;
     end;
   end;
+  result := true;
+end;
+
+function TFreeTypeFontProvider.GetGlyphAdvance(DC: TFontDC; Glyph: cardinal;
+  out Advance: integer): boolean;
+var
+  dc_: PFreeTypeDC;
+  ctx: PFreeTypeFont;
+begin
+  // design units scaled once, as GetCharAbcWidths scales the advance
+  result := false;
+  Advance := 0;
+  dc_ := PFreeTypeDC(DC);
+  if (dc_ = nil) or
+     (dc_^.Current = nil) or
+     (FreeType.LoadGlyph(dc_^.Current^.Face, Glyph, FT_LOAD_NO_SCALE) <> 0) then
+    exit;
+  ctx := dc_^.Current;
+  Advance := ScaleDesignUnit(
+    PFT_GlyphSlotRec(PFT_FaceRec(ctx^.Face)^.glyph)^.metrics.horiAdvance,
+    ctx^.UnitsPerEM);
   result := true;
 end;
 

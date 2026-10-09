@@ -206,6 +206,11 @@ type
     // 128..159 are punctuation, not C1 controls
     function GetCharAbcWidths(DC: TFontDC; FirstChar, LastChar: cardinal;
       out Widths: TFontCharAbcArray): boolean;
+    /// the advance of one glyph, by glyph index, of the font selected into DC
+    // - in the units of GetCharAbcWidths (abcA + abcB + abcC), e.g. for a
+    // glyph a shaper produced which no character maps to
+    function GetGlyphAdvance(DC: TFontDC; Glyph: cardinal;
+      out Advance: integer): boolean;
     /// read the raw bytes of a TrueType/OpenType table, as Windows GetFontData
     // - TableTag is the 4-byte tag, e.g. 'cmap', or 0 for the whole font
     // - returns the number of bytes, or FontDataError
