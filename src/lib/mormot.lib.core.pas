@@ -366,25 +366,28 @@ function ExtractSfntFromTtc(const ATtc: RawByteString;
   AFaceIndex: integer): RawByteString;
 var
   base, dir, src, dst: PAnsiChar;
-  numFonts, numTables, i, faceOfs, ofs, len, total, hd: PtrUInt;
+  numFonts, numTables, i, faceOfs, ofs, len, total, hd, size: PtrUInt;
   sum: cardinal;
 begin
+  // every bound is checked as "value > size - offset": a sum could wrap
+  // around where PtrUInt has 32 bits
   result := '';
   base := pointer(ATtc);
-  if (length(ATtc) < 16) or
+  size := length(ATtc);
+  if (size < 16) or
      (PCardinal(base)^ <> TTCF_MAGIC) then
     exit; // not a collection: the caller may embed the data as it is
   numFonts := bswap32(PCardinal(base + 8)^);
   if (AFaceIndex < 0) or
      (PtrUInt(AFaceIndex) >= numFonts) or
-     (PtrUInt(length(ATtc)) < 12 + numFonts * 4) then
+     (numFonts > (size - 12) shr 2) then
     exit;
   faceOfs := bswap32(PCardinal(base + 12 + PtrUInt(AFaceIndex) * 4)^);
-  if faceOfs + 12 > PtrUInt(length(ATtc)) then
+  if faceOfs > size - 12 then
     exit;
   numTables := bswap16(PWord(base + faceOfs + 4)^);
   if (numTables = 0) or
-     (faceOfs + 12 + numTables * 16 > PtrUInt(length(ATtc))) then
+     (numTables * 16 > size - faceOfs - 12) then
     exit;
   // measure the standalone font: offset table, directory, then 4-byte aligned
   // table data - the table bytes are copied verbatim, so their per-table
@@ -395,7 +398,9 @@ begin
   begin
     ofs := bswap32(PCardinal(dir + i * 16 + 8)^);
     len := bswap32(PCardinal(dir + i * 16 + 12)^);
-    if ofs + len > PtrUInt(length(ATtc)) then
+    if (ofs > size) or
+       (len > size - ofs) or
+       (((len + 3) and not PtrUInt(3)) > PtrUInt(MaxInt) - total) then
       exit; // truncated or malformed collection
     inc(total, (len + 3) and not PtrUInt(3));
   end;
@@ -408,7 +413,8 @@ begin
   begin
     ofs := bswap32(PCardinal(dir + i * 16 + 8)^);
     len := bswap32(PCardinal(dir + i * 16 + 12)^);
-    if PCardinal(dir + i * 16)^ = $64616568 then // 'head' little-endian
+    if (PCardinal(dir + i * 16)^ = $64616568) and // 'head' little-endian
+       (len >= 12) then // checkSumAdjustment at offset 8
       hd := PtrUInt(src - dst);
     PCardinal(dst + 12 + i * 16 + 8)^ := bswap32(cardinal(src - dst));
     MoveFast(base[ofs], src^, len);
