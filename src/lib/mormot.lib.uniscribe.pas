@@ -373,6 +373,7 @@ type
     function GetFontData(DC: TFontDC; TableTag, Offset: cardinal;
       Buffer: pointer; BufferSize: cardinal): cardinal;
     function FontDataError: cardinal;
+    function GetFaceFile(DC: TFontDC; out Face: RawByteString): boolean;
   end;
 
   /// Windows GDI implementation of IFontEnumerator
@@ -419,12 +420,6 @@ type
       Font: TFontHandle; out Output: RawByteString): boolean;
     function SupportsSymbolic: boolean;
   end;
-
-/// the index of a face in a .ttc collection, from the bytes
-// - Face is the face as GetFontData(DC, 0, ...) returns it: its table
-// directory is the one at the offset of its index in the collection header
-// - returns -1 if no face, or more than one, matches
-function TtcFaceIndex(const Ttc, Face: RawByteString): integer;
 
 /// keep only the tables a PDF needs of a CreateFontPackage subset
 procedure ReduceTtf(out Ttf: RawByteString; SubsetData: pointer;
@@ -599,6 +594,54 @@ end;
 function TGdiFontProvider.FontDataError: cardinal;
 begin
   result := GDI_ERROR;
+end;
+
+function ReadFontData(dc: HDC; Tag: cardinal; out Data: RawByteString): boolean;
+var
+  size: cardinal;
+begin
+  result := false;
+  size := Windows.GetFontData(dc, Tag, 0, nil, 0);
+  if (size = GDI_ERROR) or
+     (size = 0) then
+    exit;
+  FastSetRawByteString(Data, nil, size);
+  result := Windows.GetFontData(dc, Tag, 0, pointer(Data), size) = size;
+  if not result then
+    Data := '';
+end;
+
+function TGdiFontProvider.GetFaceFile(DC: TFontDC;
+  out Face: RawByteString): boolean;
+var
+  ttc, dir: RawByteString;
+  len: cardinal;
+  index: integer;
+begin
+  // a face of a .ttc: GetFontData(0) returns its table directory with offsets
+  // into the collection, so the face is found in and extracted from the
+  // whole collection ('ttcf')
+  result := false;
+  if Windows.GetFontData(HDC(DC), TTCF_TABLE, 0, nil, 0) = GDI_ERROR then
+  begin
+    result := ReadFontData(HDC(DC), 0, Face); // a font file of one face
+    exit;
+  end;
+  if not ReadFontData(HDC(DC), TTCF_TABLE, ttc) then
+    exit; // a collection, but unreadable: never its raw face
+  // only the table directory of the face, as TtcFaceIndex compares it
+  FastSetRawByteString(dir, nil, 12);
+  if Windows.GetFontData(HDC(DC), 0, 0, pointer(dir), 12) <> 12 then
+    exit;
+  len := 12 + 16 * ((cardinal(ord(dir[5])) shl 8) or cardinal(ord(dir[6])));
+  FastSetRawByteString(dir, nil, len);
+  if Windows.GetFontData(HDC(DC), 0, 0, pointer(dir), len) <> len then
+    exit;
+  index := TtcFaceIndex(ttc, dir);
+  if index < 0 then
+    exit;
+  Face := ExtractSfntFromTtc(ttc, index);
+  result := Face <> '';
 end;
 
 { TGdiFontEnumerator }
@@ -821,44 +864,6 @@ function GetGlyphIndicesW(DC: HDC; Str: PWideChar; Count: integer;
   Glyphs: PWord; Flags: cardinal): cardinal; stdcall;
   external 'gdi32.dll' name 'GetGlyphIndicesW';
 
-function BigEndian32(P: PAnsiChar): cardinal;
-begin
-  result := (cardinal(ord(P[0])) shl 24) or (cardinal(ord(P[1])) shl 16) or
-            (cardinal(ord(P[2])) shl 8) or cardinal(ord(P[3]));
-end;
-
-function TtcFaceIndex(const Ttc, Face: RawByteString): integer;
-var
-  n, i, ofs, dirlen: cardinal;
-begin
-  result := -1;
-  if (length(Face) < 12) or
-     (length(Ttc) < 16) or
-     (BigEndian32(pointer(Ttc)) <> $74746366) then // 'ttcf'
-    exit;
-  dirlen := 12 + 16 * ((cardinal(ord(Face[5])) shl 8) or cardinal(ord(Face[6])));
-  if cardinal(length(Face)) < dirlen then
-    exit;
-  n := BigEndian32(@Ttc[9]);
-  if (n = 0) or
-     (n > (cardinal(length(Ttc)) - 12) div 4) then // no overflow of n * 4
-    exit;
-  for i := 0 to n - 1 do
-  begin
-    ofs := BigEndian32(@Ttc[13 + i * 4]);
-    if (ofs <= cardinal(length(Ttc))) and
-       (dirlen <= cardinal(length(Ttc)) - ofs) and
-       CompareMem(@Ttc[ofs + 1], pointer(Face), dirlen) then
-      if result >= 0 then
-      begin
-        result := -1; // ambiguous: no reliable index
-        exit;
-      end
-      else
-        result := i;
-  end;
-end;
-
 type
   TTtfTableDirectory = packed record
     sfntVersion: cardinal; // 0x00010000 for version 1.0
@@ -1019,7 +1024,7 @@ begin
         exit;
       idx := TtcFaceIndex(data, Face);
       if idx < 0 then
-        exit; // no reliable index: the caller embeds the face whole
+        exit; // no reliable index: not subset, and GetFaceFile fails too
       flags := TTFCFP_FLAGS_SUBSET or TTFCFP_FLAGS_TTC;
       index := idx;
     end

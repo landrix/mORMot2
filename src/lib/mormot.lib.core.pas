@@ -9,11 +9,12 @@ unit mormot.lib.core;
    Abstract Types and Interfaces Implemented by mormot.lib.* Units
    - Font Types: Specification, Metrics, Glyph Widths
    - Font Interfaces: Provider, Enumerator, Shaper, Subsetter
+   - Font Files: TrueType Collections
    - Font Services Registration
 
-   No implementation here: the contracts of the font services implemented
-   by mormot.lib.uniscribe (Windows), mormot.lib.freetype and
-   mormot.lib.harfbuzz (POSIX), as needed by the cross-platform PDF engine.
+   The contracts of the font services implemented by mormot.lib.uniscribe
+   (Windows), mormot.lib.freetype and mormot.lib.harfbuzz (POSIX), as needed
+   by the cross-platform PDF engine, and the few font file helpers they share.
 
   *****************************************************************************
 }
@@ -187,7 +188,7 @@ type
 
   /// create fonts and read their metrics and tables
   IFontProvider = interface
-    ['{91DAB0EA-F533-40D2-9E47-BFA2111E88CF}']
+    ['{A5755A06-1813-43AB-9BC7-A8F10298A9E7}']
     /// create a font handle, nil on failure
     function CreateFont(const Request: TFontRequest): TFontHandle;
     /// release a font handle returned by CreateFont
@@ -212,6 +213,12 @@ type
       Buffer: pointer; BufferSize: cardinal): cardinal;
     /// the value GetFontData returns on failure, i.e. $ffffffff
     function FontDataError: cardinal;
+    /// the face selected into DC as one standalone font file
+    // - a face of a .ttc collection is extracted from it: a collection is
+    // no font program, e.g. for a PDF /FontFile2
+    // - returns false if the face cannot be found in or extracted from its
+    // collection
+    function GetFaceFile(DC: TFontDC; out Face: RawByteString): boolean;
   end;
 
   /// list the fonts available on the system
@@ -250,7 +257,7 @@ type
 
   /// make a subset of a TrueType/OpenType font
   IFontSubsetter = interface
-    ['{90E129B6-D3B5-4B5A-B76B-55A988E2CDD3}']
+    ['{0879A056-B4AE-44DD-8630-56F9A362E5D0}']
     /// return the subset of Face which keeps what Request lists
     // - Face holds the font bytes, Font the handle they were read from
     // - glyph indexes are kept, so data built against Face stays valid
@@ -262,6 +269,23 @@ type
     // - a caller embeds a symbol font whole when this is false
     function SupportsSymbolic: boolean;
   end;
+
+
+{ ****************** Font Files: TrueType Collections }
+
+/// extract one face of a TrueType Collection as a standalone sfnt font
+// - a 'ttcf' container is not a valid /FontFile2 stream: it must be turned into
+//   a single font, which both backends do with this function
+//   (IFontProvider.GetFaceFile)
+// - returns '' when ATtc is not a collection, i.e. already a usable sfnt
+function ExtractSfntFromTtc(const ATtc: RawByteString;
+  AFaceIndex: integer): RawByteString;
+
+/// the index of a face in a .ttc collection, from the bytes
+// - Face is the face as GetFontData(DC, 0, ...) returns it: its table
+// directory is the one at the offset of its index in the collection header
+// - returns -1 if no face, or more than one, matches
+function TtcFaceIndex(const Ttc, Face: RawByteString): integer;
 
 
 { ****************** Font Services Registration }
@@ -288,6 +312,114 @@ function FontPlatformRegistered: boolean;
 
 
 implementation
+
+
+{ ****************** Font Files: TrueType Collections }
+
+function BigEndian32(P: PAnsiChar): cardinal;
+begin
+  result := (cardinal(ord(P[0])) shl 24) or (cardinal(ord(P[1])) shl 16) or
+            (cardinal(ord(P[2])) shl 8) or cardinal(ord(P[3]));
+end;
+
+function TtcFaceIndex(const Ttc, Face: RawByteString): integer;
+var
+  n, i, ofs, dirlen: cardinal;
+begin
+  result := -1;
+  if (length(Face) < 12) or
+     (length(Ttc) < 16) or
+     (BigEndian32(pointer(Ttc)) <> $74746366) then // 'ttcf'
+    exit;
+  dirlen := 12 + 16 * ((cardinal(ord(Face[5])) shl 8) or cardinal(ord(Face[6])));
+  if cardinal(length(Face)) < dirlen then
+    exit;
+  n := BigEndian32(@Ttc[9]);
+  if (n = 0) or
+     (n > (cardinal(length(Ttc)) - 12) div 4) then // no overflow of n * 4
+    exit;
+  for i := 0 to n - 1 do
+  begin
+    ofs := BigEndian32(@Ttc[13 + i * 4]);
+    if (ofs <= cardinal(length(Ttc))) and
+       (dirlen <= cardinal(length(Ttc)) - ofs) and
+       CompareMem(@Ttc[ofs + 1], pointer(Face), dirlen) then
+      if result >= 0 then
+      begin
+        result := -1; // ambiguous: no reliable index
+        exit;
+      end
+      else
+        result := i;
+  end;
+end;
+
+const
+  TTCF_MAGIC = $66637474; // 'ttcf' read as a little-endian cardinal
+
+function ExtractSfntFromTtc(const ATtc: RawByteString;
+  AFaceIndex: integer): RawByteString;
+var
+  base, dir, src, dst: PAnsiChar;
+  numFonts, numTables, i, faceOfs, ofs, len, total, hd: PtrUInt;
+  sum: cardinal;
+begin
+  result := '';
+  base := pointer(ATtc);
+  if (length(ATtc) < 16) or
+     (PCardinal(base)^ <> TTCF_MAGIC) then
+    exit; // not a collection: the caller may embed the data as it is
+  numFonts := bswap32(PCardinal(base + 8)^);
+  if (AFaceIndex < 0) or
+     (PtrUInt(AFaceIndex) >= numFonts) or
+     (PtrUInt(length(ATtc)) < 12 + numFonts * 4) then
+    exit;
+  faceOfs := bswap32(PCardinal(base + 12 + PtrUInt(AFaceIndex) * 4)^);
+  if faceOfs + 12 > PtrUInt(length(ATtc)) then
+    exit;
+  numTables := bswap16(PWord(base + faceOfs + 4)^);
+  if (numTables = 0) or
+     (faceOfs + 12 + numTables * 16 > PtrUInt(length(ATtc))) then
+    exit;
+  // measure the standalone font: offset table, directory, then 4-byte aligned
+  // table data - the table bytes are copied verbatim, so their per-table
+  // checksums stay valid
+  total := 12 + numTables * 16;
+  dir := base + faceOfs + 12;
+  for i := 0 to numTables - 1 do
+  begin
+    ofs := bswap32(PCardinal(dir + i * 16 + 8)^);
+    len := bswap32(PCardinal(dir + i * 16 + 12)^);
+    if ofs + len > PtrUInt(length(ATtc)) then
+      exit; // truncated or malformed collection
+    inc(total, (len + 3) and not PtrUInt(3));
+  end;
+  FastSetRawByteString(result, nil, total);
+  dst := pointer(result);
+  MoveFast(base[faceOfs], dst^, 12 + numTables * 16); // header + directory
+  src := dst + 12 + numTables * 16;
+  hd := 0;
+  for i := 0 to numTables - 1 do
+  begin
+    ofs := bswap32(PCardinal(dir + i * 16 + 8)^);
+    len := bswap32(PCardinal(dir + i * 16 + 12)^);
+    if PCardinal(dir + i * 16)^ = $64616568 then // 'head' little-endian
+      hd := PtrUInt(src - dst);
+    PCardinal(dst + 12 + i * 16 + 8)^ := bswap32(cardinal(src - dst));
+    MoveFast(base[ofs], src^, len);
+    FillCharFast(src[len], ((len + 3) and not PtrUInt(3)) - len, 0);
+    inc(src, (len + 3) and not PtrUInt(3));
+  end;
+  if hd <> 0 then
+  begin
+    // head.checkSumAdjustment covers the whole file, so it must be recomputed
+    PCardinal(dst + hd + 8)^ := 0;
+    sum := 0;
+    for i := 0 to (total shr 2) - 1 do
+      inc(sum, bswap32(PCardinalArray(dst)^[i]));
+    PCardinal(dst + hd + 8)^ := bswap32(cardinal($B1B0AFBA) - sum);
+  end;
+end;
 
 
 { ****************** Font Services Registration }

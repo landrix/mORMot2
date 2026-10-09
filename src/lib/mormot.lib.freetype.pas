@@ -214,14 +214,6 @@ type
   end;
   PFreeTypeFont = ^TFreeTypeFont;
 
-/// extract one face of a TrueType Collection as a standalone sfnt font
-// - a 'ttcf' container is not a valid /FontFile2 stream: it must be turned into
-//   a single font, which is what CreateFontPackage(TTFCFP_FLAGS_TTC) does on
-//   Windows and what this function does for the FreeType backend
-// - returns '' when ATtc is not a collection, i.e. already a usable sfnt
-function ExtractSfntFromTtc(const ATtc: RawByteString;
-  AFaceIndex: integer): RawByteString;
-
 /// size the FT_Face so that one em equals exactly 1000 units
 // - hb_ft_font_create() derives the HarfBuzz scale from ft_face^.size^.metrics,
 //   which stays zero on a face that was never sized: every shaped advance then
@@ -253,6 +245,7 @@ type
     function GetFontData(DC: TFontDC; TableTag, Offset: cardinal;
       Buffer: pointer; BufferSize: cardinal): cardinal;
     function FontDataError: cardinal;
+    function GetFaceFile(DC: TFontDC; out Face: RawByteString): boolean;
   end;
 
   /// FreeType2 implementation of IFontEnumerator
@@ -443,73 +436,6 @@ begin
     result := AValue
   else
     result := MulDiv(AValue, 1000, AUnitsPerEM);
-end;
-
-const
-  TTCF_MAGIC = $66637474; // 'ttcf' read as a little-endian cardinal
-
-function ExtractSfntFromTtc(const ATtc: RawByteString;
-  AFaceIndex: integer): RawByteString;
-var
-  base, dir, src, dst: PAnsiChar;
-  numFonts, numTables, i, faceOfs, ofs, len, total, hd: PtrUInt;
-  sum: cardinal;
-begin
-  result := '';
-  base := pointer(ATtc);
-  if (length(ATtc) < 16) or
-     (PCardinal(base)^ <> TTCF_MAGIC) then
-    exit; // not a collection: the caller may embed the data as it is
-  numFonts := bswap32(PCardinal(base + 8)^);
-  if (AFaceIndex < 0) or
-     (PtrUInt(AFaceIndex) >= numFonts) or
-     (PtrUInt(length(ATtc)) < 12 + numFonts * 4) then
-    exit;
-  faceOfs := bswap32(PCardinal(base + 12 + PtrUInt(AFaceIndex) * 4)^);
-  if faceOfs + 12 > PtrUInt(length(ATtc)) then
-    exit;
-  numTables := bswap16(PWord(base + faceOfs + 4)^);
-  if (numTables = 0) or
-     (faceOfs + 12 + numTables * 16 > PtrUInt(length(ATtc))) then
-    exit;
-  // measure the standalone font: offset table, directory, then 4-byte aligned
-  // table data - the table bytes are copied verbatim, so their per-table
-  // checksums stay valid
-  total := 12 + numTables * 16;
-  dir := base + faceOfs + 12;
-  for i := 0 to numTables - 1 do
-  begin
-    ofs := bswap32(PCardinal(dir + i * 16 + 8)^);
-    len := bswap32(PCardinal(dir + i * 16 + 12)^);
-    if ofs + len > PtrUInt(length(ATtc)) then
-      exit; // truncated or malformed collection
-    inc(total, (len + 3) and not PtrUInt(3));
-  end;
-  FastSetRawByteString(result, nil, total);
-  dst := pointer(result);
-  MoveFast(base[faceOfs], dst^, 12 + numTables * 16); // header + directory
-  src := dst + 12 + numTables * 16;
-  hd := 0;
-  for i := 0 to numTables - 1 do
-  begin
-    ofs := bswap32(PCardinal(dir + i * 16 + 8)^);
-    len := bswap32(PCardinal(dir + i * 16 + 12)^);
-    if PCardinal(dir + i * 16)^ = $64616568 then // 'head' little-endian
-      hd := PtrUInt(src - dst);
-    PCardinal(dst + 12 + i * 16 + 8)^ := bswap32(cardinal(src - dst));
-    MoveFast(base[ofs], src^, len);
-    FillCharFast(src[len], ((len + 3) and not PtrUInt(3)) - len, 0);
-    inc(src, (len + 3) and not PtrUInt(3));
-  end;
-  if hd <> 0 then
-  begin
-    // head.checkSumAdjustment covers the whole file, so it must be recomputed
-    PCardinal(dst + hd + 8)^ := 0;
-    sum := 0;
-    for i := 0 to (total shr 2) - 1 do
-      inc(sum, bswap32(PCardinalArray(dst)^[i]));
-    PCardinal(dst + hd + 8)^ := bswap32(cardinal($B1B0AFBA) - sum);
-  end;
 end;
 
 function FreeTypeSetEmSize1000(AFont: PFreeTypeFont): boolean;
@@ -807,6 +733,28 @@ end;
 function TFreeTypeFontProvider.FontDataError: cardinal;
 begin
   result := $FFFFFFFF;
+end;
+
+function TFreeTypeFontProvider.GetFaceFile(DC: TFontDC;
+  out Face: RawByteString): boolean;
+var
+  size: cardinal;
+begin
+  // GetFontData(0) already extracts the face of a .ttc (FilePath set); a
+  // collection it could not extract, or one loaded without a path, fails
+  result := false;
+  size := GetFontData(DC, 0, 0, nil, 0);
+  if (size = FontDataError) or
+     (size < 12) then
+    exit;
+  FastSetRawByteString(Face, nil, size);
+  if (GetFontData(DC, 0, 0, pointer(Face), size) <> size) or
+     (PCardinal(Face)^ = $66637474) then // 'ttcf' as little-endian
+  begin
+    Face := '';
+    exit;
+  end;
+  result := true;
 end;
 
 { TFreeTypeFontEnumerator }
