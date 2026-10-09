@@ -33,7 +33,7 @@ On Windows, some Operating-System high-level features like Windows HTTP and WebS
 
 Abstract Types and Interfaces Implemented by `mormot.lib.*` Units
 - Font Types: Specification, Metrics, Glyph Widths
-- Font Interfaces: Provider, Enumerator, Shaper, Subsetter
+- Font Interfaces: Face, Provider, Enumerator, Shaper, Subsetter
 - Font Services Registration
 
 No external library here: the contracts of the font services implemented by `mormot.lib.uniscribe` on Windows, and `mormot.lib.freetype` and `mormot.lib.harfbuzz` on POSIX, as needed by the cross-platform PDF engine.
@@ -44,7 +44,7 @@ FreeType2 Font Services for POSIX
 - FreeType2 Minimal API Bindings (dynamic loading)
 - Font Files Discovery: /usr/share/fonts, ~/.fonts, macOS /Library/Fonts
 - Font Collections and Face Sizing
-- IFontProvider, IFontEnumerator and IFontDC Implementation
+- IFontFace, IFontProvider and IFontEnumerator Implementation
 
 ### mormot.lib.harfbuzz
 
@@ -59,7 +59,7 @@ HarfBuzz Text Shaping and Font Subsetting for POSIX
 Uniscribe Typography, FontSub Subsetting and GDI Font Services for Windows
 - UniScribe Shared Types and API Functions
 - FontSub API (`CreateFontPackage`) for font subset embedding
-- GDI Font Services: IFontProvider, IFontEnumerator and IFontDC
+- GDI Font Services: IFontFace, IFontProvider and IFontEnumerator
 - Uniscribe Shaper and FontSub Subsetter: IFontShaper and IFontSubsetter
 
 ### mormot.lib.z

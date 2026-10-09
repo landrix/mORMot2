@@ -10,10 +10,10 @@ unit mormot.lib.freetype;
    - FreeType2 Minimal API Bindings (dynamic loading)
    - Font Files Discovery: /usr/share/fonts, ~/.fonts, macOS /Library/Fonts
    - Font Collections and Face Sizing
-   - IFontProvider, IFontEnumerator and IFontDC Implementation
+   - IFontFace, IFontProvider and IFontEnumerator Implementation
 
-   The initialization section registers the three services of mormot.lib.core
-   when libfreetype.so.6 / libfreetype.6.dylib loads.
+   The initialization section registers the provider and the enumerator of
+   mormot.lib.core when libfreetype.so.6 / libfreetype.6.dylib loads.
 
   *****************************************************************************
 }
@@ -144,9 +144,6 @@ const
   FT_LOAD_NO_SCALE        = 1;  // = 1 shl 0; returns raw design units, no 26.6 encoding
   FT_FACE_FLAG_FIXED_WIDTH = 1 shl 2;
 
-  /// standard DPI used when no real screen DPI is available
-  FREETYPE_SCREEN_DPI = 96;
-
 type
   /// the loaded FreeType2 library and its function pointers
   // - the function fields are resolved in their declaration order
@@ -222,35 +219,43 @@ type
 //   which stays zero on a face that was never sized: every shaped advance then
 //   comes back as 0.  Sizing to 1000 units per em makes HarfBuzz return 26.6
 //   values which are just the PDF-unit widths shifted by 6 bits
-// - CreateFont() does not size the face because the other entry points all use
+// - CreateFace() does not size the face because the other entry points all use
 //   FT_LOAD_NO_SCALE or read design-unit fields, so they are unaffected by this
 function FreeTypeSetEmSize1000(AFont: PFreeTypeFont): boolean;
 
 
-{ ****************** IFontProvider, IFontEnumerator and IFontDC Implementation }
+{ ****************** IFontFace, IFontProvider and IFontEnumerator Implementation }
 
 type
+  /// FreeType2 implementation of IFontFace
+  // - owns its PFreeTypeFont, which is its Handle (mormot.lib.harfbuzz reads
+  // the FT_Face from it)
+  TFreeTypeFontFace = class(TInterfacedObject, IFontFace)
+  protected
+    fFont: PFreeTypeFont;
+  public
+    /// take ownership of Font
+    constructor Create(Font: PFreeTypeFont);
+    /// release the FT_Face and the record
+    destructor Destroy; override;
+    function Handle: TFontHandle;
+    function GetTextMetrics(out Metrics: TFontMetrics): boolean;
+    function GetOutlineMetrics(out Metrics: TFontOutlineMetrics): boolean;
+    function GetCharAbcWidths(FirstChar, LastChar: cardinal;
+      out Widths: TFontCharAbcArray): boolean;
+    function GetGlyphAdvance(Glyph: cardinal; out Advance: integer): boolean;
+    function GetFontData(TableTag, Offset: cardinal; Buffer: pointer;
+      BufferSize: cardinal): cardinal;
+    function GetFaceFile(out Face: RawByteString): boolean;
+  end;
+
   /// FreeType2 implementation of IFontProvider
-  // - each TFontHandle is a PFreeTypeFont
   TFreeTypeFontProvider = class(TInterfacedObject, IFontProvider)
   private
     fFontMap: TFontFileMapDynArray;
   public
     constructor Create;
-    function CreateFont(const Request: TFontRequest): TFontHandle;
-    procedure DeleteFont(Font: TFontHandle);
-    function SelectFont(DC: TFontDC; Font: TFontHandle): TFontHandle;
-    function GetTextMetrics(DC: TFontDC; out Metrics: TFontMetrics): boolean;
-    function GetOutlineMetrics(DC: TFontDC;
-      out Metrics: TFontOutlineMetrics): boolean;
-    function GetCharAbcWidths(DC: TFontDC; FirstChar, LastChar: cardinal;
-      out Widths: TFontCharAbcArray): boolean;
-    function GetGlyphAdvance(DC: TFontDC; Glyph: cardinal;
-      out Advance: integer): boolean;
-    function GetFontData(DC: TFontDC; TableTag, Offset: cardinal;
-      Buffer: pointer; BufferSize: cardinal): cardinal;
-    function FontDataError: cardinal;
-    function GetFaceFile(DC: TFontDC; out Face: RawByteString): boolean;
+    function CreateFace(const Request: TFontRequest): IFontFace;
   end;
 
   /// FreeType2 implementation of IFontEnumerator
@@ -260,15 +265,7 @@ type
     procedure BuildFontMap;
   public
     constructor Create;
-    procedure EnumTrueTypeFonts(DC: TFontDC; var List: TRawUtf8DynArray);
-  end;
-
-  /// FreeType2 implementation of IFontDC - transitional, as IFontDC
-  TFreeTypeFontDC = class(TInterfacedObject, IFontDC)
-  public
-    function CreateDC: TFontDC;
-    procedure DeleteDC(DC: TFontDC);
-    function GetScreenLogPixels(DC: TFontDC): integer;
+    procedure EnumTrueTypeFonts(var List: TRawUtf8DynArray);
   end;
 
 
@@ -454,21 +451,14 @@ begin
 end;
 
 
-{ ****************** IFontProvider, IFontEnumerator and IFontDC Implementation }
-
-type
-  /// the record behind a TFontDC of TFreeTypeFontDC
-  TFreeTypeDC = record
-    Current: PFreeTypeFont;
-  end;
-  PFreeTypeDC = ^TFreeTypeDC;
+{ ****************** IFontFace, IFontProvider and IFontEnumerator Implementation }
 
 { TFreeTypeFontProvider }
 
 constructor TFreeTypeFontProvider.Create;
 begin
   inherited Create;
-  // Build a font map so CreateFont can find files
+  // Build a font map so CreateFace can find files
   if FreeType.Loaded then
   begin
     {$ifdef OSDARWIN}
@@ -485,8 +475,8 @@ begin
   end;
 end;
 
-function TFreeTypeFontProvider.CreateFont(
-  const Request: TFontRequest): TFontHandle;
+function TFreeTypeFontProvider.CreateFace(
+  const Request: TFontRequest): IFontFace;
 var
   faceName: RawUtf8;
   filePath: RawUtf8;
@@ -530,43 +520,61 @@ begin
   ctx^.IsFixedWidth := (faceRec^.face_flags and FT_FACE_FLAG_FIXED_WIDTH) <> 0;
   ctx^.FaceIndex    := 0; // FT_New_Face() above always opens the first face
   ctx^.SfntChecked  := false; // New() initializes managed fields only
-  result := TFontHandle(ctx);
+  result := TFreeTypeFontFace.Create(ctx);
 end;
 
-procedure TFreeTypeFontProvider.DeleteFont(Font: TFontHandle);
 var
-  ctx: PFreeTypeFont;
+  // the faces alive: FreeType is unloaded only once the last one is released,
+  // even when a face outlives the finalization of this unit
+  FaceCount: integer;
+  UnloadPending: boolean;
+
+procedure UnloadFreeType;
 begin
-  if Font = nil then
+  if FreeType = nil then
     exit;
-  ctx := PFreeTypeFont(Font);
-  if ctx^.Face <> nil then
-    FreeType.DoneFace(ctx^.Face);
-  Dispose(ctx);
+  if FreeType.Loaded then
+    FreeType.Done(FreeType.FTLibrary);
+  FreeAndNil(FreeType); // calls FreeLib
 end;
 
-function TFreeTypeFontProvider.SelectFont(DC: TFontDC;
-  Font: TFontHandle): TFontHandle;
-var
-  dc_: PFreeTypeDC;
+{ TFreeTypeFontFace }
+
+constructor TFreeTypeFontFace.Create(Font: PFreeTypeFont);
 begin
-  dc_ := PFreeTypeDC(DC);
-  result := TFontHandle(dc_^.Current);
-  dc_^.Current := PFreeTypeFont(Font);
+  inherited Create;
+  fFont := Font;
+  InterlockedIncrement(FaceCount);
 end;
 
-function TFreeTypeFontProvider.GetTextMetrics(DC: TFontDC;
-  out Metrics: TFontMetrics): boolean;
+destructor TFreeTypeFontFace.Destroy;
+begin
+  if fFont <> nil then
+  begin
+    if fFont^.Face <> nil then
+      FreeType.DoneFace(fFont^.Face);
+    Dispose(fFont);
+  end;
+  if (InterlockedDecrement(FaceCount) = 0) and
+     UnloadPending then
+    UnloadFreeType;
+  inherited Destroy;
+end;
+
+function TFreeTypeFontFace.Handle: TFontHandle;
+begin
+  result := TFontHandle(fFont);
+end;
+
+function TFreeTypeFontFace.GetTextMetrics(out Metrics: TFontMetrics): boolean;
 var
-  dc_: PFreeTypeDC;
   ctx: PFreeTypeFont;
   fr:  PFT_FaceRec;
 begin
   result := false;
-  dc_ := PFreeTypeDC(DC);
-  if (dc_ = nil) or (dc_^.Current = nil) then
+  ctx := fFont;
+  if ctx = nil then
     exit;
-  ctx := dc_^.Current;
   fr  := PFT_FaceRec(ctx^.Face);
   FillChar(Metrics, SizeOf(Metrics), 0);
   Metrics.tmAscent  := ctx^.Ascent;
@@ -592,18 +600,16 @@ begin
   result := true;
 end;
 
-function TFreeTypeFontProvider.GetOutlineMetrics(DC: TFontDC;
+function TFreeTypeFontFace.GetOutlineMetrics(
   out Metrics: TFontOutlineMetrics): boolean;
 var
-  dc_: PFreeTypeDC;
   ctx: PFreeTypeFont;
   fr:  PFT_FaceRec;
 begin
   result := false;
-  dc_ := PFreeTypeDC(DC);
-  if (dc_ = nil) or (dc_^.Current = nil) then
+  ctx := fFont;
+  if ctx = nil then
     exit;
-  ctx := dc_^.Current;
   fr  := PFT_FaceRec(ctx^.Face);
   FillChar(Metrics, SizeOf(Metrics), 0);
   Metrics.otmSize     := SizeOf(Metrics);
@@ -621,10 +627,9 @@ begin
   result := true;
 end;
 
-function TFreeTypeFontProvider.GetCharAbcWidths(DC: TFontDC;
-  FirstChar, LastChar: cardinal; out Widths: TFontCharAbcArray): boolean;
+function TFreeTypeFontFace.GetCharAbcWidths(FirstChar, LastChar: cardinal;
+  out Widths: TFontCharAbcArray): boolean;
 var
-  dc_:   PFreeTypeDC;
   ctx:   PFreeTypeFont;
   n, i:  integer;
   slot:  PFT_GlyphSlotRec;
@@ -636,10 +641,9 @@ var
   total: integer;
 begin
   result := false;
-  dc_ := PFreeTypeDC(DC);
-  if (dc_ = nil) or (dc_^.Current = nil) then
+  ctx := fFont;
+  if ctx = nil then
     exit;
-  ctx := dc_^.Current;
   n := integer(LastChar) - integer(FirstChar) + 1;
   if n <= 0 then
     exit;
@@ -688,40 +692,32 @@ begin
   result := true;
 end;
 
-function TFreeTypeFontProvider.GetGlyphAdvance(DC: TFontDC; Glyph: cardinal;
+function TFreeTypeFontFace.GetGlyphAdvance(Glyph: cardinal;
   out Advance: integer): boolean;
-var
-  dc_: PFreeTypeDC;
-  ctx: PFreeTypeFont;
 begin
   // design units scaled once, as GetCharAbcWidths scales the advance
   result := false;
   Advance := 0;
-  dc_ := PFreeTypeDC(DC);
-  if (dc_ = nil) or
-     (dc_^.Current = nil) or
-     (FreeType.LoadGlyph(dc_^.Current^.Face, Glyph, FT_LOAD_NO_SCALE) <> 0) then
+  if (fFont = nil) or
+     (FreeType.LoadGlyph(fFont^.Face, Glyph, FT_LOAD_NO_SCALE) <> 0) then
     exit;
-  ctx := dc_^.Current;
   Advance := ScaleDesignUnit(
-    PFT_GlyphSlotRec(PFT_FaceRec(ctx^.Face)^.glyph)^.metrics.horiAdvance,
-    ctx^.UnitsPerEM);
+    PFT_GlyphSlotRec(PFT_FaceRec(fFont^.Face)^.glyph)^.metrics.horiAdvance,
+    fFont^.UnitsPerEM);
   result := true;
 end;
 
-function TFreeTypeFontProvider.GetFontData(DC: TFontDC;
-  TableTag, Offset: cardinal; Buffer: pointer; BufferSize: cardinal): cardinal;
+function TFreeTypeFontFace.GetFontData(TableTag, Offset: cardinal;
+  Buffer: pointer; BufferSize: cardinal): cardinal;
 var
-  dc_: PFreeTypeDC;
   ctx: PFreeTypeFont;
   len: FT_ULong;
   err: FT_Error;
 begin
-  result := FontDataError;
-  dc_ := PFreeTypeDC(DC);
-  if (dc_ = nil) or (dc_^.Current = nil) then
+  result := FONT_DATA_ERROR;
+  ctx := fFont;
+  if ctx = nil then
     exit;
-  ctx := dc_^.Current;
   if TableTag = 0 then
   begin
     // "whole font file": for a .ttc this would return the entire collection,
@@ -738,7 +734,7 @@ begin
       result := length(ctx^.Sfnt);
       if Buffer <> nil then
         if BufferSize < result then
-          result := FontDataError
+          result := FONT_DATA_ERROR
         else
           MoveFast(pointer(ctx^.Sfnt)^, Buffer^, result);
       exit;
@@ -757,25 +753,19 @@ begin
   result := len;
 end;
 
-function TFreeTypeFontProvider.FontDataError: cardinal;
-begin
-  result := $FFFFFFFF;
-end;
-
-function TFreeTypeFontProvider.GetFaceFile(DC: TFontDC;
-  out Face: RawByteString): boolean;
+function TFreeTypeFontFace.GetFaceFile(out Face: RawByteString): boolean;
 var
   size: cardinal;
 begin
   // GetFontData(0) already extracts the face of a .ttc (FilePath set); a
   // collection it could not extract, or one loaded without a path, fails
   result := false;
-  size := GetFontData(DC, 0, 0, nil, 0);
-  if (size = FontDataError) or
+  size := GetFontData(0, 0, nil, 0);
+  if (size = FONT_DATA_ERROR) or
      (size < 12) then
     exit;
   FastSetRawByteString(Face, nil, size);
-  if (GetFontData(DC, 0, 0, pointer(Face), size) <> size) or
+  if (GetFontData(0, 0, pointer(Face), size) <> size) or
      (PCardinal(Face)^ = $66637474) then // 'ttcf' as little-endian
   begin
     Face := '';
@@ -807,53 +797,27 @@ begin
   {$endif OSDARWIN}
 end;
 
-procedure TFreeTypeFontEnumerator.EnumTrueTypeFonts(DC: TFontDC;
-  var List: TRawUtf8DynArray);
+procedure TFreeTypeFontEnumerator.EnumTrueTypeFonts(var List: TRawUtf8DynArray);
 var
   i: integer;
 begin
   { Enumerate all fonts in fFontMap, but only add family names once (duplicates
     are filtered by AddRawUtf8 with true,true). The font variants (Bold, Italic)
-    are found via CreateFont -> FindFontFile which matches against Bold/Italic flags. }
+    are found via CreateFace -> FindFontFile which matches against Bold/Italic flags. }
   for i := 0 to high(fFontMap) do
     AddRawUtf8(List, fFontMap[i].FamilyName, true, true);
 end;
-
-{ TFreeTypeFontDC }
-
-function TFreeTypeFontDC.CreateDC: TFontDC;
-var
-  dc_: PFreeTypeDC;
-begin
-  New(dc_);
-  dc_^.Current := nil;
-  result := TFontDC(dc_);
-end;
-
-procedure TFreeTypeFontDC.DeleteDC(DC: TFontDC);
-begin
-  if DC <> nil then
-    Dispose(PFreeTypeDC(DC));
-end;
-
-function TFreeTypeFontDC.GetScreenLogPixels(DC: TFontDC): integer;
-begin
-  result := FREETYPE_SCREEN_DPI;
-end;
-
 
 var
   // what this unit registered, so that only its own services are released
   RegisteredProvider: IFontProvider;
   RegisteredEnumerator: IFontEnumerator;
-  RegisteredDC: IFontDC;
 
 procedure RegisterFreeType;
 begin
   RegisteredProvider := TFreeTypeFontProvider.Create;
   RegisteredEnumerator := TFreeTypeFontEnumerator.Create;
-  RegisteredDC := TFreeTypeFontDC.Create;
-  RegisterFontPlatform(RegisteredProvider, RegisteredEnumerator, RegisteredDC);
+  RegisterFontPlatform(RegisteredProvider, RegisteredEnumerator);
 end;
 
 procedure UnregisterFreeType;
@@ -863,14 +827,12 @@ begin
     FontProvider := nil;
   if FontEnumerator = RegisteredEnumerator then
     FontEnumerator := nil;
-  if FontDC = RegisteredDC then
-    FontDC := nil;
   RegisteredProvider := nil;
   RegisteredEnumerator := nil;
-  RegisteredDC := nil;
-  if FreeType.Loaded then
-    FreeType.Done(FreeType.FTLibrary);
-  FreeAndNil(FreeType); // calls FreeLib
+  // a face still alive unloads the library when it is released
+  UnloadPending := true;
+  if FaceCount = 0 then
+    UnloadFreeType;
 end;
 
 

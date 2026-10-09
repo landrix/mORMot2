@@ -8,7 +8,7 @@ unit mormot.lib.core;
 
    Abstract Types and Interfaces Implemented by mormot.lib.* Units
    - Font Types: Specification, Metrics, Glyph Widths
-   - Font Interfaces: Provider, Enumerator, Shaper, Subsetter
+   - Font Interfaces: Face, Provider, Enumerator, Shaper, Subsetter
    - Font Files: TrueType Collections
    - Font Services Registration
 
@@ -30,14 +30,9 @@ uses
 { ****************** Font Types: Specification, Metrics, Glyph Widths }
 
 type
-  /// opaque font handle of an IFontProvider implementation
-  // - e.g. a HFONT on Windows, a FT_Face with FreeType
+  /// opaque native handle of an IFontFace, for IFontShaper and IFontSubsetter
+  // - a HFONT on Windows, a PFreeTypeFont with FreeType
   TFontHandle = type pointer;
-
-  /// opaque device context of an IFontDC implementation
-  // - transitional: a HDC on Windows, a record holding the selected font on
-  // POSIX - to be replaced by a font face object owning its state
-  TFontDC = type pointer;
 
   /// the requested font, as a Windows LOGFONTW gives it
   TFontRequest = record
@@ -184,65 +179,68 @@ type
   end;
 
 
-{ ****************** Font Interfaces: Provider, Enumerator, Shaper, Subsetter }
+{ ****************** Font Interfaces: Face, Provider, Enumerator, Shaper, Subsetter }
 
-  /// create fonts and read their metrics and tables
-  IFontProvider = interface
-    ['{A5755A06-1813-43AB-9BC7-A8F10298A9E7}']
-    /// create a font handle, nil on failure
-    function CreateFont(const Request: TFontRequest): TFontHandle;
-    /// release a font handle returned by CreateFont
-    procedure DeleteFont(Font: TFontHandle);
-    /// select a font into a device context, returning the previous one
-    // - transitional, as TFontDC
-    function SelectFont(DC: TFontDC; Font: TFontHandle): TFontHandle;
-    /// the metrics of the font selected into DC
-    function GetTextMetrics(DC: TFontDC; out Metrics: TFontMetrics): boolean;
-    /// the outline metrics of the font selected into DC
-    function GetOutlineMetrics(DC: TFontDC;
-      out Metrics: TFontOutlineMetrics): boolean;
+const
+  /// what IFontFace.GetFontData returns on failure (GDI_ERROR on Windows)
+  FONT_DATA_ERROR = cardinal($ffffffff);
+
+type
+  /// one font face as a TFontRequest asked for, owning its native state
+  // - from IFontProvider.CreateFace and released by reference counting, e.g.
+  // shared by the WinAnsi and the Unicode font of a PDF document
+  // - no selection into a device context: each method reads this face
+  // - metrics and widths are those of a 1000 units per em face, as the PDF
+  // engine asks with Height = -1000: GDI scales to the requested height, the
+  // FreeType face always to 1000 units
+  // - a face belongs to the thread that uses it: the GDI face keeps a device
+  // context made by the thread which first measures it, valid while that
+  // thread lives; FreeType shares one library between its faces
+  IFontFace = interface
+    ['{F0C800AA-DB24-4A34-93C0-8E22DF618DA2}']
+    /// the native handle for IFontShaper and IFontSubsetter: a HFONT on
+    // Windows, a PFreeTypeFont with FreeType - valid while the face lives
+    function Handle: TFontHandle;
+    /// the metrics of the face
+    function GetTextMetrics(out Metrics: TFontMetrics): boolean;
+    /// the outline metrics of the face
+    function GetOutlineMetrics(out Metrics: TFontOutlineMetrics): boolean;
     /// the advances of the characters FirstChar..LastChar
     // - FirstChar and LastChar are WinAnsi (code page 1252) bytes, so that
     // 128..159 are punctuation, not C1 controls
-    function GetCharAbcWidths(DC: TFontDC; FirstChar, LastChar: cardinal;
+    function GetCharAbcWidths(FirstChar, LastChar: cardinal;
       out Widths: TFontCharAbcArray): boolean;
-    /// the advance of one glyph, by glyph index, of the font selected into DC
+    /// the advance of one glyph, by glyph index
     // - in the units of GetCharAbcWidths (abcA + abcB + abcC), e.g. for a
     // glyph a shaper produced which no character maps to
-    function GetGlyphAdvance(DC: TFontDC; Glyph: cardinal;
-      out Advance: integer): boolean;
+    function GetGlyphAdvance(Glyph: cardinal; out Advance: integer): boolean;
     /// read the raw bytes of a TrueType/OpenType table, as Windows GetFontData
-    // - TableTag is the 4-byte tag, e.g. 'cmap', or 0 for the whole font
-    // - returns the number of bytes, or FontDataError
-    function GetFontData(DC: TFontDC; TableTag, Offset: cardinal;
-      Buffer: pointer; BufferSize: cardinal): cardinal;
-    /// the value GetFontData returns on failure, i.e. $ffffffff
-    function FontDataError: cardinal;
-    /// the face selected into DC as one standalone font file
+    // - TableTag is the 4-byte tag read as a little-endian cardinal, e.g.
+    // 'cmap', or 0 for the whole font: for a face of a .ttc, its table
+    // directory with offsets into the collection, as GDI returns it
+    // - returns the number of bytes, or FONT_DATA_ERROR
+    function GetFontData(TableTag, Offset: cardinal; Buffer: pointer;
+      BufferSize: cardinal): cardinal;
+    /// the face as one standalone font file
     // - a face of a .ttc collection is extracted from it: a collection is
     // no font program, e.g. for a PDF /FontFile2
     // - returns false if the face cannot be found in or extracted from its
     // collection
-    function GetFaceFile(DC: TFontDC; out Face: RawByteString): boolean;
+    function GetFaceFile(out Face: RawByteString): boolean;
+  end;
+
+  /// create font faces
+  IFontProvider = interface
+    ['{EDA8601C-380D-43C7-8B9A-5DC50516C103}']
+    /// the face the system resolves Request to, nil on failure
+    function CreateFace(const Request: TFontRequest): IFontFace;
   end;
 
   /// list the fonts available on the system
   IFontEnumerator = interface
-    ['{176128CF-BF4B-4B30-ADF1-25BC3B1249D7}']
+    ['{43E765AA-942B-4058-A843-7B7FED1324B6}']
     /// add the UTF-8 family names of the TrueType fonts to List
-    procedure EnumTrueTypeFonts(DC: TFontDC; var List: TRawUtf8DynArray);
-  end;
-
-  /// device contexts for IFontProvider
-  // - transitional: to be replaced by a font face object owning its state
-  IFontDC = interface
-    ['{F99740CC-609D-4868-8A86-D5E64AB32473}']
-    /// create a device context to measure fonts with
-    function CreateDC: TFontDC;
-    /// release a device context returned by CreateDC
-    procedure DeleteDC(DC: TFontDC);
-    /// the screen resolution in pixels per inch (Y axis)
-    function GetScreenLogPixels(DC: TFontDC): integer;
+    procedure EnumTrueTypeFonts(var List: TRawUtf8DynArray);
   end;
 
   /// shape Unicode text with the OpenType rules of a font
@@ -264,7 +262,8 @@ type
   IFontSubsetter = interface
     ['{0879A056-B4AE-44DD-8630-56F9A362E5D0}']
     /// return the subset of Face which keeps what Request lists
-    // - Face holds the font bytes, Font the handle they were read from
+    // - Face holds the font bytes, Font the IFontFace.Handle they were read
+    // from
     // - glyph indexes are kept, so data built against Face stays valid
     // - returns false if the font cannot be subset: the caller keeps Face
     function Subset(const Face: RawByteString; const Request: TFontSubsetRequest;
@@ -287,7 +286,7 @@ function ExtractSfntFromTtc(const ATtc: RawByteString;
   AFaceIndex: integer): RawByteString;
 
 /// the index of a face in a .ttc collection, from the bytes
-// - Face is the face as GetFontData(DC, 0, ...) returns it: its table
+// - Face is the face as IFontFace.GetFontData(0, ...) returns it: its table
 // directory is the one at the offset of its index in the collection header
 // - returns -1 if no face, or more than one, matches
 function TtcFaceIndex(const Ttc, Face: RawByteString): integer;
@@ -300,8 +299,6 @@ var
   FontProvider: IFontProvider;
   /// the registered font enumerator
   FontEnumerator: IFontEnumerator;
-  /// the registered device context provider - transitional
-  FontDC: IFontDC;
   /// the registered text shaper, nil when no shaping library is available
   FontShaper: IFontShaper;
   /// the registered font subsetter, nil when none is available
@@ -310,9 +307,9 @@ var
 /// register the font services of an implementation unit
 // - a nil parameter leaves the current registration unchanged
 procedure RegisterFontPlatform(const Provider: IFontProvider;
-  const Enumerator: IFontEnumerator; const DC: IFontDC);
+  const Enumerator: IFontEnumerator);
 
-/// true when a provider, an enumerator and a device context are registered
+/// true when a provider and an enumerator are registered
 function FontPlatformRegistered: boolean;
 
 
@@ -436,21 +433,18 @@ end;
 { ****************** Font Services Registration }
 
 procedure RegisterFontPlatform(const Provider: IFontProvider;
-  const Enumerator: IFontEnumerator; const DC: IFontDC);
+  const Enumerator: IFontEnumerator);
 begin
   if Provider <> nil then
     FontProvider := Provider;
   if Enumerator <> nil then
     FontEnumerator := Enumerator;
-  if DC <> nil then
-    FontDC := DC;
 end;
 
 function FontPlatformRegistered: boolean;
 begin
   result := (FontProvider <> nil) and
-            (FontEnumerator <> nil) and
-            (FontDC <> nil);
+            (FontEnumerator <> nil);
 end;
 
 

@@ -11,7 +11,7 @@ unit mormot.lib.uniscribe;
    - UniScribe Shared Types
    - UniScribe API Functions
    - FontSub API for font sunset embedding
-   - GDI Font Services: IFontProvider, IFontEnumerator and IFontDC
+   - GDI Font Services: IFontFace, IFontProvider and IFontEnumerator
    - Uniscribe Shaper and FontSub Subsetter: IFontShaper and IFontSubsetter
 
   *****************************************************************************
@@ -355,42 +355,54 @@ function lpfnReAllocate(Buffer: pointer; Size: integer): pointer; cdecl;
 procedure lpfnFree(Buffer: pointer); cdecl;
 
 
-{ ****************** GDI Font Services: IFontProvider, IFontEnumerator and IFontDC }
+{ ****************** GDI Font Services: IFontFace, IFontProvider and IFontEnumerator }
 
 type
+  /// Windows GDI implementation of IFontFace
+  // - owns its HFONT, and a memory device context it is selected into, made
+  // when first needed - Handle is the HFONT
+  TGdiFontFace = class(TInterfacedObject, IFontFace)
+  protected
+    fFont: HFONT;
+    fDC: HDC;
+    fOldFont: HGDIOBJ;
+    function DC: HDC;
+  public
+    /// take ownership of Font
+    constructor Create(Font: HFONT);
+    /// restore the device context, then release it and the font
+    destructor Destroy; override;
+    function Handle: TFontHandle;
+    function GetTextMetrics(out Metrics: TFontMetrics): boolean;
+    function GetOutlineMetrics(out Metrics: TFontOutlineMetrics): boolean;
+    function GetCharAbcWidths(FirstChar, LastChar: cardinal;
+      out Widths: TFontCharAbcArray): boolean;
+    function GetGlyphAdvance(Glyph: cardinal; out Advance: integer): boolean;
+    function GetFontData(TableTag, Offset: cardinal; Buffer: pointer;
+      BufferSize: cardinal): cardinal;
+    function GetFaceFile(out Face: RawByteString): boolean;
+  end;
+
   /// Windows GDI implementation of IFontProvider
-  // - each TFontHandle is a HFONT, each TFontDC a HDC
   TGdiFontProvider = class(TInterfacedObject, IFontProvider)
   public
-    function CreateFont(const Request: TFontRequest): TFontHandle;
-    procedure DeleteFont(Font: TFontHandle);
-    function SelectFont(DC: TFontDC; Font: TFontHandle): TFontHandle;
-    function GetTextMetrics(DC: TFontDC; out Metrics: TFontMetrics): boolean;
-    function GetOutlineMetrics(DC: TFontDC;
-      out Metrics: TFontOutlineMetrics): boolean;
-    function GetCharAbcWidths(DC: TFontDC; FirstChar, LastChar: cardinal;
-      out Widths: TFontCharAbcArray): boolean;
-    function GetGlyphAdvance(DC: TFontDC; Glyph: cardinal;
-      out Advance: integer): boolean;
-    function GetFontData(DC: TFontDC; TableTag, Offset: cardinal;
-      Buffer: pointer; BufferSize: cardinal): cardinal;
-    function FontDataError: cardinal;
-    function GetFaceFile(DC: TFontDC; out Face: RawByteString): boolean;
+    function CreateFace(const Request: TFontRequest): IFontFace;
   end;
 
   /// Windows GDI implementation of IFontEnumerator
   TGdiFontEnumerator = class(TInterfacedObject, IFontEnumerator)
   public
-    procedure EnumTrueTypeFonts(DC: TFontDC; var List: TRawUtf8DynArray);
+    procedure EnumTrueTypeFonts(var List: TRawUtf8DynArray);
   end;
 
-  /// Windows GDI implementation of IFontDC - transitional, as IFontDC
-  TGdiFontDC = class(TInterfacedObject, IFontDC)
-  public
-    function CreateDC: TFontDC;
-    procedure DeleteDC(DC: TFontDC);
-    function GetScreenLogPixels(DC: TFontDC): integer;
-  end;
+/// the face GDI resolves a whole LOGFONT to, nil on failure
+// - for the Windows API that takes a LOGFONT: lfWidth, lfEscapement and the
+// precisions, which TFontRequest does not carry, reach the font
+function GdiCreateFace(const LogFont: TLogFontW): IFontFace;
+
+/// the resolution of the screen, GetDeviceCaps(LOGPIXELSY)
+// - 96 unless the process is DPI-aware
+function GdiScreenLogPixels: integer;
 
 
 { ****************** Uniscribe Shaper and FontSub Subsetter: IFontShaper and IFontSubsetter }
@@ -464,46 +476,50 @@ begin
 end;
 
 
-{ ****************** GDI Font Services: IFontProvider, IFontEnumerator and IFontDC }
+{ ****************** GDI Font Services: IFontFace, IFontProvider and IFontEnumerator }
 
-{ TGdiFontProvider }
+{ TGdiFontFace }
 
-function TGdiFontProvider.CreateFont(const Request: TFontRequest): TFontHandle;
-var
-  lf: TLogFontW;
+constructor TGdiFontFace.Create(Font: HFONT);
 begin
-  FillChar(lf, SizeOf(lf), 0);
-  lf.lfHeight    := Request.Height;
-  lf.lfWeight    := Request.Weight;
-  lf.lfItalic    := Request.Italic;
-  lf.lfCharSet   := Request.CharSet;
-  lf.lfPitchAndFamily := Request.PitchAndFamily;
-  lf.lfOutPrecision   := OUT_TT_ONLY_PRECIS;
-  lf.lfClipPrecision  := CLIP_DEFAULT_PRECIS;
-  lf.lfQuality        := DEFAULT_QUALITY;
-  if Request.FaceName <> '' then
-    Move(Request.FaceName[1], lf.lfFaceName[0],
-      MinPtrInt(Length(Request.FaceName), LF_FACESIZE - 1) * SizeOf(WideChar));
-  result := TFontHandle(CreateFontIndirectW(lf));
+  inherited Create;
+  fFont := Font;
 end;
 
-procedure TGdiFontProvider.DeleteFont(Font: TFontHandle);
+destructor TGdiFontFace.Destroy;
 begin
-  if Font <> nil then
-    DeleteObject(HGDIOBJ(Font));
+  // a font is deleted only once no device context holds it
+  if fDC <> 0 then
+  begin
+    SelectObject(fDC, fOldFont);
+    DeleteDC(fDC);
+  end;
+  if fFont <> 0 then
+    DeleteObject(fFont);
+  inherited Destroy;
 end;
 
-function TGdiFontProvider.SelectFont(DC: TFontDC; Font: TFontHandle): TFontHandle;
+function TGdiFontFace.DC: HDC;
 begin
-  result := TFontHandle(SelectObject(HDC(DC), HGDIOBJ(Font)));
+  if fDC = 0 then
+  begin
+    fDC := CreateCompatibleDC(0);
+    if fDC <> 0 then
+      fOldFont := SelectObject(fDC, fFont);
+  end;
+  result := fDC;
 end;
 
-function TGdiFontProvider.GetTextMetrics(DC: TFontDC;
-  out Metrics: TFontMetrics): boolean;
+function TGdiFontFace.Handle: TFontHandle;
+begin
+  result := TFontHandle(fFont);
+end;
+
+function TGdiFontFace.GetTextMetrics(out Metrics: TFontMetrics): boolean;
 var
   tm: TTextMetric;
 begin
-  result := Windows.GetTextMetrics(HDC(DC), tm);
+  result := Windows.GetTextMetrics(DC, tm);
   if result then
   begin
     Metrics.tmHeight          := tm.tmHeight;
@@ -525,14 +541,13 @@ begin
   end;
 end;
 
-function TGdiFontProvider.GetOutlineMetrics(DC: TFontDC;
-  out Metrics: TFontOutlineMetrics): boolean;
+function TGdiFontFace.GetOutlineMetrics(out Metrics: TFontOutlineMetrics): boolean;
 var
   otm: TOutlineTextmetric;
 begin
   FillChar(otm, SizeOf(otm), 0);
   otm.otmSize := SizeOf(otm);
-  result := Windows.GetOutlineTextMetrics(HDC(DC), SizeOf(otm), @otm) <> 0;
+  result := Windows.GetOutlineTextMetrics(DC, SizeOf(otm), @otm) <> 0;
   if result then
   begin
     Metrics.otmSize              := otm.otmSize;
@@ -557,8 +572,8 @@ begin
   end;
 end;
 
-function TGdiFontProvider.GetCharAbcWidths(DC: TFontDC;
-  FirstChar, LastChar: cardinal; out Widths: TFontCharAbcArray): boolean;
+function TGdiFontFace.GetCharAbcWidths(FirstChar, LastChar: cardinal;
+  out Widths: TFontCharAbcArray): boolean;
 var
   n: integer;
   W: array of TABC;
@@ -574,7 +589,7 @@ begin
   // the ANSI call maps the bytes through the charset of the selected font: with
   // ANSI_CHARSET, as the PDF engine creates its fonts, 128..159 resolve to their
   // WinAnsi characters, as the IFontProvider contract requires
-  result := GetCharABCWidthsA(HDC(DC), FirstChar, LastChar, W[0]);
+  result := GetCharABCWidthsA(DC, FirstChar, LastChar, W[0]);
   if result then
   begin
     SetLength(Widths, n);
@@ -591,27 +606,22 @@ end;
 function GetCharABCWidthsI(DC: HDC; giFirst, cgi: cardinal; pgi: PWord;
   lpabc: PABC): BOOL; stdcall; external 'gdi32.dll' name 'GetCharABCWidthsI';
 
-function TGdiFontProvider.GetGlyphAdvance(DC: TFontDC; Glyph: cardinal;
+function TGdiFontFace.GetGlyphAdvance(Glyph: cardinal;
   out Advance: integer): boolean;
 var
   abc: TABC;
 begin
-  result := GetCharABCWidthsI(HDC(DC), Glyph, 1, nil, @abc);
+  result := GetCharABCWidthsI(DC, Glyph, 1, nil, @abc);
   if result then
     Advance := abc.abcA + integer(abc.abcB) + abc.abcC
   else
     Advance := 0;
 end;
 
-function TGdiFontProvider.GetFontData(DC: TFontDC; TableTag, Offset: cardinal;
-  Buffer: pointer; BufferSize: cardinal): cardinal;
+function TGdiFontFace.GetFontData(TableTag, Offset: cardinal; Buffer: pointer;
+  BufferSize: cardinal): cardinal;
 begin
-  result := Windows.GetFontData(HDC(DC), TableTag, Offset, Buffer, BufferSize);
-end;
-
-function TGdiFontProvider.FontDataError: cardinal;
-begin
-  result := GDI_ERROR;
+  result := Windows.GetFontData(DC, TableTag, Offset, Buffer, BufferSize);
 end;
 
 function ReadFontData(dc: HDC; Tag: cardinal; out Data: RawByteString): boolean;
@@ -629,8 +639,7 @@ begin
     Data := '';
 end;
 
-function TGdiFontProvider.GetFaceFile(DC: TFontDC;
-  out Face: RawByteString): boolean;
+function TGdiFontFace.GetFaceFile(out Face: RawByteString): boolean;
 var
   ttc, dir: RawByteString;
   len: cardinal;
@@ -640,20 +649,20 @@ begin
   // into the collection, so the face is found in and extracted from the
   // whole collection ('ttcf')
   result := false;
-  if Windows.GetFontData(HDC(DC), TTCF_TABLE, 0, nil, 0) = GDI_ERROR then
+  if Windows.GetFontData(DC, TTCF_TABLE, 0, nil, 0) = GDI_ERROR then
   begin
-    result := ReadFontData(HDC(DC), 0, Face); // a font file of one face
+    result := ReadFontData(DC, 0, Face); // a font file of one face
     exit;
   end;
-  if not ReadFontData(HDC(DC), TTCF_TABLE, ttc) then
+  if not ReadFontData(DC, TTCF_TABLE, ttc) then
     exit; // a collection, but unreadable: never its raw face
   // only the table directory of the face, as TtcFaceIndex compares it
   FastSetRawByteString(dir, nil, 12);
-  if Windows.GetFontData(HDC(DC), 0, 0, pointer(dir), 12) <> 12 then
+  if Windows.GetFontData(DC, 0, 0, pointer(dir), 12) <> 12 then
     exit;
   len := 12 + 16 * ((cardinal(ord(dir[5])) shl 8) or cardinal(ord(dir[6])));
   FastSetRawByteString(dir, nil, len);
-  if Windows.GetFontData(HDC(DC), 0, 0, pointer(dir), len) <> len then
+  if Windows.GetFontData(DC, 0, 0, pointer(dir), len) <> len then
     exit;
   index := TtcFaceIndex(ttc, dir);
   if index < 0 then
@@ -661,6 +670,51 @@ begin
   Face := ExtractSfntFromTtc(ttc, index);
   result := Face <> '';
 end;
+
+function GdiCreateFace(const LogFont: TLogFontW): IFontFace;
+var
+  lf: TLogFontW; // a var fits both the FPC and the Delphi declaration
+  font: HFONT;
+begin
+  lf := LogFont;
+  font := CreateFontIndirectW(lf);
+  if font = 0 then
+    result := nil
+  else
+    result := TGdiFontFace.Create(font);
+end;
+
+function GdiScreenLogPixels: integer;
+var
+  dc: HDC;
+begin
+  dc := CreateCompatibleDC(0);
+  result := GetDeviceCaps(dc, LOGPIXELSY);
+  DeleteDC(dc);
+end;
+
+
+{ TGdiFontProvider }
+
+function TGdiFontProvider.CreateFace(const Request: TFontRequest): IFontFace;
+var
+  lf: TLogFontW;
+begin
+  FillChar(lf, SizeOf(lf), 0);
+  lf.lfHeight    := Request.Height;
+  lf.lfWeight    := Request.Weight;
+  lf.lfItalic    := Request.Italic;
+  lf.lfCharSet   := Request.CharSet;
+  lf.lfPitchAndFamily := Request.PitchAndFamily;
+  lf.lfOutPrecision   := OUT_TT_ONLY_PRECIS;
+  lf.lfClipPrecision  := CLIP_DEFAULT_PRECIS;
+  lf.lfQuality        := DEFAULT_QUALITY;
+  if Request.FaceName <> '' then
+    Move(Request.FaceName[1], lf.lfFaceName[0],
+      MinPtrInt(Length(Request.FaceName), LF_FACESIZE - 1) * SizeOf(WideChar));
+  result := GdiCreateFace(lf);
+end;
+
 
 { TGdiFontEnumerator }
 
@@ -685,32 +739,16 @@ begin
   result := 1; // continue enumeration
 end;
 
-procedure TGdiFontEnumerator.EnumTrueTypeFonts(DC: TFontDC;
-  var List: TRawUtf8DynArray);
+procedure TGdiFontEnumerator.EnumTrueTypeFonts(var List: TRawUtf8DynArray);
 var
   LFont: TLogFontW;
+  dc: HDC;
 begin
   FillChar(LFont, SizeOf(LFont), 0);
   LFont.lfCharSet := DEFAULT_CHARSET; // enumerate ALL fonts
-  EnumFontFamiliesExW(HDC(DC), LFont, @EnumFontsProcW, LPARAM(@List), 0);
-end;
-
-{ TGdiFontDC }
-
-function TGdiFontDC.CreateDC: TFontDC;
-begin
-  result := TFontDC(Windows.CreateCompatibleDC(0));
-end;
-
-procedure TGdiFontDC.DeleteDC(DC: TFontDC);
-begin
-  if DC <> nil then
-    Windows.DeleteDC(HDC(DC));
-end;
-
-function TGdiFontDC.GetScreenLogPixels(DC: TFontDC): integer;
-begin
-  result := GetDeviceCaps(HDC(DC), LOGPIXELSY);
+  dc := CreateCompatibleDC(0);
+  EnumFontFamiliesExW(dc, LFont, @EnumFontsProcW, LPARAM(@List), 0);
+  DeleteDC(dc);
 end;
 
 
@@ -1083,8 +1121,7 @@ procedure RegisterUniscribe;
 begin
   RegisterFontPlatform(
     TGdiFontProvider.Create,
-    TGdiFontEnumerator.Create,
-    TGdiFontDC.Create);
+    TGdiFontEnumerator.Create);
   {$ifndef NO_USE_UNISCRIBE} // set project-wide: no shaping, no subsetting
   RegisteredShaper := TUniscribeShaper.Create;
   FontShaper := RegisteredShaper;
