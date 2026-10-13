@@ -10,6 +10,7 @@ unit mormot.lib.core;
    - Font Types: Specification, Metrics, Glyph Widths
    - Font Interfaces: Face, Provider, Enumerator, Shaper, Subsetter
    - Font Files: TrueType Collections
+   - Registered Font Data
    - Font Services Registration
 
    The contracts of the font services implemented by mormot.lib.uniscribe
@@ -292,6 +293,43 @@ function ExtractSfntFromTtc(const ATtc: RawByteString;
 function TtcFaceIndex(const Ttc, Face: RawByteString): integer;
 
 
+{ ****************** Registered Font Data }
+
+/// register a font from its bytes, so that the backends find it by its name
+// - Data holds a TrueType/OpenType font, or a .ttc collection and FaceIndex
+// the face in it; a file is read by the caller, e.g. with StringFromFile
+// - the family and the style come from the face's 'name' and 'OS/2' tables;
+// the enumerators list it; FreeType opens a registered family before the
+// system fonts, GDI installs the font and its mapper resolves the name -
+// give a font of your own a name of its own
+// - register after the unit initializations (mormot.lib.uniscribe sets the
+// GDI hook there) and before a document exists, which reads the font list
+// once - or tell the document with TPdfDocument.AddTrueTypeFont
+// - the bytes stay referenced: a face created from them keeps them alive
+// - returns the family name, '' if Data is no font this unit can read
+function RegisterFontData(const Data: RawByteString;
+  FaceIndex: integer = 0): RawUtf8;
+
+/// forget all registered fonts
+// - faces already created keep their bytes, and a font GDI installed stays
+// installed until mormot.lib.uniscribe is finalized
+procedure UnregisterFontData;
+
+/// the registered font Request names: its family, then the closest style
+// - the font registered last wins between equal ones
+function FindRegisteredFont(const Request: TFontRequest;
+  out Data: RawByteString; out FaceIndex: integer): boolean;
+
+/// add the family names of the registered fonts to List, each once
+procedure AddRegisteredFontNames(var List: TRawUtf8DynArray);
+
+var
+  /// called by RegisterFontData for each font it registers
+  // - mormot.lib.uniscribe installs the font for GDI there, so that every
+  // CreateFontIndirectW finds it by name
+  OnRegisterFontData: procedure(const Data: RawByteString; FaceIndex: integer);
+
+
 { ****************** Font Services Registration }
 
 var
@@ -426,6 +464,342 @@ begin
     for i := 0 to (total shr 2) - 1 do
       inc(sum, bswap32(PCardinalArray(dst)^[i]));
     PCardinal(dst + hd + 8)^ := bswap32(cardinal($B1B0AFBA) - sum);
+  end;
+end;
+
+
+{ ****************** Registered Font Data }
+
+type
+  TRegisteredFont = record
+    Family: RawUtf8;
+    Bold: boolean;
+    Italic: boolean;
+    Data: RawByteString;
+    FaceIndex: integer;
+  end;
+
+var
+  RegisteredFonts: array of TRegisteredFont;
+  RegisteredFontsLock: PtrUInt;
+
+procedure LockRegisteredFonts;
+begin
+  // held for a copy or an append only: spinning is cheaper than a mutex
+  while not LockedExc(RegisteredFontsLock, 1, 0) do
+    ;
+end;
+
+procedure UnlockRegisteredFonts;
+begin
+  // atomic: a plain store would not order the writes before it on ARM
+  LockedExc(RegisteredFontsLock, 0, 1);
+end;
+
+// UTF-16 code units, big-endian as in a 'name' table or native, as UTF-8
+function Utf16ToUtf8(P: PWordArray; Count: PtrInt; BigEndian: boolean): RawUtf8;
+var
+  i, n: PtrInt;
+  c, c2: cardinal;
+  tmp: array of AnsiChar;
+begin
+  SetLength(tmp, Count * 3 + 1);
+  n := 0;
+  i := 0;
+  while i < Count do
+  begin
+    c := P[i];
+    if BigEndian then
+      c := bswap16(c);
+    inc(i);
+    if (c >= $d800) and
+       (c < $dc00) and
+       (i < Count) then
+    begin
+      c2 := P[i];
+      if BigEndian then
+        c2 := bswap16(c2);
+      if (c2 >= $dc00) and
+         (c2 < $e000) then
+      begin
+        c := $10000 + ((c - $d800) shl 10) + (c2 - $dc00);
+        inc(i);
+      end;
+    end;
+    if (c >= $d800) and
+       (c < $e000) then
+      c := $fffd; // a lone surrogate: no valid UTF-8
+    if c < $80 then
+    begin
+      tmp[n] := AnsiChar(c);
+      inc(n);
+    end
+    else if c < $800 then
+    begin
+      tmp[n] := AnsiChar($c0 or (c shr 6));
+      tmp[n + 1] := AnsiChar($80 or (c and $3f));
+      inc(n, 2);
+    end
+    else if c < $10000 then
+    begin
+      tmp[n] := AnsiChar($e0 or (c shr 12));
+      tmp[n + 1] := AnsiChar($80 or ((c shr 6) and $3f));
+      tmp[n + 2] := AnsiChar($80 or (c and $3f));
+      inc(n, 3);
+    end
+    else
+    begin
+      // a surrogate pair: two code units in, four bytes out
+      tmp[n] := AnsiChar($f0 or (c shr 18));
+      tmp[n + 1] := AnsiChar($80 or ((c shr 12) and $3f));
+      tmp[n + 2] := AnsiChar($80 or ((c shr 6) and $3f));
+      tmp[n + 3] := AnsiChar($80 or (c and $3f));
+      inc(n, 4);
+    end;
+  end;
+  FastSetString(result, pointer(tmp), n);
+end;
+
+// the offset and length of a table of an sfnt font, false if absent or out
+// of the data; Tag big-endian, e.g. $6e616d65 for 'name'
+function SfntFindTable(const Sfnt: RawByteString; Tag: cardinal;
+  out Ofs, Len: PtrUInt): boolean;
+var
+  base: PAnsiChar;
+  size, n: PtrUInt;
+  i: PtrInt;
+begin
+  result := false;
+  base := pointer(Sfnt);
+  size := length(Sfnt);
+  if size < 12 then
+    exit;
+  n := bswap16(PWord(base + 4)^);
+  if n * 16 > size - 12 then
+    exit;
+  for i := 0 to PtrInt(n) - 1 do // i signed: n = 0 runs no loop
+    if BigEndian32(base + 12 + i * 16) = Tag then
+    begin
+      Ofs := BigEndian32(base + 12 + i * 16 + 8);
+      Len := BigEndian32(base + 12 + i * 16 + 12);
+      result := (Ofs <= size) and
+                (Len <= size - Ofs);
+      exit;
+    end;
+end;
+
+// the family name (name ID 1) of an sfnt font, Windows Unicode English first
+function SfntFamilyName(const Sfnt: RawByteString): RawUtf8;
+var
+  base, rec: PAnsiChar;
+  ofs, len, count, strofs, pid, eid, lid, nlen, nofs: PtrUInt;
+  best, rank, bestofs, bestlen: PtrUInt;
+  i: PtrInt;
+begin
+  result := '';
+  if not SfntFindTable(Sfnt, $6e616d65, ofs, len) or // 'name'
+     (len < 6) then
+    exit;
+  base := PAnsiChar(pointer(Sfnt)) + ofs;
+  count := bswap16(PWord(base + 2)^);
+  strofs := bswap16(PWord(base + 4)^);
+  if (count * 12 > len - 6) or
+     (strofs > len) then
+    exit;
+  best := 0;
+  bestofs := 0;
+  bestlen := 0;
+  for i := 0 to PtrInt(count) - 1 do
+  begin
+    rec := base + 6 + i * 12;
+    if bswap16(PWord(rec + 6)^) <> 1 then // name ID 1: font family
+      continue;
+    pid := bswap16(PWord(rec)^);
+    eid := bswap16(PWord(rec + 2)^);
+    lid := bswap16(PWord(rec + 4)^);
+    nlen := bswap16(PWord(rec + 8)^);
+    nofs := bswap16(PWord(rec + 10)^);
+    if (nofs > len - strofs) or
+       (nlen > len - strofs - nofs) then
+      continue;
+    // Windows Unicode English, any UTF-16 record (Windows symbol, BMP or full
+    // repertoire, or the Unicode platform), Macintosh Roman
+    rank := 0;
+    if (pid = 3) and
+       ((eid <= 1) or (eid = 10)) and
+       (lid = $409) then
+      rank := 3
+    else if ((pid = 3) and
+             ((eid <= 1) or (eid = 10))) or
+            (pid = 0) then
+      rank := 2
+    else if (pid = 1) and
+            (eid = 0) then
+      rank := 1;
+    if rank > best then // rank 0, another platform, never wins
+    begin
+      best := rank;
+      bestofs := strofs + nofs;
+      bestlen := nlen;
+    end;
+  end;
+  if best >= 2 then
+    result := Utf16ToUtf8(pointer(base + bestofs), bestlen shr 1, true)
+  else if best = 1 then
+  begin
+    // Mac Roman: only an ASCII name is the same in UTF-8
+    for i := 0 to PtrInt(bestlen) - 1 do
+      if ord(base[bestofs + PtrUInt(i)]) >= $80 then
+        exit;
+    FastSetString(result, base + bestofs, bestlen);
+  end;
+end;
+
+// the face of Data as a registered font, false if it is no readable font
+function ParseRegisteredFont(const Data: RawByteString; FaceIndex: integer;
+  out Font: TRegisteredFont): boolean;
+var
+  sfnt: RawByteString;
+  ofs, len: PtrUInt;
+begin
+  result := false;
+  if length(Data) < 12 then
+    exit;
+  if PCardinal(Data)^ = TTCF_MAGIC then
+  begin
+    sfnt := ExtractSfntFromTtc(Data, FaceIndex);
+    if sfnt = '' then
+      exit;
+  end
+  else if FaceIndex <> 0 then
+    exit
+  else
+    sfnt := Data;
+  case BigEndian32(pointer(sfnt)) of
+    $00010000, $4f54544f, $74727565: // TrueType, 'OTTO' (CFF), 'true'
+      ;
+  else
+    exit;
+  end;
+  Font.Family := SfntFamilyName(sfnt);
+  if Font.Family = '' then
+    exit;
+  Font.Bold := false;
+  Font.Italic := false;
+  if SfntFindTable(sfnt, $4f532f32, ofs, len) and // 'OS/2'
+     (len >= 64) then
+  begin
+    // usWeightClass at 4, fsSelection at 62: bit 0 italic
+    Font.Bold := bswap16(PWord(PAnsiChar(pointer(sfnt)) + ofs + 4)^) >= 600;
+    Font.Italic := bswap16(PWord(PAnsiChar(pointer(sfnt)) + ofs + 62)^) and 1 <> 0;
+  end
+  else if SfntFindTable(sfnt, $68656164, ofs, len) and // 'head'
+          (len >= 46) then
+  begin
+    // macStyle at 44: bit 0 bold, bit 1 italic
+    Font.Bold := bswap16(PWord(PAnsiChar(pointer(sfnt)) + ofs + 44)^) and 1 <> 0;
+    Font.Italic := bswap16(PWord(PAnsiChar(pointer(sfnt)) + ofs + 44)^) and 2 <> 0;
+  end;
+  Font.Data := Data;
+  Font.FaceIndex := FaceIndex;
+  result := true;
+end;
+
+function RegisterFontData(const Data: RawByteString;
+  FaceIndex: integer): RawUtf8;
+var
+  font: TRegisteredFont;
+  n: PtrInt;
+begin
+  result := '';
+  if not ParseRegisteredFont(Data, FaceIndex, font) then
+    exit;
+  LockRegisteredFonts;
+  try
+    n := length(RegisteredFonts);
+    SetLength(RegisteredFonts, n + 1);
+    RegisteredFonts[n] := font;
+  finally
+    UnlockRegisteredFonts;
+  end;
+  if Assigned(OnRegisterFontData) then
+    OnRegisterFontData(Data, FaceIndex);
+  result := font.Family;
+end;
+
+procedure UnregisterFontData;
+begin
+  LockRegisteredFonts;
+  try
+    RegisteredFonts := nil;
+  finally
+    UnlockRegisteredFonts;
+  end;
+end;
+
+function FindRegisteredFont(const Request: TFontRequest;
+  out Data: RawByteString; out FaceIndex: integer): boolean;
+var
+  name: RawUtf8;
+  wantbold, wantitalic: boolean;
+  i, best, score, bestscore: PtrInt;
+begin
+  result := false;
+  if RegisteredFonts = nil then
+    exit; // nothing registered: no lock, no conversion
+  name := Utf16ToUtf8(pointer(Request.FaceName), length(Request.FaceName), false);
+  wantbold := Request.Weight >= 600;
+  wantitalic := Request.Italic <> 0;
+  LockRegisteredFonts;
+  try
+    best := -1;
+    bestscore := -1;
+    for i := high(RegisteredFonts) downto 0 do
+      if PropNameEquals(RegisteredFonts[i].Family, name) then
+      begin
+        score := ord(RegisteredFonts[i].Bold = wantbold) +
+                 ord(RegisteredFonts[i].Italic = wantitalic);
+        if score > bestscore then
+        begin
+          best := i;
+          bestscore := score;
+        end;
+      end;
+    if best >= 0 then
+    begin
+      Data := RegisteredFonts[best].Data;
+      FaceIndex := RegisteredFonts[best].FaceIndex;
+      result := true;
+    end;
+  finally
+    UnlockRegisteredFonts;
+  end;
+end;
+
+procedure AddRegisteredFontNames(var List: TRawUtf8DynArray);
+var
+  i, j, n: PtrInt;
+  found: boolean;
+begin
+  LockRegisteredFonts;
+  try
+    for i := 0 to high(RegisteredFonts) do
+    begin
+      found := false;
+      for j := 0 to high(List) do
+        if PropNameEquals(List[j], RegisteredFonts[i].Family) then
+        begin
+          found := true;
+          break;
+        end;
+      if found then
+        continue;
+      n := length(List);
+      SetLength(List, n + 1);
+      List[n] := RegisteredFonts[i].Family;
+    end;
+  finally
+    UnlockRegisteredFonts;
   end;
 end;
 

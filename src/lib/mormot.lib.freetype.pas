@@ -130,6 +130,9 @@ type
   TFT_New_Face          = function(alibrary: FT_Library; filepathname: PAnsiChar;
                             face_index: FT_Long; var aface: FT_Face): FT_Error; cdecl;
   TFT_Done_Face         = function(face: FT_Face): FT_Error; cdecl;
+  TFT_New_Memory_Face   = function(alibrary: FT_Library; file_base: pointer;
+                            file_size, face_index: FT_Long;
+                            var aface: FT_Face): FT_Error; cdecl;
   TFT_Set_Char_Size     = function(face: FT_Face; char_width, char_height: FT_F26Dot6;
                             horz_resolution, vert_resolution: FT_UInt): FT_Error; cdecl;
   TFT_Load_Char         = function(face: FT_Face; char_code: FT_ULong;
@@ -159,6 +162,7 @@ type
     LoadChar:         TFT_Load_Char;
     LoadSfntTable:    TFT_Load_Sfnt_Table;
     LoadGlyph:        TFT_Load_Glyph;
+    NewMemoryFace:    TFT_New_Memory_Face;
     /// the FT_Library instance of FT_Init_FreeType
     FTLibrary:        FT_Library;
     /// true once the library is loaded and initialized - false on nil
@@ -209,6 +213,7 @@ type
     Height:       integer;
     IsFixedWidth: boolean;
     FaceIndex:    integer;   // index of the face opened within a .ttc
+    Data:         RawByteString; // a registered font: FreeType reads these bytes
     Sfnt:         RawByteString; // cached standalone sfnt built from a .ttc
     SfntChecked:  boolean;   // true once the file has been tested for 'ttcf'
   end;
@@ -292,7 +297,7 @@ const
     {$endif OSDARWIN}
 
   /// the entries of TFreeTypeLib, in the order of its fields
-  FREETYPE_ENTRIES: array[0 .. 8] of PAnsiChar = (
+  FREETYPE_ENTRIES: array[0 .. 9] of PAnsiChar = (
     'Init_FreeType',
     'Done_FreeType',
     'New_Face',
@@ -301,6 +306,7 @@ const
     'Load_Char',
     'Load_Sfnt_Table',
     'Load_Glyph',
+    'New_Memory_Face',
     nil);
 
 function TFreeTypeLib.Loaded: boolean;
@@ -484,29 +490,43 @@ var
   ctx:      PFreeTypeFont;
   faceRec:  PFT_FaceRec;
   bold, italic: boolean;
+  data:     RawByteString;
+  index:    integer;
 begin
   result := nil;
   if not FreeType.Loaded then
     exit;
-  bold   := Request.Weight >= 600;
-  italic := Request.Italic <> 0;
-  faceName := SynUnicodeToUtf8(Request.FaceName);
-  filePath := FindFontFile(fFontMap, faceName, bold, italic);
-  if filePath = '' then
-  begin
-    // Fallback: try DejaVu Sans
-    filePath := FindFontFile(fFontMap, 'DejaVu Sans', bold, italic);
-    if filePath = '' then
-      filePath := FindFontFile(fFontMap, 'DejaVuSans', bold, italic);
-    if filePath = '' then
-      filePath := FindFontFile(fFontMap, 'Roboto', bold, italic); // Android
-    if filePath = '' then
-      exit; // no font found at all
-  end;
   face := nil;
-  if FreeType.NewFace(FreeType.FTLibrary, PAnsiChar(AnsiString(filePath)),
-     0, face) <> 0 then
-    exit;
+  if FindRegisteredFont(Request, data, index) then
+  begin
+    // FreeType reads the bytes while the face lives: ctx^.Data keeps them
+    if FreeType.NewMemoryFace(FreeType.FTLibrary, pointer(data), length(data),
+       index, face) <> 0 then
+      exit;
+    filePath := '';
+  end
+  else
+  begin
+    bold   := Request.Weight >= 600;
+    italic := Request.Italic <> 0;
+    faceName := SynUnicodeToUtf8(Request.FaceName);
+    filePath := FindFontFile(fFontMap, faceName, bold, italic);
+    if filePath = '' then
+    begin
+      // Fallback: try DejaVu Sans
+      filePath := FindFontFile(fFontMap, 'DejaVu Sans', bold, italic);
+      if filePath = '' then
+        filePath := FindFontFile(fFontMap, 'DejaVuSans', bold, italic);
+      if filePath = '' then
+        filePath := FindFontFile(fFontMap, 'Roboto', bold, italic); // Android
+      if filePath = '' then
+        exit; // no font found at all
+    end;
+    if FreeType.NewFace(FreeType.FTLibrary, PAnsiChar(AnsiString(filePath)),
+       0, face) <> 0 then
+      exit;
+    index := 0; // FT_New_Face() above always opens the first face
+  end;
   // GetCharAbcWidths will use FT_LOAD_NO_SCALE to get raw design units,
   // so SetCharSize is not needed here anymore
   faceRec := PFT_FaceRec(face);
@@ -518,7 +538,8 @@ begin
   ctx^.Descent      := ScaleDesignUnit(faceRec^.descender,   ctx^.UnitsPerEM);
   ctx^.Height       := ScaleDesignUnit(faceRec^.height,      ctx^.UnitsPerEM);
   ctx^.IsFixedWidth := (faceRec^.face_flags and FT_FACE_FLAG_FIXED_WIDTH) <> 0;
-  ctx^.FaceIndex    := 0; // FT_New_Face() above always opens the first face
+  ctx^.FaceIndex    := index;
+  ctx^.Data         := data;
   ctx^.SfntChecked  := false; // New() initializes managed fields only
   result := TFreeTypeFontFace.Create(ctx);
 end;
@@ -725,7 +746,9 @@ begin
     if not ctx^.SfntChecked then
     begin
       ctx^.SfntChecked := true; // a plain .ttf is returned by FreeType as it is
-      if ctx^.FilePath <> '' then
+      if ctx^.Data <> '' then
+        ctx^.Sfnt := ExtractSfntFromTtc(ctx^.Data, ctx^.FaceIndex)
+      else if ctx^.FilePath <> '' then
         ctx^.Sfnt := ExtractSfntFromTtc(
           StringFromFile(Utf8ToString(ctx^.FilePath)), ctx^.FaceIndex);
     end;
@@ -757,8 +780,8 @@ function TFreeTypeFontFace.GetFaceFile(out Face: RawByteString): boolean;
 var
   size: cardinal;
 begin
-  // GetFontData(0) already extracts the face of a .ttc (FilePath set); a
-  // collection it could not extract, or one loaded without a path, fails
+  // GetFontData(0) already extracts the face of a .ttc (from its file or its
+  // registered bytes); a collection it could not extract fails
   result := false;
   size := GetFontData(0, 0, nil, 0);
   if (size = FONT_DATA_ERROR) or
@@ -806,6 +829,7 @@ begin
     are found via CreateFace -> FindFontFile which matches against Bold/Italic flags. }
   for i := 0 to high(fFontMap) do
     AddRawUtf8(List, fFontMap[i].FamilyName, true, true);
+  AddRegisteredFontNames(List);
 end;
 
 var

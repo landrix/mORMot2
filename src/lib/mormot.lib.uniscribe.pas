@@ -749,6 +749,8 @@ begin
   dc := CreateCompatibleDC(0);
   EnumFontFamiliesExW(dc, LFont, @EnumFontsProcW, LPARAM(@List), 0);
   DeleteDC(dc);
+  // a font installed by AddFontMemResourceEx is not enumerated
+  AddRegisteredFontNames(List);
 end;
 
 
@@ -1116,12 +1118,44 @@ end;
 var
   RegisteredShaper: IFontShaper;
   RegisteredSubsetter: IFontSubsetter;
+  // the fonts installed for RegisterFontData, removed at finalization
+  InstalledFonts: array of THandle;
+  InstalledFontsLock: TLightLock;
+
+// gdi32 since Windows 2000; Delphi 7's Windows unit does not declare them
+function AddFontMemResourceEx(pbFont: pointer; cbFont: cardinal; pdv: pointer;
+  pcFonts: PCardinal): THandle; stdcall;
+  external 'gdi32.dll' name 'AddFontMemResourceEx';
+function RemoveFontMemResourceEx(h: THandle): BOOL; stdcall;
+  external 'gdi32.dll' name 'RemoveFontMemResourceEx';
+
+// OnRegisterFontData: install the font for this process, so that every
+// CreateFontIndirectW finds it by name - GdiCreateFace as well
+procedure GdiInstallFontData(const Data: RawByteString; FaceIndex: integer);
+var
+  h: THandle;
+  n: cardinal;
+begin
+  // the whole file: GDI selects a face of a collection by its name
+  n := 0;
+  h := AddFontMemResourceEx(pointer(Data), length(Data), nil, @n);
+  if h = 0 then
+    exit;
+  InstalledFontsLock.Lock;
+  try
+    SetLength(InstalledFonts, length(InstalledFonts) + 1);
+    InstalledFonts[high(InstalledFonts)] := h;
+  finally
+    InstalledFontsLock.UnLock;
+  end;
+end;
 
 procedure RegisterUniscribe;
 begin
   RegisterFontPlatform(
     TGdiFontProvider.Create,
     TGdiFontEnumerator.Create);
+  OnRegisterFontData := GdiInstallFontData;
   {$ifndef NO_USE_UNISCRIBE} // set project-wide: no shaping, no subsetting
   RegisteredShaper := TUniscribeShaper.Create;
   FontShaper := RegisteredShaper;
@@ -1134,7 +1168,14 @@ begin
 end;
 
 procedure UnregisterUniscribe;
+var
+  i: PtrInt;
 begin
+  if @OnRegisterFontData = @GdiInstallFontData then
+    OnRegisterFontData := nil;
+  for i := 0 to high(InstalledFonts) do
+    RemoveFontMemResourceEx(InstalledFonts[i]);
+  InstalledFonts := nil;
   // release the services before the library they call
   if FontShaper = RegisteredShaper then
     FontShaper := nil;
