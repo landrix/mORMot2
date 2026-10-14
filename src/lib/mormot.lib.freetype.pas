@@ -141,11 +141,14 @@ type
                             buffer: pointer; var length: FT_ULong): FT_Error; cdecl;
   TFT_Load_Glyph        = function(face: FT_Face; glyph_index: FT_UInt;
                             load_flags: FT_Int): FT_Error; cdecl;
+  TFT_Select_Charmap    = function(face: FT_Face; encoding: cardinal): FT_Error; cdecl;
+  TFT_Get_Char_Index    = function(face: FT_Face; charcode: FT_ULong): FT_UInt; cdecl;
 
 const
   FT_LOAD_DEFAULT         = 0;
   FT_LOAD_NO_SCALE        = 1;  // = 1 shl 0; returns raw design units, no 26.6 encoding
   FT_FACE_FLAG_FIXED_WIDTH = 1 shl 2;
+  FT_ENCODING_MS_SYMBOL   = $73796D62; // FT_ENC_TAG('s', 'y', 'm', 'b')
 
 type
   /// the loaded FreeType2 library and its function pointers
@@ -163,6 +166,8 @@ type
     LoadSfntTable:    TFT_Load_Sfnt_Table;
     LoadGlyph:        TFT_Load_Glyph;
     NewMemoryFace:    TFT_New_Memory_Face;
+    SelectCharmap:    TFT_Select_Charmap;
+    GetCharIndex:     TFT_Get_Char_Index;
     /// the FT_Library instance of FT_Init_FreeType
     FTLibrary:        FT_Library;
     /// true once the library is loaded and initialized - false on nil
@@ -212,6 +217,7 @@ type
     Descent:      integer;   // scaled descender (negative)
     Height:       integer;
     IsFixedWidth: boolean;
+    IsSymbol:     boolean;   // only a (3,0) cmap, selected by CreateFace
     FaceIndex:    integer;   // index of the face opened within a .ttc
     Data:         RawByteString; // a registered font: FreeType reads these bytes
     Sfnt:         RawByteString; // cached standalone sfnt built from a .ttc
@@ -297,7 +303,7 @@ const
     {$endif OSDARWIN}
 
   /// the entries of TFreeTypeLib, in the order of its fields
-  FREETYPE_ENTRIES: array[0 .. 9] of PAnsiChar = (
+  FREETYPE_ENTRIES: array[0 .. 11] of PAnsiChar = (
     'Init_FreeType',
     'Done_FreeType',
     'New_Face',
@@ -307,6 +313,8 @@ const
     'Load_Sfnt_Table',
     'Load_Glyph',
     'New_Memory_Face',
+    'Select_Charmap',
+    'Get_Char_Index',
     nil);
 
 function TFreeTypeLib.Loaded: boolean;
@@ -538,6 +546,10 @@ begin
   ctx^.Descent      := ScaleDesignUnit(faceRec^.descender,   ctx^.UnitsPerEM);
   ctx^.Height       := ScaleDesignUnit(faceRec^.height,      ctx^.UnitsPerEM);
   ctx^.IsFixedWidth := (faceRec^.face_flags and FT_FACE_FLAG_FIXED_WIDTH) <> 0;
+  // FreeType selects no charmap for a face whose only cmap is the symbol one
+  // (Wingdings), and FT_Load_Char would then take a code for a glyph index
+  ctx^.IsSymbol     := (faceRec^.charmap = nil) and
+                       (FreeType.SelectCharmap(face, FT_ENCODING_MS_SYMBOL) = 0);
   ctx^.FaceIndex    := index;
   ctx^.Data         := data;
   ctx^.SfntChecked  := false; // New() initializes managed fields only
@@ -658,8 +670,11 @@ var
   lsb:   FT_Pos;   // left side bearing (A width)
   rsb:   FT_Pos;   // right side bearing (C width)
   code:  cardinal;
+  glyph: FT_UInt;
+  range: cardinal;
   a, c:  integer;
   total: integer;
+  loaded: boolean;
 begin
   result := false;
   ctx := fFont;
@@ -680,11 +695,30 @@ begin
     // as the unassigned C1 controls, miss the CMAP and silently return the
     // .notdef advance. That is what put the bullet (#$95 -> U+2022) and the
     // em dash (#$97 -> U+2014) into /Widths with a wrong value.
-    if code <= high(byte) then
-      code := WinAnsiConvert.AnsiToWide[code];
     // Use FT_LOAD_NO_SCALE to get raw design units (like faceRec^.ascender),
     // then apply uniform ScaleDesignUnit(value, UPM) across all metrics.
-    if FreeType.LoadChar(ctx^.Face, code, FT_LOAD_NO_SCALE) = 0 then
+    if ctx^.IsSymbol then
+    begin
+      // a symbol cmap holds the bytes at U+00xx, F0xx, F1xx or F2xx, the
+      // ranges a PDF viewer looks them up in (ISO 32000-1 9.6.6.4)
+      glyph := FreeType.GetCharIndex(ctx^.Face, code);
+      range := $F000;
+      while (glyph = 0) and
+            (code <= high(byte)) and
+            (range <= $F200) do
+      begin
+        glyph := FreeType.GetCharIndex(ctx^.Face, code + range);
+        inc(range, $100);
+      end;
+      loaded := FreeType.LoadGlyph(ctx^.Face, glyph, FT_LOAD_NO_SCALE) = 0;
+    end
+    else
+    begin
+      if code <= high(byte) then
+        code := WinAnsiConvert.AnsiToWide[code];
+      loaded := FreeType.LoadChar(ctx^.Face, code, FT_LOAD_NO_SCALE) = 0;
+    end;
+    if loaded then
     begin
       slot := PFT_GlyphSlotRec(PFT_FaceRec(ctx^.Face)^.glyph);
       // FreeType metrics in design units:
