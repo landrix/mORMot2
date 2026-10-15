@@ -314,6 +314,29 @@ function ScriptApplyDigitSubstitution(
 function ScriptFreeCache(var psc: pointer): HRESULT;
   stdcall; external Usp10;
 
+type
+  /// SCRIPT_FONTPROPERTIES: the special glyphs of a font
+  // - cBytes has to be set to SizeOf(TScriptFontProperties) before the call
+  TScriptFontProperties = record
+    cBytes: integer;
+    /// the blank glyph
+    wgBlank: word;
+    /// the glyph of a character the font has no glyph for
+    wgDefault: word;
+    /// the glyph of an invalid character combination
+    wgInvalid: word;
+    /// the kashida glyph
+    wgKashida: word;
+    /// the width of the kashida glyph
+    iKashida: integer;
+  end;
+
+/// Uniscribe function to retrieve the special glyphs of a font
+// - hdc may be 0 once psc holds the font's cache (after ScriptShape)
+function ScriptGetFontProperties(hdc: HDC; var psc: pointer;
+  var sfp: TScriptFontProperties): HRESULT;
+  stdcall; external Usp10;
+
 
 { ****************** FontSub API for font sunset embedding }
 
@@ -417,10 +440,15 @@ type
   // shaped to no glyph at all is fskSkip + fsoDone
   // - zero-width glyphs which are no diacritic are left out; Advances and
   // Offsets stay empty, the advances of the font apply
-  TUniscribeShaper = class(TInterfacedObject, IFontShaper)
+  // - an item shaped with the font's default glyph (wgDefault) for a character
+  // it lacks is fskShaped + fsoMissingGlyphs; every run keeps its item's
+  // SCRIPT_ANALYSIS in Analysis, for ShapeRun (IFontRunShaper)
+  TUniscribeShaper = class(TInterfacedObject, IFontShaper, IFontRunShaper)
   public
     function Shape(Text: PWideChar; Len: integer; Font: TFontHandle;
       RightToLeft: boolean; out Runs: TFontShapedRuns): boolean;
+    function ShapeRun(Text: PWideChar; Len: integer; Font: TFontHandle;
+      var Run: TFontShapedRun): boolean;
   end;
 
   /// FontSub implementation of IFontSubsetter, through CreateFontPackage
@@ -758,56 +786,145 @@ end;
 
 { TUniscribeShaper }
 
+type
+  // what shaping the items of one text with one font shares: the DC and the
+  // cache are opened on demand and released by UspDone
+  TUspShapeContext = record
+    Font: TFontHandle;
+    dc: HDC;
+    old: HGDIOBJ;
+    psc: pointer; // opaque Uniscribe font metric cache
+    maxglyphs: integer;
+    glyphs, logclust: array of word;
+    attrs: array of TScriptVisAttr;
+    defaultRead, hasDefault: boolean;
+    wgDefault: word;
+  end;
+
+procedure UspInit(var c: TUspShapeContext; Font: TFontHandle; MaxLen: integer);
+begin
+  c.Font := Font;
+  c.dc := 0;
+  c.old := 0;
+  c.psc := nil;
+  c.defaultRead := false;
+  c.hasDefault := false;
+  c.wgDefault := 0;
+  // one buffer size for all items, as large as the text with a #0 needs
+  c.maxglyphs := ((MaxLen + 1) * 3) shr 1 + 32;
+  SetLength(c.attrs, c.maxglyphs);
+  SetLength(c.glyphs, c.maxglyphs);
+  SetLength(c.logclust, c.maxglyphs);
+end;
+
+procedure UspDone(var c: TUspShapeContext);
+begin
+  if c.dc <> 0 then
+  begin
+    SelectObject(c.dc, c.old);
+    DeleteDC(c.dc);
+    c.dc := 0;
+  end;
+  if c.psc <> nil then
+    ScriptFreeCache(c.psc);
+end;
+
+// shape the Len code units at Text with the analysis a: Run.Kind, Outcome and
+// Glyphs set - Glyphs a new array; TextStart, TextLen, Analysis, Rtl untouched
+procedure UspShapeItem(var c: TUspShapeContext; Text: PWideChar; Len: integer;
+  a: PScriptAnalysis; var Run: TFontShapedRun);
+var
+  res: HRESULT;
+  count, g, k: integer;
+  missing: boolean;
+  props: TScriptFontProperties;
+begin
+  Run.Glyphs := nil;
+  count := 0;
+  res := ScriptShape(0, c.psc, Text, Len, c.maxglyphs, a, pointer(c.glyphs),
+    pointer(c.logclust), pointer(c.attrs), count);
+  if (res = E_PENDING) or
+     (res = USP_E_SCRIPT_NOT_IN_FONT) then
+  begin
+    // the font has to be selected into a DC
+    if c.dc = 0 then
+    begin
+      c.dc := CreateCompatibleDC(0);
+      c.old := SelectObject(c.dc, HGDIOBJ(c.Font));
+    end;
+    res := ScriptShape(c.dc, c.psc, Text, Len, c.maxglyphs, a,
+      pointer(c.glyphs), pointer(c.logclust), pointer(c.attrs), count);
+    if res <> 0 then
+      // the script is not in this font: no font of its own is chosen here,
+      // see https://learn.microsoft.com/windows/win32/intl/
+      // displaying-text-with-uniscribe
+      res := E_OUTOFMEMORY; // drawn unshaped, as after a too small buffer
+  end;
+  case res of
+    0:
+      ;
+    E_OUTOFMEMORY:
+      begin
+        Run.Kind := fskPlain;
+        Run.Outcome := fsoFailed;
+        exit;
+      end;
+  else
+    begin
+      Run.Kind := fskSkip;
+      Run.Outcome := fsoFailed;
+      exit;
+    end;
+  end;
+  if count = 0 then
+  begin
+    Run.Kind := fskSkip; // nothing to draw
+    Run.Outcome := fsoDone;
+    exit;
+  end;
+  // S_OK with the font's default glyph for a character it lacks: the caller
+  // has to scan for it (ScriptShape documentation); read once, cache filled
+  if not c.defaultRead then
+  begin
+    c.defaultRead := true;
+    FillCharFast(props, SizeOf(props), 0);
+    props.cBytes := SizeOf(props);
+    c.hasDefault := ScriptGetFontProperties(c.dc, c.psc, props) = 0;
+    c.wgDefault := props.wgDefault;
+  end;
+  SetLength(Run.Glyphs, count);
+  k := 0;
+  missing := false;
+  for g := 0 to count - 1 do
+    // a zero-width glyph which is no diacritic draws nothing
+    if c.attrs[g].fFlags * [fDiacritic, fZeroWidth] <> [fZeroWidth] then
+    begin
+      Run.Glyphs[k] := c.glyphs[g];
+      if c.hasDefault and
+         (c.glyphs[g] = c.wgDefault) then
+        missing := true;
+      inc(k);
+    end;
+  SetLength(Run.Glyphs, k);
+  Run.Kind := fskShaped;
+  if missing then
+    Run.Outcome := fsoMissingGlyphs
+  else
+    Run.Outcome := fsoDone;
+end;
+
 function TUniscribeShaper.Shape(Text: PWideChar; Len: integer;
   Font: TFontHandle; RightToLeft: boolean; out Runs: TFontShapedRuns): boolean;
 var
-  i, j, n, L, max, maxglyphs, count, numSp, glyphsCount: integer;
-  res: HRESULT;
+  i, j, n, L, max, count, numSp: integer;
   Sp: PScriptPropertiesArray;
   items: array of TScriptItem;
   level: array of byte;
   VisualToLogical: array of integer;
-  psc: pointer; // opaque Uniscribe font metric cache
   complex, R2L: boolean;
-  attrs: array of TScriptVisAttr;
-  glyphs, logclust: array of word;
   control: TScriptControl;
   state: TScriptState;
-  dc: HDC;
-  old: HGDIOBJ;
-
-  procedure AddRun(Kind: TFontShapeKind; Outcome: TFontShapeOutcome);
-  begin
-    SetLength(Runs, n + 1);
-    Runs[n].Kind := Kind;
-    Runs[n].Outcome := Outcome;
-    Runs[n].TextStart := items[i].iCharPos;
-    Runs[n].TextLen := L;
-    inc(n);
-  end;
-
-  procedure AddShaped;
-  var
-    g, k: integer;
-  begin
-    if glyphsCount = 0 then
-    begin
-      AddRun(fskSkip, fsoDone); // nothing to draw
-      exit;
-    end;
-    AddRun(fskShaped, fsoDone);
-    SetLength(Runs[n - 1].Glyphs, glyphsCount);
-    k := 0;
-    for g := 0 to glyphsCount - 1 do
-      // a zero-width glyph which is no diacritic draws nothing
-      if attrs[g].fFlags * [fDiacritic, fZeroWidth] <> [fZeroWidth] then
-      begin
-        Runs[n - 1].Glyphs[k] := glyphs[g];
-        inc(k);
-      end;
-    SetLength(Runs[n - 1].Glyphs, k);
-  end;
-
+  c: TUspShapeContext;
 begin
   result := false;
   Runs := nil;
@@ -848,15 +965,8 @@ begin
   SetLength(VisualToLogical, count);
   if ScriptLayout(count, pointer(level), pointer(VisualToLogical), nil) <> 0 then
     exit;
-  // 4. shape every item; one buffer size for all, as large as the whole text
-  // with its terminating #0 needs
-  maxglyphs := ((Len + 1) * 3) shr 1 + 32;
-  SetLength(attrs, maxglyphs);
-  SetLength(glyphs, maxglyphs);
-  SetLength(logclust, maxglyphs);
-  psc := nil; // cached for the same font
-  dc := 0;
-  old := 0;
+  // 4. shape every item
+  UspInit(c, Font, Len);
   n := 0;
   try
     for j := 0 to count - 1 do
@@ -865,47 +975,51 @@ begin
       L := items[i + 1].iCharPos - items[i].iCharPos;
       if L <= 0 then
         continue; // covers no code unit
-      res := ScriptShape(0, psc, Text + items[i].iCharPos, L, maxglyphs,
-        @items[i].a, pointer(glyphs), pointer(logclust), pointer(attrs),
-        glyphsCount);
-      case res of
-        0:
-          AddShaped;
-        E_OUTOFMEMORY:
-          AddRun(fskPlain, fsoFailed); // maxglyphs too small
-        E_PENDING,
-        USP_E_SCRIPT_NOT_IN_FONT:
-          begin
-            // the font has to be selected into a DC
-            if dc = 0 then
-            begin
-              dc := CreateCompatibleDC(0);
-              old := SelectObject(dc, HGDIOBJ(Font));
-            end;
-            res := ScriptShape(dc, psc, Text + items[i].iCharPos, L, maxglyphs,
-              @items[i].a, pointer(glyphs), pointer(logclust), pointer(attrs),
-              glyphsCount);
-            if res = 0 then
-              AddShaped
-            else
-              // the script is not in this font: no font of its own is chosen
-              // here, see https://learn.microsoft.com/windows/win32/intl/
-              // displaying-text-with-uniscribe
-              AddRun(fskPlain, fsoFailed);
-          end;
-      else
-        AddRun(fskSkip, fsoFailed);
-      end;
+      SetLength(Runs, n + 1);
+      Runs[n].TextStart := items[i].iCharPos;
+      Runs[n].TextLen := L;
+      if SizeOf(TScriptAnalysis) = SizeOf(cardinal) then
+        Runs[n].Analysis := PCardinal(@items[i].a)^; // for ShapeRun
+      Runs[n].Rtl := odd(items[i].a.s.uBidiLevel);
+      UspShapeItem(c, Text + items[i].iCharPos, L, @items[i].a, Runs[n]);
+      inc(n);
     end;
   finally
-    if dc <> 0 then
-    begin
-      SelectObject(dc, old);
-      DeleteDC(dc);
-    end;
-    if psc <> nil then
-      ScriptFreeCache(psc);
+    UspDone(c);
   end;
+  result := true;
+end;
+
+function TUniscribeShaper.ShapeRun(Text: PWideChar; Len: integer;
+  Font: TFontHandle; var Run: TFontShapedRun): boolean;
+var
+  a: TScriptAnalysis;
+  c: TUspShapeContext;
+  r: TFontShapedRun;
+begin
+  result := false;
+  if (Text = nil) or
+     (Font = nil) or
+     (Run.TextStart < 0) or
+     (Run.TextLen <= 0) or
+     (Run.TextStart + Run.TextLen > Len) or
+     (SizeOf(TScriptAnalysis) <> SizeOf(cardinal)) then
+    exit;
+  PCardinal(@a)^ := Run.Analysis;
+  r := Run;
+  UspInit(c, Font, Run.TextLen);
+  try
+    UspShapeItem(c, Text + Run.TextStart, Run.TextLen, @a, r);
+  finally
+    UspDone(c);
+  end;
+  if r.Outcome = fsoFailed then
+    exit; // the part cannot be shaped with this font: Run unchanged
+  r.Advances := nil; // the advances of the font apply
+  r.Offsets := nil;
+  r.YOffsets := nil;
+  r.Clusters := nil;
+  Run := r;
   result := true;
 end;
 
