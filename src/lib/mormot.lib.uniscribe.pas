@@ -889,8 +889,12 @@ begin
     c.defaultRead := true;
     FillCharFast(props, SizeOf(props), 0);
     props.cBytes := SizeOf(props);
-    c.hasDefault := ScriptGetFontProperties(c.dc, c.psc, props) = 0;
-    c.wgDefault := props.wgDefault;
+    c.hasDefault := true;
+    if ScriptGetFontProperties(c.dc, c.psc, props) = 0 then
+      c.wgDefault := props.wgDefault
+    else
+      c.wgDefault := 0; // the .notdef of a TrueType font: keep the check
+
   end;
   SetLength(Run.Glyphs, count);
   k := 0;
