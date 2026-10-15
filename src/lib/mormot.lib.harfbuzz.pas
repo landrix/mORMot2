@@ -115,6 +115,12 @@ const
   HB_DIRECTION_LTR = 4;
   HB_DIRECTION_RTL = 5;
 
+  /// hb_script_t values from harfbuzz/hb-common.h: the ISO 15924 tags of the
+  // scripts which take the script of the text around them
+  HB_SCRIPT_COMMON = $5A797979;    // 'Zyyy'
+  HB_SCRIPT_INHERITED = $5A696E68; // 'Zinh'
+  HB_SCRIPT_UNKNOWN = $5A7A7A7A;   // 'Zzzz'
+
   /// FT_LOAD_NO_HINTING keeps the advances free of grid-fitting distortion
   // - do NOT use FT_LOAD_NO_SCALE here: HarfBuzz dropped its "return raw design
   //   units" behaviour for that flag, and now always multiplies the advance by
@@ -139,6 +145,13 @@ type
     buffer: hb_buffer_t; direction: hb_direction_t); cdecl;
   Thb_buffer_guess_segment_properties = procedure(
     buffer: hb_buffer_t); cdecl;
+  Thb_buffer_set_script = procedure(
+    buffer: hb_buffer_t; script: cardinal); cdecl;
+  Thb_unicode_funcs_get_default = function: pointer; cdecl;
+  Thb_unicode_script = function(
+    ufuncs: pointer; unicode: cardinal): cardinal; cdecl;
+  Thb_script_get_horizontal_direction = function(
+    script: cardinal): hb_direction_t; cdecl;
   Thb_shape = procedure(
     font: hb_font_t; buffer: hb_buffer_t;
     features: pointer; num_features: cardinal); cdecl;
@@ -163,6 +176,11 @@ type
     shape:           Thb_shape;
     buffer_get_glyph_infos: Thb_buffer_get_glyph_infos;
     buffer_get_glyph_positions: Thb_buffer_get_glyph_positions;
+    // the script runs of a mixed text - all available since HarfBuzz 0.9.2
+    buffer_set_script: Thb_buffer_set_script;
+    unicode_funcs_get_default: Thb_unicode_funcs_get_default;
+    unicode_script: Thb_unicode_script;
+    script_get_horizontal_direction: Thb_script_get_horizontal_direction;
     // optional - available since HarfBuzz 0.9.5; used to set FT_LOAD_NO_HINTING
     ft_font_set_load_flags: Thb_ft_font_set_load_flags;
     /// true once the library is loaded - false on nil
@@ -186,7 +204,7 @@ const
     {$endif OSDARWIN}
 
   /// the entries of THarfBuzzLib, in the order of its fields
-  HARFBUZZ_ENTRIES: array[0 .. 11] of PAnsiChar = (
+  HARFBUZZ_ENTRIES: array[0 .. 15] of PAnsiChar = (
     'ft_font_create',
     'font_destroy',
     'buffer_create',
@@ -197,6 +215,10 @@ const
     'shape',
     'buffer_get_glyph_infos',
     'buffer_get_glyph_positions',
+    'buffer_set_script',
+    'unicode_funcs_get_default',
+    'unicode_script',
+    'script_get_horizontal_direction',
     '?ft_font_set_load_flags',
     nil);
 
@@ -264,85 +286,281 @@ begin
 end;
 
 type
-  /// HarfBuzz implementation of IFontShaper
-  // - shapes the whole text in one call: one fskShaped run, every glyph kept
+  /// HarfBuzz implementation of IFontShaper and IFontRunShaper
   // - returns false for a text which is not RightToLeft and has no character
   // of a script that needs shaping (NeedsShaping)
-  THarfBuzzShaper = class(TInterfacedObject, IFontShaper)
+  // - otherwise one run per script run, each shaped with the whole text as
+  // context, its direction from its script; in visual order by two levels
+  // only: the base direction is RTL if RightToLeft is set, LTR otherwise, as
+  // Uniscribe's ScriptItemize sees it - no full bidi (no FriBidi), so digits
+  // inside an Arabic run come out reversed, as they did before
+  // - a run with glyph 0 is fskShaped + fsoMissingGlyphs; Analysis holds its
+  // hb_script_t, for ShapeRun
+  THarfBuzzShaper = class(TInterfacedObject, IFontShaper, IFontRunShaper)
   public
     function Shape(Text: PWideChar; Len: integer; Font: TFontHandle;
       RightToLeft: boolean; out Runs: TFontShapedRuns): boolean;
+    function ShapeRun(Text: PWideChar; Len: integer; Font: TFontHandle;
+      var Run: TFontShapedRun): boolean;
   end;
+
+// the HarfBuzz font of a face sized to 1000 units per em, nil on failure
+function HbFont(Font: TFontHandle): hb_font_t;
+var
+  ctx: PFreeTypeFont;
+begin
+  result := nil;
+  ctx := PFreeTypeFont(Font);
+  if (ctx = nil) or
+     (ctx^.Face = nil) or
+     // hb_ft_font_create() copies the scale out of ft_face^.size^.metrics, so
+     // the face must be sized first or every advance comes back as 0
+     not FreeTypeSetEmSize1000(ctx) then
+    exit;
+  result := HarfBuzz.ft_font_create(ctx^.Face, nil);
+  if (result <> nil) and
+     Assigned(HarfBuzz.ft_font_set_load_flags) then
+    HarfBuzz.ft_font_set_load_flags(result, HB_FT_LOAD_NO_HINTING);
+end;
+
+// shape the part of Run in the whole text: Kind, Outcome and the glyph arrays
+// set - new arrays; false if HarfBuzz gave nothing
+function HbShapeRun(Font: hb_font_t; Text: PWideChar; Len: integer;
+  var Run: TFontShapedRun): boolean;
+var
+  buf: hb_buffer_t;
+  infos: Phb_glyph_info_array;
+  positions: Phb_glyph_position_array;
+  count: cardinal;
+  i: integer;
+  missing: boolean;
+begin
+  result := false;
+  buf := HarfBuzz.buffer_create;
+  try
+    // the whole text as context: joining survives the edge of the part
+    HarfBuzz.buffer_add_utf16(buf, Text, Len, Run.TextStart, Run.TextLen);
+    if Run.Rtl then
+      HarfBuzz.buffer_set_direction(buf, HB_DIRECTION_RTL)
+    else
+      HarfBuzz.buffer_set_direction(buf, HB_DIRECTION_LTR);
+    if Run.Analysis <> 0 then
+      HarfBuzz.buffer_set_script(buf, Run.Analysis);
+    HarfBuzz.buffer_guess_segment_properties(buf); // the language
+    HarfBuzz.shape(Font, buf, nil, 0);
+    count := 0;
+    infos := HarfBuzz.buffer_get_glyph_infos(buf, count);
+    positions := HarfBuzz.buffer_get_glyph_positions(buf, count);
+    if (count = 0) or
+       (infos = nil) or
+       (positions = nil) then
+      exit;
+    Run.Glyphs := nil; // new arrays: a copy of the run keeps the old ones
+    Run.Advances := nil;
+    Run.Offsets := nil;
+    Run.YOffsets := nil;
+    Run.Clusters := nil;
+    SetLength(Run.Glyphs, count);
+    SetLength(Run.Advances, count);
+    SetLength(Run.Offsets, count);
+    SetLength(Run.YOffsets, count);
+    SetLength(Run.Clusters, count);
+    missing := false;
+    for i := 0 to integer(count) - 1 do
+    begin
+      Run.Glyphs[i] := word(infos[i].codepoint);
+      if Run.Glyphs[i] = 0 then
+        missing := true; // the font has no glyph for a character
+      Run.Clusters[i] := integer(infos[i].cluster); // in the whole text
+      // one em = 1000 units, so the 26.6 values are PDF units shifted by 6 bits
+      Run.Advances[i] := From26Dot6(positions[i].x_advance);
+      Run.Offsets[i] := From26Dot6(positions[i].x_offset);
+      Run.YOffsets[i] := From26Dot6(positions[i].y_offset);
+    end;
+    Run.Kind := fskShaped;
+    if missing then
+      Run.Outcome := fsoMissingGlyphs
+    else
+      Run.Outcome := fsoDone;
+    result := true;
+  finally
+    HarfBuzz.buffer_destroy(buf);
+  end;
+end;
+
+// the script runs of a text: Common, Inherited and Unknown take the script
+// before them, at the start the first one after them (as ICU's ScriptRun)
+procedure HbScriptRuns(Text: PWideChar; Len: integer; BaseRtl: boolean;
+  out Runs: TFontShapedRuns);
+var
+  ufuncs: pointer;
+  scripts: TCardinalDynArray;
+  i, n, first: integer;
+  c, sc, last: cardinal;
+  d: hb_direction_t;
+begin
+  Runs := nil;
+  ufuncs := HarfBuzz.unicode_funcs_get_default;
+  SetLength(scripts, Len);
+  i := 0;
+  while i < Len do
+  begin
+    c := ord(Text[i]);
+    n := 1;
+    if (c >= $D800) and
+       (c <= $DBFF) and
+       (i + 1 < Len) and
+       (ord(Text[i + 1]) >= $DC00) and
+       (ord(Text[i + 1]) <= $DFFF) then
+    begin
+      c := ((c - $D800) shl 10) + (cardinal(ord(Text[i + 1])) - $DC00) + $10000;
+      n := 2;
+    end;
+    sc := HarfBuzz.unicode_script(ufuncs, c);
+    scripts[i] := sc;
+    if n = 2 then
+      scripts[i + 1] := sc;
+    inc(i, n);
+  end;
+  // neutral code units take the script before them
+  last := 0;
+  first := -1;
+  for i := 0 to Len - 1 do
+    if (scripts[i] = HB_SCRIPT_COMMON) or
+       (scripts[i] = HB_SCRIPT_INHERITED) or
+       (scripts[i] = HB_SCRIPT_UNKNOWN) then
+    begin
+      if last <> 0 then
+        scripts[i] := last;
+    end
+    else
+    begin
+      last := scripts[i];
+      if first < 0 then
+        first := i;
+    end;
+  // and those at the start the first script after them
+  if first > 0 then
+    for i := 0 to first - 1 do
+      scripts[i] := scripts[first];
+  // one run per script
+  n := 0;
+  i := 0;
+  while i < Len do
+  begin
+    SetLength(Runs, n + 1);
+    Runs[n].TextStart := i;
+    sc := scripts[i];
+    while (i < Len) and
+          (scripts[i] = sc) do
+      inc(i);
+    Runs[n].TextLen := i - Runs[n].TextStart;
+    Runs[n].Analysis := sc;
+    if first < 0 then
+      Runs[n].Rtl := BaseRtl // no script at all: the base direction
+    else
+    begin
+      d := HarfBuzz.script_get_horizontal_direction(sc);
+      Runs[n].Rtl := d = HB_DIRECTION_RTL; // INVALID or LTR: left to right
+    end;
+    inc(n);
+  end;
+end;
+
+// the visual order of the runs, two levels: on an LTR base a sequence of RTL
+// runs is reversed; on an RTL base the whole list, then each LTR sequence back
+procedure HbVisualOrder(var Runs: TFontShapedRuns; BaseRtl: boolean);
+var
+  i, j, k: integer;
+  tmp: TFontShapedRun;
+
+  procedure Reverse(a, b: integer);
+  begin
+    while a < b do
+    begin
+      tmp := Runs[a];
+      Runs[a] := Runs[b];
+      Runs[b] := tmp;
+      inc(a);
+      dec(b);
+    end;
+  end;
+
+begin
+  if BaseRtl then
+    Reverse(0, high(Runs));
+  i := 0;
+  while i <= high(Runs) do
+    if Runs[i].Rtl <> BaseRtl then
+    begin
+      j := i;
+      while (j < high(Runs)) and
+            (Runs[j + 1].Rtl <> BaseRtl) do
+        inc(j);
+      k := i;
+      Reverse(k, j);
+      i := j + 1;
+    end
+    else
+      inc(i);
+end;
 
 function THarfBuzzShaper.Shape(Text: PWideChar; Len: integer;
   Font: TFontHandle; RightToLeft: boolean; out Runs: TFontShapedRuns): boolean;
 var
-  ctx:       PFreeTypeFont;
-  font_:     hb_font_t;
-  buf:       hb_buffer_t;
-  infos:     Phb_glyph_info_array;
-  positions: Phb_glyph_position_array;
-  count:     cardinal;
-  i:         integer;
+  font_: hb_font_t;
+  i: integer;
 begin
   result := false;
-  Runs   := nil;
-  if not HarfBuzz.Loaded or (Font = nil) or
-     (Text = nil) or (Len <= 0) or
+  Runs := nil;
+  if not HarfBuzz.Loaded or
+     (Font = nil) or
+     (Text = nil) or
+     (Len <= 0) or
      not (RightToLeft or NeedsShaping(Text, Len)) then
     exit;
-  ctx := PFreeTypeFont(Font);
-  if ctx^.Face = nil then
-    exit;
-  // hb_ft_font_create() copies the scale out of ft_face^.size^.metrics, so the
-  // face must be sized first or every advance comes back as 0
-  if not FreeTypeSetEmSize1000(ctx) then
-    exit;
-  font_ := HarfBuzz.ft_font_create(ctx^.Face, nil);
+  font_ := HbFont(Font);
   if font_ = nil then
     exit;
-  if Assigned(HarfBuzz.ft_font_set_load_flags) then
-    HarfBuzz.ft_font_set_load_flags(font_, HB_FT_LOAD_NO_HINTING);
-  buf := HarfBuzz.buffer_create;
   try
-    HarfBuzz.buffer_add_utf16(buf, Text, Len, 0, -1);
-    // RTL is forced; otherwise guess_segment_properties takes the direction
-    // from the script, as Uniscribe's itemizer does - a forced LTR would
-    // shape Arabic in the wrong order
-    if RightToLeft then
-      HarfBuzz.buffer_set_direction(buf, HB_DIRECTION_RTL);
-    HarfBuzz.buffer_guess_segment_properties(buf);
-    HarfBuzz.shape(font_, buf, nil, 0);
-    count     := 0;
-    infos     := HarfBuzz.buffer_get_glyph_infos(buf, count);
-    positions := HarfBuzz.buffer_get_glyph_positions(buf, count);
-    if (count = 0) or (infos = nil) or (positions = nil) then
-      exit;
-    SetLength(Runs, 1);
-    with Runs[0] do
-    begin
-      Kind      := fskShaped;
-      Outcome   := fsoDone;
-      TextStart := 0;
-      TextLen   := Len;
-      SetLength(Glyphs,   count);
-      SetLength(Advances, count);
-      SetLength(Offsets,  count);
-      SetLength(YOffsets, count);
-      SetLength(Clusters, count);
-      for i := 0 to integer(count) - 1 do
+    HbScriptRuns(Text, Len, RightToLeft, Runs);
+    for i := 0 to high(Runs) do
+      if not HbShapeRun(font_, Text, Len, Runs[i]) then
       begin
-        Glyphs[i]   := word(infos[i].codepoint);
-        Clusters[i] := integer(infos[i].cluster);
-        // one em = 1000 units, so the 26.6 values are PDF units shifted by 6 bits
-        Advances[i] := From26Dot6(positions[i].x_advance);
-        Offsets[i]  := From26Dot6(positions[i].x_offset);
-        YOffsets[i] := From26Dot6(positions[i].y_offset);
+        Runs[i].Kind := fskPlain; // HarfBuzz gave nothing: drawn unshaped
+        Runs[i].Outcome := fsoFailed;
       end;
-    end;
-    result := true;
+    HbVisualOrder(Runs, RightToLeft);
+    result := Runs <> nil;
   finally
-    HarfBuzz.buffer_destroy(buf);
+    HarfBuzz.font_destroy(font_);
+  end;
+end;
+
+function THarfBuzzShaper.ShapeRun(Text: PWideChar; Len: integer;
+  Font: TFontHandle; var Run: TFontShapedRun): boolean;
+var
+  font_: hb_font_t;
+  r: TFontShapedRun;
+begin
+  result := false;
+  if not HarfBuzz.Loaded or
+     (Text = nil) or
+     (Run.TextStart < 0) or
+     (Run.TextLen <= 0) or
+     (Run.TextStart + Run.TextLen > Len) then
+    exit;
+  font_ := HbFont(Font);
+  if font_ = nil then
+    exit;
+  try
+    r := Run;
+    if HbShapeRun(font_, Text, Len, r) then
+    begin
+      Run := r;
+      result := true;
+    end;
+  finally
     HarfBuzz.font_destroy(font_);
   end;
 end;
