@@ -131,11 +131,16 @@ type
   // - fsoNotNeeded: the part needs no shaping
   // - fsoFailed: the shaper could not shape the part; Kind says what to draw
   // instead, e.g. fskSkip where the platform API used to drop it
+  // - fsoMissingGlyphs: the part is shaped (fskShaped), but the font lacks a
+  // glyph for at least one of its characters - its Glyphs hold the font's
+  // missing glyph there; a caller may reshape it with another face
+  // (IFontRunShaper) or draw it as it is
   TFontShapeOutcome = (
     fsoUnknown,
     fsoDone,
     fsoNotNeeded,
-    fsoFailed);
+    fsoFailed,
+    fsoMissingGlyphs);
 
   /// one part of a shaped text, in visual order
   // - positions count UTF-16 code units of the whole source text
@@ -164,6 +169,12 @@ type
     YOffsets: TIntegerDynArray;
     /// source code unit of each glyph, in the whole text - empty when not known
     Clusters: TIntegerDynArray;
+    /// what the shaper found for the part, for IFontRunShaper.ShapeRun of the
+    // same shaper: opaque to the caller (Uniscribe: its SCRIPT_ANALYSIS,
+    // HarfBuzz: the hb_script_t)
+    Analysis: cardinal;
+    /// true if the part runs right to left
+    Rtl: boolean;
   end;
 
   /// the parts of a shaped text, in visual order
@@ -257,6 +268,22 @@ type
     // Kind and Outcome set
     function Shape(Text: PWideChar; Len: integer; Font: TFontHandle;
       RightToLeft: boolean; out Runs: TFontShapedRuns): boolean;
+  end;
+
+  /// shape one part of a text again, with another face, in its context
+  // - an optional interface of an IFontShaper: the caller of Shape may take a
+  // part the font lacks glyphs for (fsoMissingGlyphs, or fskPlain with
+  // fsoFailed) to another face, e.g. its fallback font
+  IFontRunShaper = interface
+    ['{4A0DD8CC-3BF1-4CE0-B596-664778F68C45}']
+    /// shape the part Run of Text again with Font
+    // - Text and Len as given to IFontShaper.Shape, Run one of its runs:
+    // TextStart, TextLen, Analysis and Rtl say what to shape and how; Kind,
+    // Outcome and the glyph arrays are replaced - with new arrays, so that a
+    // copy of the run keeps the old ones
+    // - returns false, Run unchanged, if the part cannot be shaped with Font
+    function ShapeRun(Text: PWideChar; Len: integer; Font: TFontHandle;
+      var Run: TFontShapedRun): boolean;
   end;
 
   /// make a subset of a TrueType/OpenType font
