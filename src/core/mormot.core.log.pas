@@ -69,7 +69,7 @@ type
 
   /// a debugger symbol, as decoded by TDebugFile from a .map/.dbg/.mab file
   // - may refer to a global variable, function or method name and address
-  TDebugSymbol = packed record
+  TDebugSymbol = record
     /// symbol identifier
     Name: RawUtf8;
     /// relative virtual address where this symbol starts
@@ -87,7 +87,7 @@ type
   // - as decoded by TDebugFile from a .map/.dbg/.mab file
   // - may refer to the main .pas file, a nested .inc file, or source locations
   // generated for compiler features such as inlined routines or generics
-  TDebugBlock = packed record
+  TDebugBlock = record
     /// identifier and address range of this source block
     // - Name is the main Pascal unit identifier, e.g. 'mormot.core.base'
     Symbol: TDebugSymbol;
@@ -1206,7 +1206,7 @@ type
 
   /// thread-specific internal threadvar definition used for fast process
   // - consumes 484/512 bytes + 256+64 per thread on CPU32/CPU64
-  TSynLogThreadInfo = packed record
+  TSynLogThreadInfo = {$ifdef CPUINTEL} packed {$endif} record
     /// number of recursive calls currently stored in Recursion[]
     // - nothing logged above MAX_SYNLOGRECURSION (53) to keep this record small
     RecursionCount: byte;
@@ -4235,6 +4235,18 @@ begin
     until L > R;
 end;
 
+function IsWeakSymbol(s: PDebugSymbol): boolean;
+begin
+  result := (s <> nil) and
+            (FindPropName(['LogExcept', 'SynLogException', 'ThreadProc',
+              'SynLogVectoredHandler', 'SynRaiseProc'
+              {$ifdef ISDELPHI} , 'SynRtlUnwind',  '@HandleAnyException',
+              '@HandleOnException', '@RaiseExcept', '@RaiseAgain',
+              '@RaiseAtExcept', '@InternalRaiseAtExcept', 'ThreadWrapper'
+              {$ifdef CPUX86} , 'RawStackTrace' {$endif}
+              {$endif ISDELPHI} ], s^.Name) >= 0);
+end;
+
 function TDebugFile.AddLog(W: TTextWriter; aPointer: PtrUInt; NoHex: boolean): boolean;
 var
   rva: TDebugAddress;
@@ -4260,15 +4272,8 @@ begin
   if rva = 0 then
     exit;
   s := FindSymbol(rva);
-  if s <> nil then
-    if FindPropName(['LogExcept', 'SynLogException', 'ThreadProc',
-         'SynLogVectoredHandler', 'SynRaiseProc'
-         {$ifdef ISDELPHI} , 'SynRtlUnwind',  '@HandleAnyException',
-         '@HandleOnException', '@RaiseExcept', '@RaiseAgain',
-         '@RaiseAtExcept', '@InternalRaiseAtExcept', 'ThreadWrapper'
-         {$ifdef CPUX86} , 'RawStackTrace' {$endif}
-         {$endif ISDELPHI} ], s^.Name) >= 0 then
-      exit; // only meaningful entries
+  if IsWeakSymbol(s) then
+    exit; // only meaningful entries
   result := true;
   if not NoHex then
   begin
@@ -4313,6 +4318,11 @@ begin
   if (s = nil) and
      (l = nil) then
      exit;
+  if IsWeakSymbol(s) or
+     ((l <> nil) and
+      (FindPropName(['mormot.core.log.pas', 'mormot.core.test.pas'],
+         l^.FileName) >= 0)) then
+    exit; // don't pollute the output ShortString with internal redirections
   AppendShortCharSafe(' ', aInfo); // always prepend a space
   if l <> nil then
   begin
@@ -9170,8 +9180,7 @@ begin
   destbuffer^ := '<';
   destbuffer := AppendUInt32ToBuffer(destbuffer + 1,
     ord(severity) + ord(facility) shl 3);
-  PInteger(destbuffer)^ :=
-    ord('>') + ord('1') shl 8 + ord(' ') shl 16; // VERSION=1
+  PInteger(destbuffer)^ := ord('>') + ord('1') shl 8 + ord(' ') shl 16; // VERSION=1
   inc(destbuffer, 3);
   FromGlobalTime(st, {local=}false);
   DateToIso8601PChar(destbuffer, true, st.Year, st.Month, st.Day);
@@ -9200,7 +9209,7 @@ begin
     exit; // nothing to send
   if not IsAnsiCompatible(P, len) then
   begin
-    PInteger(destbuffer)^ := BOM_UTF8; // weird enough behavior on POSIX :(
+    PInteger(destbuffer)^ := BOM_UTF8; // weird enough behavior for POSIX :(
     inc(destbuffer, 3);
   end;
   MoveFast(P^, destbuffer^, len);

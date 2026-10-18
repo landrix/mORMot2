@@ -1662,6 +1662,7 @@ var
   var
     c: AnsiChar;
     jc: TJsonChar;
+    bak, json, abc, def, void: RawUtf8;
     // _JSONCHARS: array[0 .. 127] of byte; if needs recompute
   begin
     // validate JSON_CHARS[] pre-computed table
@@ -1689,6 +1690,90 @@ var
         include(jc, jcJsonIdentifier);           // _-.[]$0..9a..zA..Z
       Check(JSON_CHARS[c] = jc, 'JSON_CHARS');
     end;
+    // validate RemoveMagicFromJson()
+    abc  := BinToBase64WithMagic('abc');
+    def  := BinToBase64WithMagic('def');
+    void := BinToBase64WithMagic('');
+    json := '{"a":"normal","b":123}'; // no magic
+    bak := json;
+    RemoveMagicFromJson(json);
+    CheckEqual(json, bak);
+    Check(pointer(json) = pointer(bak), 'idem1');
+    json := '["' + abc + '"]'; // single magic
+    RemoveMagicFromJson(json);
+    CheckEqual(json, '["YWJj"]');
+    json := '["' + abc + '","' + def + '"]'; // consecutive magic
+    RemoveMagicFromJson(json);
+    CheckEqual(json, '["YWJj","ZGVm"]');
+    json := '["' + abc + '","one","two",3,"' + def + '","three"]';
+    RemoveMagicFromJson(json); // normal strings between magic strings
+    CheckEqual(json, '["YWJj","one","two",3,"ZGVm","three"]');
+    json := '{"text":"one\"two","blob":"' + abc + '"}'; // escaped quote
+    RemoveMagicFromJson(json);
+    CheckEqual(json, '{"text":"one\"two","blob":"YWJj"}');
+    json := '{"blob":"' + abc + '"}';
+    bak := json; // shared instance
+    RemoveMagicFromJson(json);
+    CheckEqual(json, '{"blob":"YWJj"}');
+    Check(pointer(json) <> pointer(bak), 'idem2');
+    CheckEqual(bak, '{"blob":"' + abc + '"}');
+    bak := json;
+    RemoveMagicFromJson(json); // idempotent
+    CheckEqual(json, bak);
+    json := ''; // empty input
+    RemoveMagicFromJson(json);
+    CheckEqual(json, '');
+    json := '[1,2,3,true,false,null]'; // no JSON strings at all
+    bak := json;
+    RemoveMagicFromJson(json);
+    CheckEqual(json, bak);
+    Check(pointer(json) = pointer(bak), 'idem3');
+    json := '"' + abc + '"'; // top-level string
+    RemoveMagicFromJson(json);
+    CheckEqual(json, '"YWJj"');
+    // empty BLOB - assuming BinToBase64WithMagic('') emits the magic prefix
+    json := '["' + void + '"]';
+    RemoveMagicFromJson(json);
+    CheckEqual(json, '[""]');
+    // magic occurs inside a string, but not as its prefix: must stay untouched
+    json := '["prefix' + abc + '"]';
+    bak := json;
+    RemoveMagicFromJson(json);
+    CheckEqual(json, bak);
+    // textual "\uFFF0" JSON escape is not the actual UTF-8 magic marker
+    json := '["\uFFF0YWJj"]';
+    bak := json;
+    RemoveMagicFromJson(json);
+    CheckEqual(json, bak);
+    // magic in a property name
+    json := '{"' + abc + '":"value"}';
+    RemoveMagicFromJson(json);
+    CheckEqual(json, '{"YWJj":"value"}');
+    // magic in both property name and value
+    json := '{"' + abc + '":"' + def + '"}';
+    RemoveMagicFromJson(json);
+    CheckEqual(json, '{"YWJj":"ZGVm"}');
+    // escaped backslash just before the closing quote
+    json := '{"text":"one\\","blob":"' + abc + '"}';
+    RemoveMagicFromJson(json);
+    CheckEqual(json, '{"text":"one\\","blob":"YWJj"}');
+    // several escaped quotes/backslashes before the magic string
+    json := '{"text":"a\"b\\c\"d","blob":"' + abc + '"}';
+    RemoveMagicFromJson(json);
+    CheckEqual(json, '{"text":"a\"b\\c\"d","blob":"YWJj"}');
+    // unique string should really be compacted in place
+    json := '["' + abc + '","tail"]';
+    p := UniqueRawUtf8(json);
+    RemoveMagicFromJson(json);
+    Check(pointer(json) = p, 'inplace');
+    CheckEqual(json, '["YWJj","tail"]');
+    // several consecutive empty/non-empty BLOBs
+    json := '["' + void + '","' + abc + '","' + void + '","' + def + '"]';
+    RemoveMagicFromJson(json);
+    CheckEqual(json, '["","YWJj","","ZGVm"]');
+    json := '["' + abc + ',"unfinished';
+    RemoveMagicFromJson(json);
+    CheckEqual(json, '["YWJj,"unfinished');
   end;
 
   procedure TestMyColl(MyColl: TMyCollection);
@@ -11141,7 +11226,7 @@ end;
 
 const
   // regression tests use a const table instead of our runtime-computed array
-  c32t: array[byte] of cardinal = ($00000000, $77073096, $EE0E612C,
+  c32t: TByteToCardinal = ($00000000, $77073096, $EE0E612C,
     $990951BA, $076DC419, $706AF48F, $E963A535, $9E6495A3, $0EDB8832, $79DCB8A4,
     $E0D5E91E, $97D2D988, $09B64C2B, $7EB17CBD, $E7B82D07, $90BF1D91, $1DB71064,
     $6AB020F2, $F3B97148, $84BE41DE, $1ADAD47D, $6DDDE4EB, $F4D4B551, $83D385C7,
@@ -11297,6 +11382,19 @@ begin
   end;
 end;
 
+function W(p: PAnsiChar; value, bytes: PtrUInt): PAnsiChar;
+  {$ifdef HASINLINE} inline; {$endif}
+begin
+  PCardinal(p)^ := value; // little-endian, as the .zip format
+  result := @p[bytes];
+end;
+
+function WS(p: PAnsiChar; const text: RawUtf8): PAnsiChar;
+begin
+  MoveFast(pointer(text)^, p^, length(text));
+  result := @p[length(text)];
+end;
+
 procedure TTestCoreCompression.ZipFormat;
 var
   FN, FN2: TFileName;
@@ -11389,6 +11487,83 @@ var
     end;
   end;
 
+  procedure DataDescriptorLastEntry;
+  // some tools (e.g. LibreOffice for .xlsx) set FLAG_DATADESCRIPTOR on all
+  // entries: retrieving the last one from a memory buffer should not need fSource
+  const
+    DATA: array[0..1] of RawUtf8 = ('first content', 'second stored content');
+  var
+    crc, offs: array[0..1] of cardinal;
+    cdoffs, v: cardinal;
+    i: PtrInt;
+    p: PAnsiChar;
+    tmp: TTemp512;
+  begin
+    p := @tmp;
+    for i := 0 to 1 do
+    begin
+      offs[i] := p - PAnsiChar(@tmp);
+      crc[i] := crc32(0, pointer(DATA[i]), length(DATA[i]));
+      p := W(p, $04034b50, 4);           // local file header with no crc/sizes
+      p := W(p, 20, 2);
+      p := W(p, 8, 2);                   // FLAG_DATADESCRIPTOR
+      p := W(p, 0, 2);                   // stored
+      p := W(p, 0, 4);                   // time+date
+      p := W(p, 0, 4);
+      p := W(p, 0, 4);
+      p := W(p, 0, 4);
+      p := W(p, 5, 2);                   // name length
+      p := W(p, 0, 2);
+      p := WS(p, FormatUtf8('f%.tx', [i]));
+      p := WS(p, DATA[i]);
+      p := W(p, $08074b50, 4);           // data descriptor
+      p := W(p, crc[i], 4);
+      p := W(p, length(DATA[i]), 4);
+      p := W(p, length(DATA[i]), 4);
+    end;
+    cdoffs := p - PAnsiChar(@tmp);
+    for i := 0 to 1 do
+    begin
+      p := W(p, $02014b50, 4);           // central directory with crc/sizes
+      p := W(p, 20, 2);
+      p := W(p, 20, 2);
+      p := W(p, 8, 2);                   // FLAG_DATADESCRIPTOR
+      p := W(p, 0, 2);
+      p := W(p, 0, 4);
+      p := W(p, crc[i], 4);
+      p := W(p, length(DATA[i]), 4);
+      p := W(p, length(DATA[i]), 4);
+      p := W(p, 5, 2);
+      p := W(p, 0, 4);                   // extra + comment length
+      p := W(p, 0, 4);                   // disk + internal attr
+      p := W(p, 0, 4);                   // external attr
+      p := W(p, offs[i], 4);
+      p := WS(p, FormatUtf8('f%.tx', [i]));
+    end;
+    v := cardinal(p - PAnsiChar(@tmp)) - cdoffs;
+    p := W(p, $06054b50, 4);             // last header
+    p := W(p, 0, 4);
+    p := W(p, 2, 2);
+    p := W(p, 2, 2);
+    p := W(p, v, 4);
+    p := W(p, cdoffs, 4);
+    p := W(p, 0, 2);
+    CheckHash(@tmp, p - PAnsiChar(@tmp), $032B1637);
+    try
+      with TZipRead.Create(@tmp, p - PAnsiChar(@tmp)) do
+      try
+        CheckEqual(Count, 2, 'datadesc count');
+        for i := 0 to Count - 1 do
+          CheckEqual(UnZip(i), DATA[i], 'datadesc unzip');
+      finally
+        Free;
+      end;
+    except
+      on E: Exception do
+        FailedRaised(E);
+    end;
+  end;
+
 var
   i, m: integer;
   mem: QWord;
@@ -11414,12 +11589,13 @@ begin
       end;
   except
     on E: Exception do
-      Check(false, E.Message);
+      FailedRaised(E);
   end;
   Check(DeleteFile(FN));
   TZipWrite.Create(FN).Free;
   CheckEqual(FileSize(FN), SizeOf(minim), 'TZipWrite void .zip');
   Check(DeleteFile(FN));
+  DataDescriptorLastEntry;
   // onprog := TStreamRedirect.ProgressInfoToConsole;
   onprog := TSynLog.ProgressInfo;
   for m := 1 to 2 do
@@ -11558,9 +11734,36 @@ procedure TTestCoreCompression._SynLZ;
     Check(t = v);
   end;
 
+  procedure TestPartial(const hexa, suffix, expected: RawByteString;
+    maxOut: integer);
+  var
+    buffer: array[0..191] of byte;
+    count, k: integer;
+    outbuf: PAnsiChar;
+    compressed: RawByteString;
+  begin
+    compressed := Join([HumanHexToBin(hexa), suffix]);
+    Check((maxOut >= 0) and (maxOut <= SizeOf(buffer) - 16),
+      'partial test bound');
+    if (maxOut < 0) or (maxOut > SizeOf(buffer) - 16) then
+      exit;
+    outbuf := @buffer[16]; // guard 16 bytes before the output
+    FillCharFast(buffer, SizeOf(buffer), $A5);
+    count := SynLZDecompress1partial(pointer(compressed), length(compressed),
+      outbuf, maxOut);
+    CheckEqual(count, length(expected), 'partial count');
+    if expected <> '' then
+      Check(CompareMem(outbuf, pointer(expected), length(expected)),
+        'partial content');
+    for k := 0 to 15 do
+      CheckEqual(buffer[k], $A5, 'partial output underflow');
+    for k := 16 + maxOut to high(buffer) do
+      CheckEqual(buffer[k], $A5, 'partial output overflow');
+  end;
+
 var
   s, t: RawByteString;
-  i, j, complen2: integer;
+  i, j, k, n, complen2: integer;
   comp2, dec1: array of byte;
   {$ifdef ASMINTEL}
   comp1, dec2: array of byte;
@@ -11585,7 +11788,7 @@ begin
     FastSetRawByteString(s, pointer(t), length(t)); // =UniqueString
     Check(CompressSynLZ(s, true) = 'synlz');
     Check(CompressSynLZ(s, false) = 'synlz');
-    Check(s = t);
+    CheckEqual(s, t);
     Check(AlgoSynLZ.Decompress(AlgoSynLZ.Compress(s)) = t);
     SetLength(comp2, AlgoSynLZ.Compressdestlen(length(s)));
     complen2 := SynLZCompress1pas(Pointer(s), length(s), pointer(comp2));
@@ -11611,14 +11814,75 @@ begin
   for j := 0 to length(t) - 1 do
   begin
     FillCharFast(pointer(dec1)^, length(t), 0);
-    Check(SynLZDecompress1partial(pointer(comp2), complen2, Pointer(dec1), j) = j);
+    CheckEqual(SynLZDecompress1partial(pointer(comp2), complen2, Pointer(dec1), j), j);
     Check(CompareMem(pointer(dec1), pointer(t), j));
+    CheckEqual(StrLen(pointer(dec1)), j, 'underflow');
+    n := 0;
+    for k := j to length(t) - 1 do
+      if dec1[k] <> 0 then
+        inc(n);
+    CheckEqual(n, 0, 'overflow');
   end;
   s := Data;
   Check(CompressSynLZ(s, true) = 'synlz');
   Check(Length(s) < Length(Data), 'exelen');
   Check(CompressSynLZ(s, false) = 'synlz');
-  Check(s = Data);
+  CheckEqual(s, Data);
+  s := HumanHexToBin('0A000000000041');
+  CheckEqual(SynLZDecompressdestlen(pointer(s)), 10);
+  dec1[0] := 0;
+  CheckEqual(SynLZDecompress1partial(pointer(s), length(s), Pointer(dec1), length(dec1)), 1);
+  CheckEqual(dec1[0], $41, 'truncated');
+  dec1[0] := 0;
+  CheckEqual(SynLZDecompress1partial(pointer(s), length(s), Pointer(dec1), 0), 0);
+  CheckEqual(dec1[0], 0, 'partial0');
+  // in the ABC fixtures, hash('ABC') = $675, so 5167 encodes a 3-byte match
+  // and 506702 encodes an extended 20-byte match
+  TestPartial('', '', '',
+    8); // missing header
+  TestPartial('00', '', '',
+    8); // short header
+  TestPartial('0000', '', '',
+    8); // header alone
+  TestPartial('00000000', '', '',
+    8); // partial CW
+  TestPartial('008000', '', '',
+    8); // short extended header
+  TestPartial('010000000000', 'ABC', 'ABC',
+    16); // ignore advertised size
+  TestPartial('0080000000000000', 'ABC', 'ABC',
+    16); // extended header
+  TestPartial('000001000000', '', '',
+    8);  // missing match token
+  TestPartial('00000100000010', '', '',
+    8);  // one-byte token
+  TestPartial('0000010000000000', '', '',
+    8);  // unset hash entry
+  TestPartial('0000080000004142430000', '', 'ABC',
+    16); // invalid after literals
+  TestPartial('0000080000004142435067', '', 'ABC',
+    16); // missing length byte
+  TestPartial('0000080000004142435167', '', 'ABCABC',
+    6);  // final 2-byte token
+  TestPartial('0000080000004142435167', '', 'ABCABC',
+    16); // count < maxOut
+  TestPartial('0000080000004142435367', '', 'ABCABCAB',
+    16); // overlap
+  TestPartial('000008000000414243506702',  '','ABCABCABCABCABCABCABCAB',
+    23); // final 3-byte token
+  TestPartial('000008000000414243506702', '', 'ABCA',
+    4);  // clipped match
+  TestPartial('000008000000414243506702', '', 'ABCABCA',
+    7);
+  TestPartial('00001800000041424351675167', '', 'ABCABCABC',
+    16); // consecutive matches/hash
+  TestPartial('0000080000004142435167', '123456789', 'ABCABC123456789',
+   15);  // 8-byte match fast path
+  // literal runs across a 32-bit control-word boundary
+  TestPartial('000000000000' +
+    '4141414141414141414141414141414141414141414141414141414141414141' +
+    '00000000', 'Z', Join([RawUtf8OfChar('A', 32), 'Z']), 64);
+  TestPartial('000008000000414243506702', '', '', 0); // no writes
 end;
 
 procedure TTestCoreCompression._TAlgoCompress;
@@ -11867,9 +12131,14 @@ begin
     Check(zin.Extract('A.1mb') = Data, 'pw2');
     zin := nil;
     // a wrong password is reported as failure, not silently swallowed
-    zin := zlib.NewReader(newfile1, fhZip, 'wrongpassword');
-    Check(not zin.Extract('A.1mb', folder, {nosubfolder=}true), 'pw3');
-    CheckEqual(zin.Extract('A.1mb'), '', 'pw4');
+    TSynLog.Family.ExceptionIgnoreCurrentThread := true;
+    try
+      zin := zlib.NewReader(newfile1, fhZip, 'wrongpassword');
+      Check(not zin.Extract('A.1mb', folder, {nosubfolder=}true), 'pw3');
+      CheckEqual(zin.Extract('A.1mb'), '', 'pw4');
+    finally
+      TSynLog.Family.ExceptionIgnoreCurrentThread := false;
+    end;
     zin := nil;
     // a wrong password raises E7Zip on direct item extraction
     CheckRaised(Run7zExtract, [newfile1, 'wrongpassword'], E7Zip, 'pw5');

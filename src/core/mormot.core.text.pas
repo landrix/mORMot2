@@ -7678,14 +7678,14 @@ type
 const
   ROUNDER = $80000000;
 
-{$ifdef ASMINTEL} // our faster version using 128-bit x86_64 multiplication
+{$ifdef ASMINTELARM} // our faster version using 128-bit x86_64 multiplication
 
 procedure d2a_diy_fp_multiply(var x, y: TDIY_FP; normalize: boolean;
   out result: TDIY_FP); {$ifdef HASINLINE}inline;{$endif}
 var
   p: THash128Rec;
 begin
-  mul64x64(x.f, y.f, p); // fast x86_64 / i386 asm
+  mul64x64(x.f, y.f, p); // fast x86_64 / i386 / armv7 / aarch64 asm
   if (p.c1 and ROUNDER) <>  0 then
     inc(p.h);
   result.f := p.h;
@@ -7722,7 +7722,7 @@ begin
     end;
 end;
 
-{$endif ASMINTEL}
+{$endif ASMINTELARM}
 
 const
   // alpha =-61; gamma = 0
@@ -7830,7 +7830,7 @@ begin
 end;
 
 type
-  TSplitFloat = packed record
+  TSplitFloat = record
     case byte of
       0: (f: double);
       1: (b: array[0..7] of byte);
@@ -10833,6 +10833,7 @@ begin
     Head := GotoNextLine(p + plen);
     // parse each line pairs
     repeat
+      p := GotoNextNotSpace(p);
       if IdemPChar(p, '__SECURE-') then
         inc(p, 9); // e.g. if rsoCookieSecure is in Server.Options
       new.NameLen := GetNextItemTrimedLineBuffer(p, '=', new.NameStart);
@@ -10892,6 +10893,7 @@ begin // same logic than THttpCookies.ParseServer above
         break;
       Headers := GotoNextLine(p + plen);
       repeat
+        p := GotoNextNotSpace(p);
         if IdemPChar(p, '__SECURE-') then
           inc(p, 9);
         l := GetNextItemTrimedLineBuffer(p, '=', n);

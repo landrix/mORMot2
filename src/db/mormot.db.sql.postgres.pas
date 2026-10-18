@@ -876,8 +876,16 @@ begin
           fPGParamLengths[i] := length(p^.VData);
         end
         else
+        begin
           // p^.VData was not already set by BindArrayJson() -> convert now
+          // - p^.VArray may have been over-allocated by the caller (e.g.
+          // TRestStorageExternal.InternalBatchStop allocates the whole remaining
+          // batch) and only the first p^.VInt64 = ValuesCount items are bound:
+          // the trailing '' items would be serialized as ,,,, = invalid literal
+          if length(p^.VArray) > p^.VInt64 then
+            SetLength(p^.VArray, p^.VInt64); // local copy - caller untouched
           BoundArrayToJsonArray(p^.VArray, RawUtf8(p^.VData)); // e.g. '{1,2,3}'
+        end;
     end
     else
       // single value parameter
@@ -931,7 +939,11 @@ begin
           'parameter #% of type %', [self, i, ToText(p^.VType)^]);
       end;
     if fPGParams[i] = nil then
-      fPGParams[i] := pointer(p^.VData);
+      if (p^.VType <> ftNull) and
+         (p^.VData = '') then
+        fPGParams[i] := @NULCHAR // empty value, not SQL NULL
+      else
+        fPGParams[i] := pointer(p^.VData);
     inc(p);
   end;
 end;
@@ -1217,9 +1229,15 @@ begin
 end;
 
 function TSqlDBPostgresStatement.ColumnInt(Col: integer): int64;
+var
+  v: PUtf8Char;
 begin
   CheckColAndRowset(Col);
-  result := GetInt64(PQ.GetValue(fRes, fCurrentRow, Col));
+  v := PQ.GetValue(fRes, fCurrentRow, Col);
+  if fColumns[Col].ColumnAttr = BOOLOID then // = PQ.ftype(fRes, Col)
+    result := ord((v <> nil) and (v^ = 't'))
+  else
+    result := GetInt64(v);
 end;
 
 function TSqlDBPostgresStatement.ColumnNull(Col: integer): boolean;

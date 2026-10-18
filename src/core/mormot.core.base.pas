@@ -496,6 +496,7 @@ type
   TByteToByte = array[byte] of byte;
   TByteToAnsiChar = array[byte] of AnsiChar;
   TByteToWideChar = array[byte] of WideChar;
+  TByteToCardinal = array[byte] of cardinal;
   /// type of mormot.core.unicode TNormTable lookup table
   TAnsiCharToAnsiChar = array[AnsiChar] of AnsiChar;
   PAnsiCharToAnsiChar = ^TAnsiCharToAnsiChar;
@@ -984,12 +985,12 @@ function StrRecNew(U: PPointer; sr: PStrRec; P: pointer; const len: PtrInt): PSt
 /// ensure the supplied variable will have a CP_UTF8 code page
 // - making it unique if needed
 procedure EnsureRawUtf8(var s: RawByteString); overload;
-  {$ifdef HASINLINE}inline;{$endif}
+  {$ifdef HASSAFEINLINE}inline;{$endif}
 
 /// ensure the supplied variable will have a CP_UTF8 code page
 // - making it unique if needed
 procedure EnsureRawUtf8(var s: RawUtf8); overload;
-  {$ifdef HASINLINE}inline;{$endif}
+  {$ifdef HASSAFEINLINE}inline;{$endif}
 
 /// internal function which could be used instead of SetLength() if RefCnt = 1
 procedure FakeLength(var s: RawUtf8; len: PtrInt); overload;
@@ -1017,7 +1018,7 @@ procedure FakeSetLength(var s: RawByteString; len: PtrInt); overload;
 // - warning: s should NOT be read-only (i.e. assigned from a constant), but
 // a just-allocated string with RefCnt = 1
 procedure FakeCodePage(var s: RawByteString; cp: cardinal);
-  {$ifdef HASINLINE} inline; {$endif}
+  {$ifdef HASSAFEINLINE} inline; {$endif}
 
 /// internal function which assign src to dest, force CP_UTF8 and set src to ''
 // - warning: calls FakeCodePage(CP_UTF8) so requires src to have a RefCnt of 1
@@ -1273,8 +1274,10 @@ const
      '70', '71', '72', '73', '74', '75', '76', '77', '78', '79',
      '80', '81', '82', '83', '84', '85', '86', '87', '88', '89',
      '90', '91', '92', '93', '94', '95', '96', '97', '98', '99');
-  /// 1 mod 2^32 reciprocal for unsigned div 100
+  /// 1 mod 2^32 reciprocal for unsigned div 100 in 32-bit range [0..4908534098]
   DIV100_INV = $51eb851f;
+  /// 1 mod 2^32 reciprocal for unsigned div 10 in 32-bit range [0..4294967295]
+  DIV10_INV = $cccccccd;
 
 var
   /// fast lookup table for converting any decimal number from
@@ -1283,7 +1286,7 @@ var
 
 type
   /// small structure used as convenient result to Div100() procedure
-  TDiv100Rec = packed record
+  TDiv100Rec = record
     /// contains V div 100 after Div100(V)
     D: cardinal;
     /// contains V mod 100 after Div100(V)
@@ -2489,7 +2492,7 @@ type
 
   /// map a 128-bit hash as an array of lower bit size values
   // - consumes 16 bytes of memory
-  THash128Rec = packed record
+  THash128Rec = record
     case integer of
       0: (Lo, Hi: Int64);
       1: (L, H: QWord);
@@ -2519,7 +2522,7 @@ type
 
   /// map a 256-bit hash as an array of lower bit size values
   // - consumes 32 bytes of memory
-  THash256Rec = packed record
+  THash256Rec = record
     case integer of
       0: (Lo, Hi: THash128);
       1: (d0, d1, d2, d3: Int64);
@@ -2552,7 +2555,7 @@ type
 
   /// map a 512-bit hash as an array of lower bit size values
   // - consumes 64 bytes of memory
-  THash512Rec = packed record
+  THash512Rec = record
     case integer of
       0:  (Lo, Hi: THash256);
       1:  (h0, h1, h2, h3: THash128);
@@ -2701,8 +2704,37 @@ function IsEqual(const A, B; count: PtrInt): boolean; overload;
 {$ifdef ASMINTEL}
 procedure mul64x64(const left, right: QWord; out product: THash128Rec);
 {$else}
-procedure mul64x64({$ifdef FPC}constref{$else}const{$endif} left, right: QWord;
-  out product: THash128Rec); inline;
+procedure mul64x64({$ifdef FPC_32}constref{$else}const{$endif} left, right: QWord;
+  out product: THash128Rec); {$ifndef ASMARM} inline; {$endif}
+
+{$ifdef ASMARM}
+procedure _xasmsquarediagonal(Src, Dst: pointer; Count: PtrUInt);
+{$endif ASMARM}
+{$ifdef ASMARM64} // unrolled ARMv8 64-bit asm used by mormot.crypt.* units
+function _add256(out Output: THash256Rec; const Left, Right: THash256Rec): PtrUInt;
+function _inc256(var Value: THash256Rec; const Added: THash256Rec): PtrUInt;
+function _dec256(var Value: THash256Rec; const Subs: THash256Rec): PtrUInt;
+function _sub256(out Output: THash256Rec; const Left, Right: THash256Rec): PtrUInt;
+procedure _rshift1(var V: THash256Rec);
+function _lshift1(var V: THash256Rec): PtrUInt;
+function _cmp256(const Left, Right: THash256Rec): integer;
+procedure _mult128(constref l, r: THash128Rec; out product: THash256Rec);
+procedure _mult256(out Output: THash512Rec; const Left, Right: THash256Rec);
+procedure _mmodP(out Output: THash256Rec; var Product: THash512Rec);
+function _xasmadd(Value, Adds: pointer; Carry: PtrUInt): PtrUInt;
+function _xasmsub(Value, Subs: pointer; Carry: PtrUInt): PtrUInt;
+function _xasmmul(Src, Dst: pointer; Factor, Carry: PtrUInt): PtrUInt;
+function _xasmmuladd(Src, Dst: pointer; Factor, Carry: PtrUInt): PtrUInt;
+function _xasmdiv(Value: pointer; Factor, Carry: PtrUInt): PtrUInt;
+function _xasmmod(Value: pointer; Factor, Carry: PtrUInt): PtrUInt;
+const
+  _xasmaddn    = SizeOf(pointer) * 16; // 1024 bits per call on CPU64
+  _xasmsubn    = SizeOf(pointer) * 16;
+  _xasmmuln    = SizeOf(pointer) * 8;  // 512 bits per call on CPU64
+  _xasmmuladdn = SizeOf(pointer) * 8;
+  _xasmdivn    = SizeOf(pointer) * 16;
+  _xasmmodn    = SizeOf(pointer) * 16;
+{$endif ASMARM64}
 {$endif ASMINTEL}
 
 /// simply compute inc(d[], s[]) in a loop, up to a few elements
@@ -3027,27 +3059,6 @@ procedure RdRand32(buffer: PCardinal; n: integer); overload;
 // see https://tizee.github.io/x86_ref_book_web/instruction/rdtsc.html
 function Rdtsc: Int64;
 
-/// compatibility function, to be implemented according to the running CPU
-// - expect the same result as the homonymous Win32 API function, i.e.
-// returns I + 1, and store I + 1 within I in an atomic/thread-safe way
-// - FPC will define this function as intrinsic for non-Intel CPUs
-function InterlockedIncrement(var I: integer): integer;
-
-/// compatibility function, to be implemented according to the running CPU
-// - expect the same result as the homonymous Win32 API function, i.e.
-// returns I - 1, and store I - 1 within I in an atomic/thread-safe way
-// - FPC will define this function as intrinsic for non-Intel CPUs
-function InterlockedDecrement(var I: integer): integer;
-
-/// slightly faster than InterlockedIncrement() when you don't need the result
-procedure LockedInc32(int32: PInteger);
-
-/// slightly faster than InterlockedDecrement() when you don't need the result
-procedure LockedDec32(int32: PInteger);
-
-/// slightly faster than InterlockedIncrement64()
-procedure LockedInc64(int64: PInt64);
-
 // defined here for test.core.base
 function GetBitsCountSSE42(value: PtrInt): PtrInt;
 function crc32csse42(crc: cardinal; buf: PAnsiChar; len: cardinal): cardinal;
@@ -3058,56 +3069,66 @@ function hashsse42(seed: cardinal; buf: PAnsiChar; len: cardinal): cardinal;
 const
   SPIN_FACTOR = 2; // ARM yield has smaller latency than Intel's pause
 
-{$ifdef ISDELPHI}
-/// redirect to Delphi AtomicIncrement() on non Intel CPU
-function InterlockedIncrement(var I: integer): integer; inline;
-/// redirect to Delphi AtomicDecrement() on non Intel CPU
-function InterlockedDecrement(var I: integer): integer; inline;
-{$endif ISDELPHI}
-
-/// redirect to FPC InterlockedIncrement() or Delphi AtomicIncrement() on non Intel CPU
-procedure LockedInc32(int32: PInteger); inline;
-
-/// redirect to FPC InterlockedDecrement() or Delphi AtomicDecrement() on non Intel CPU
-procedure LockedDec32(int32: PInteger); inline;
-
-/// redirect to FPC InterlockedIncrement64() or Delphi AtomicIncrement() on non Intel CPU
-procedure LockedInc64(int64: PInt64); inline;
-
 {$endif ASMINTEL}
 
+/// compatibility function, to be implemented according to the running CPU
+// - expect the same result as the homonymous Win32 API function, i.e.
+// returns I + 1, and store I + 1 within I in an atomic/thread-safe way
+// - this unit adds a ReadWriteBarrier to the FPC RTL system.InterlockedIncrement()
+function InterlockedIncrement(var I: integer): integer;
+  {$ifndef ASMINTELARM} inline; {$endif}
+
+/// compatibility function, to be implemented according to the running CPU
+// - expect the same result as the homonymous Win32 API function, i.e.
+// returns I - 1, and store I - 1 within I in an atomic/thread-safe way
+// - this unit adds a ReadWriteBarrier to the FPC RTL system.InterlockedDecrement()
+function InterlockedDecrement(var I: integer): integer;
+  {$ifndef ASMINTELARM} inline; {$endif}
+
+/// slightly faster than InterlockedIncrement() when you don't need the result
+procedure LockedInc32(int32: PInteger);
+  {$ifndef ASMINTELARM} inline; {$endif}
+
+/// slightly faster than InterlockedDecrement() when you don't need the result
+procedure LockedDec32(int32: PInteger);
+  {$ifndef ASMINTELARM} inline; {$endif}
+
+/// slightly faster than InterlockedIncrement64()
+procedure LockedInc64(int64: PInt64);
+  {$ifndef ASMINTELARM} inline; {$endif}
+
 /// fast atomic compare-and-swap operation on a pointer-sized integer value
-// - via Intel/AMD custom asm or FPC RTL InterlockedCompareExchange(pointer)
+// - via Intel/AMD/ARM custom asm or FPC RTL InterlockedCompareExchange()
 // - true if Target was equal to Comparand, and Target set to NewValue
 // - used e.g. as thread-safe atomic operation for TLightLock/TRWLock
 // - Target should be aligned, which is the case when defined as a class field
 function LockedExc(var Target: PtrUInt; NewValue, Comperand: PtrUInt): boolean;
-  {$ifndef ASMINTEL} inline; {$endif}
+  {$ifndef ASMINTELARM} inline; {$endif}
 
 /// fast atomic compare-and-swap operation on a 32-bit integer value
-// - via Intel/AMD custom asm or FPC RTL InterlockedCompareExchange(pointer)
+// - via Intel/AMD/ARM custom asm or FPC RTL InterlockedCompareExchange()
 // - true if Target was equal to Comparand, and Target set to NewValue
 // - Target should be aligned, which is the case when defined as a class field
 function LockedExc32(var Target: cardinal; NewValue, Comperand: cardinal): boolean;
-  {$ifndef ASMINTEL} inline; {$endif}
+  {$ifndef ASMINTELARM} inline; {$endif}
 
 /// fast atomic addition operation on a pointer-sized integer value
-// - via Intel/AMD custom asm or FPC RTL InterlockedExchangeAdd(pointer)
+// - via Intel/AMD/ARM custom asm or FPC RTL InterlockedExchangeAdd()
 // - Target should be aligned, which is the case when defined as a class field
 procedure LockedAdd(var Target: PtrUInt; Increment: PtrUInt);
-  {$ifndef ASMINTEL} inline; {$endif}
+  {$ifndef ASMINTELARM} inline; {$endif}
 
 /// fast atomic substraction operation on a pointer-sized integer value
-// - via Intel/AMD custom asm or FPC RTL InterlockedExchangeAdd(-pointer)
+// - via Intel/AMD/ARM custom asm or FPC RTL InterlockedExchangeAdd()
 // - Target should be aligned, which is the case when defined as a class field
 procedure LockedDec(var Target: PtrUInt; Decrement: PtrUInt);
-  {$ifndef ASMINTEL} inline; {$endif}
+  {$ifndef ASMINTELARM} inline; {$endif}
 
 /// fast atomic addition operation on a 32-bit integer value
-// - via Intel/AMD custom asm or FPC RTL InterlockedExchangeAdd(pointer)
+// - via Intel/AMD/ARM custom asm or FPC RTL InterlockedExchangeAdd()
 // - Target should be aligned, which is the case when defined as a class field
 procedure LockedAdd32(var Target: cardinal; Increment: cardinal);
-  {$ifndef ASMINTEL} inline; {$endif}
+  {$ifndef ASMINTELARM} inline; {$endif}
 
 /// fast atomic "result := Target^; Target^ := New;" on a 32-bit integer value
 function LockedReset32(Target: PInteger; New: integer = 0): integer;
@@ -3117,13 +3138,12 @@ function LockedReset32(Target: PInteger; New: integer = 0): integer;
 /// return the position of the leftmost set bit in a 32-bit value
 // - returns 255 if c equals 0
 // - mimics the FPC intrinsic, via asm on Intel or optimized pure pascal
-function BSRdword(c: cardinal): cardinal;
+function BSRdword(c: cardinal): cardinal; {$ifdef HASBITINTRINSICS} inline; {$endif}
 
 /// return the position of the leftmost set bit in a 64-bit value
 // - returns 255 if q equals 0
 // - mimics the FPC intrinsic, via asm on Intel x64 or optimized pure pascal
-function BSRqword(const q: Qword): cardinal;
-  {$ifndef ASMX64} {$ifdef HASINLINE} inline; {$endif} {$endif}
+function BSRqword(const q: Qword): cardinal; {$ifdef HASBITINTRINSICS} inline; {$endif}
 
 {$endif ISDELPHI}
 
@@ -3135,8 +3155,9 @@ type
   // as expected e.g. by IsValidUtf8Avx2/Base64EncodeAvx2 dedicated asm
   // - won't include ERMSB flag because it is not propagated within some VMs
   // - cpuAVX512 identifies x86-64-v4 AVX-512 support, also enabled by the OS
+  // - cpuAESGCM identifies cfCLMUL, cfSSE41 and cfAESNI flags
   TX64CpuFeatures = set of (
-    cpuAVX, cpuAVX2, cpuHaswell, cpuAVX512);
+    cpuAVX, cpuAVX2, cpuHaswell, cpuAVX512, cpuAESGCM);
 
 var
   /// internal flags used by FillCharFast - easier from asm that CpuFeatures
@@ -3711,6 +3732,7 @@ type
   TTemp16  = array[0..15] of AnsiChar;
   TTemp24  = array[0..23] of AnsiChar;
   TTemp32  = array[0..31] of AnsiChar;
+  TTemp47  = array[0..47] of AnsiChar;
   TTemp64  = array[0..63] of AnsiChar;
   TTemp128 = array[0..127] of AnsiChar;
   TTemp256 = array[0..255] of AnsiChar;
@@ -3766,7 +3788,7 @@ type
     tmp: TBuffer4K;
     /// initialize a temporary copy of the content supplied as RawByteString
     // - will also allocate and copy the ending #0 (even for binary)
-    procedure Init(const Source: RawByteString); overload;
+    function Init(const Source: RawByteString): PUtf8Char; overload;
     /// initialize a temporary copy of the supplied text buffer, ending with #0
     function Init(Source: PUtf8Char): PUtf8Char; overload;
     /// initialize a temporary copy of the supplied text buffer
@@ -4199,8 +4221,10 @@ function SynLZdecompress1pas(src: PAnsiChar; size: integer; dst: PAnsiChar): int
 /// SynLZ decompression algorithm with memory boundaries check
 // - this function is slower, but will allow to uncompress only the start
 // of the content (e.g. to read some metadata header)
-// - it will also check for dst buffer overflow, so will be more secure than
-// other functions, which expect the content to be verified (e.g. via CRC)
+// - it will also check for dst buffer overflow and detect invalid input
+// - so will be more secure than other functions, which expect the content to be
+// from a trusted source and verified ahead of time e.g. via a CRC/GMAC
+// - returns the number of bytes <= maxDst successfully uncompressed into dst[]
 function SynLZdecompress1partial(src: PAnsiChar; size: integer; dst: PAnsiChar;
   maxDst: integer): integer;
 
@@ -4332,9 +4356,9 @@ type
   TSynVarData = packed record
     case integer of
       0: (
-        VType: cardinal;
+        VType: cardinal;{%H-}
         case padding: cardinal of // access the most used TVarData value members
-          varInteger:  (VInteger:  integer);
+          varInteger:  (VInteger:  integer);{%H-}
           varOleUInt:  (VCardinal: cardinal);
           varOleInt:   (VPtrInt:   PtrInt);
           varDouble:   (VDouble:   double);
@@ -4707,7 +4731,8 @@ type
     {$ifdef HASCODEPAGE}
     /// will ensure that the DataString storage is a RawUtf8 with CP_UTF8
     // - is called e.g. from TTextWriter.FlushFinal
-    procedure EnsureDataStringIsUtf8; inline;
+    procedure EnsureDataStringIsUtf8;
+      {$ifdef HASSAFEINLINE}inline;{$endif}
     {$endif HASCODEPAGE}
     /// direct low-level access to the internal RawByteString storage
     // - if no RawByteString was supplied in Create(), result will be CP_UTF8
@@ -5283,42 +5308,46 @@ end;
 
 function FastNewString(len, codepage: PtrInt): pointer;
 var
-  rec: PStrRec;
+  sr: PStrRec;
 begin
   result := nil;
   if len <= 0 then
     exit;
   {$ifdef FPC}
-  rec := GetMem(len + (_STRRECSIZE + 4));
-  result := PAnsiChar(rec) + _STRRECSIZE;
+  sr := GetMem(len + (_STRRECSIZE + 4));
+  result := PAnsiChar(sr) + _STRRECSIZE;
   {$else}
   GetMem(result, len + (_STRRECSIZE + 4));
-  rec := result;
+  sr := result;
   inc(PStrRec(result));
   {$endif FPC}
   {$ifdef HASCODEPAGE} // also set elemSize := 1
   {$ifdef FPC}         // with constant propagation
-  rec^.codePageElemSize := codepage + (SizeOf(AnsiChar) shl 16);
+  sr^.codePageElemSize := codepage + (SizeOf(AnsiChar) shl 16);
   {$else}
-  PCardinal(@rec^.codePage)^ := codepage + (SizeOf(AnsiChar) shl 16);
+  PCardinal(@sr^.codePage)^ := codepage + (SizeOf(AnsiChar) shl 16);
   {$endif FPC}
   {$endif HASCODEPAGE}
-  rec^.refCnt := 1;
-  rec^.length := len;
-  PCardinal(PAnsiChar(rec) + len + _STRRECSIZE)^ := 0; // ends with four #0
+  sr^.refCnt := 1;
+  sr^.length := len;
+  PCardinal(PAnsiChar(sr) + len + _STRRECSIZE)^ := 0; // ends with four #0
 end;
 
 {$ifdef HASCODEPAGE}
 
 procedure EnsureRawUtf8(var s: RawByteString);
+var
+  sr: PStrRec;
 begin
-  if s <> '' then
-    with PStrRec(PAnsiChar(pointer(s)) - _STRRECSIZE)^ do
-      if CodePage <> CP_UTF8 then
-        if refCnt <> 1 then
-          FastSetString(RawUtf8(s), pointer(s), length) // make copy
-        else
-          CodePage := CP_UTF8; // just replace in-place
+  sr := pointer(s);
+  if sr = nil then
+    exit;
+  dec(sr);
+  if sr^.CodePage <> CP_UTF8 then
+    if sr^.refCnt <> 1 then
+      FastSetString(RawUtf8(s), pointer(s), sr^.length) // make copy
+    else
+      sr^.CodePage := CP_UTF8; // just replace in-place
 end;
 
 procedure EnsureRawUtf8(var s: RawUtf8);
@@ -5328,12 +5357,14 @@ end;
 
 procedure FakeCodePage(var s: RawByteString; cp: cardinal);
 var
-  p: PAnsiChar;
+  sr: PStrRec;
 begin
-  p := pointer(s);
-  if (p <> nil) and
-     (PStrRec(p - _STRRECSIZE)^.CodePage <> cp) then
-    PStrRec(p - _STRRECSIZE)^.CodePage := cp;
+  sr := pointer(s);
+  if sr = nil then
+    exit;
+  dec(sr);
+  if sr^.codePage <> cp then
+    sr^.codePage := cp;
 end;
 
 function GetCodePage(const s: RawByteString): cardinal;
@@ -5527,7 +5558,7 @@ end;
 {$ifdef HASVARUSTRING}
 procedure FastSynUnicode(var s: SynUnicode; p: pointer; len: PtrInt);
 var
-  rec: PStrRec; // same header than AnsiString, but elemSize=SizeOf(WideChar)=2
+  sr: PStrRec; // same header than AnsiString, but elemSize=SizeOf(WideChar)=2
 begin
   if pointer(s) <> nil then
     FastAssignNew(s); // works also for UnicodeString
@@ -5535,17 +5566,17 @@ begin
     exit;
   len := len * 2; // from WideChar count to bytes
   GetMem(pointer(s), len + (_STRRECSIZE + 4));
-  rec := pointer(s);
+  sr := pointer(s);
   {$ifdef FPC}
-  rec^.codePageElemSize := CP_UTF16 + (SizeOf(WideChar) shl 16);
+  sr^.codePageElemSize := CP_UTF16 + (SizeOf(WideChar) shl 16);
   {$else}
-  PCardinal(@rec^.codePage)^ := cardinal(CP_UTF16) + (SizeOf(WideChar) shl 16);
+  PCardinal(@sr^.codePage)^ := cardinal(CP_UTF16) + (SizeOf(WideChar) shl 16);
   {$endif FPC}
-  rec^.refCnt := 1;
-  rec^.length := len shr 1; // length as WideChar count
-  inc(rec);
-  pointer(s) := rec;
-  PCardinal(PAnsiChar(rec) + len)^ := 0; // ends with two WideChar #0
+  sr^.refCnt := 1;
+  sr^.length := len shr 1; // length as WideChar count
+  inc(sr);
+  pointer(s) := sr;
+  PCardinal(PAnsiChar(sr) + len)^ := 0; // ends with two WideChar #0
   if p <> nil then
     MoveFast(p^, pointer(s)^, len);
 end;
@@ -10378,12 +10409,15 @@ begin
 end;
 
 procedure FillZero(var secret: RawByteString);
+var
+  sr: PStrRec;
 begin
-  if secret = '' then
+  sr := pointer(secret);
+  if sr = nil then
     exit;
-  with PStrRec(pointer(PtrInt(secret) - _STRRECSIZE))^ do
-    if refCnt = 1 then // avoid GPF if const
-      FillCharFast(pointer(secret)^, length, 0);
+  dec(sr);
+  if sr^.refCnt = 1 then // avoid GPF if const
+    FillCharFast(pointer(secret)^, sr^.length, 0);
   FastAssignNew(secret); // dec refCnt
 end;
 
@@ -10795,7 +10829,7 @@ type
 {$ifdef ASMINTEL}
 
 type
-  TIntelRegisters = packed record
+  TIntelRegisters = record
     eax, ebx, ecx, edx: cardinal;
   end;
 
@@ -11029,6 +11063,10 @@ begin
     if IntelAvx512 * CPUAVX512X64V4 = CPUAVX512X64V4 then
       include(X64CpuFeatures, cpuAVX512);
   end;
+  if (cfCLMUL in CpuFeatures) and
+     (cfSSE41  in CpuFeatures) and
+     (cfAESNI  in CpuFeatures) then
+    include(X64CpuFeatures, cpuAESGCM);
   {$endif ASMX64NOTPIC}
   // redirect some CPU-aware functions
   if cfSSE42 in CpuFeatures then // for both i386 and x86_64
@@ -11342,22 +11380,6 @@ begin
   {$endif CPU64}
 end;
 
-procedure mul64x64({$ifdef FPC}constref{$else}const{$endif} left, right: QWord;
-  out product: THash128Rec);
-var
-  l: TQWordRec absolute left;
-  r: TQWordRec absolute right;
-  t1, t2: TQWordRec;
-begin
-  // CPU-neutral implementation
-  t1.V := QWord(l.L) * r.L;
-  product.c0 := t1.L;
-  t2.V := QWord(l.H) * r.L + t1.H;
-  t1.V := QWord(l.L) * r.H + t2.L;
-  product.H := QWord(l.H) * r.H + t2.H + t1.H;
-  product.c1 := t1.V;
-end;
-
 function SynLZcompress1(src: PAnsiChar; size: integer; dst: PAnsiChar): integer;
 begin
   result := SynLZcompress1pas(src, size, dst);
@@ -11368,34 +11390,6 @@ begin
   result := SynLZdecompress1pas(src, size, dst);
 end;
 
-procedure LockedInc32(int32: PInteger);
-begin
-  {$ifdef ISDELPHI}AtomicIncrement{$else}InterlockedIncrement{$endif}(int32^);
-end;
-
-procedure LockedDec32(int32: PInteger);
-begin
-  {$ifdef ISDELPHI}AtomicDecrement{$else}InterlockedDecrement{$endif}(int32^);
-end;
-
-function LockedExc(var Target: PtrUInt; NewValue, Comperand: PtrUInt): boolean;
-begin
-  result := {$ifdef ISDELPHI}AtomicCmpExchange{$else}InterlockedCompareExchange{$endif}(
-    pointer(Target), pointer(NewValue), pointer(Comperand)) = pointer(Comperand);
-end;
-
-function LockedExc32(var Target: cardinal; NewValue, Comperand: cardinal): boolean;
-begin
-  result := {$ifdef ISDELPHI}AtomicCmpExchange{$else}InterlockedCompareExchange{$endif}(
-    Target, NewValue, Comperand) = Comperand;
-end;
-
-procedure LockedAdd32(var Target: cardinal; Increment: cardinal);
-begin
-  {$ifdef ISDELPHI}AtomicIncrement{$else}InterlockedExchangeAdd{$endif}(
-    Target, Increment);
-end;
-
 procedure bswap64array(a,b: PQWordArray; n: PtrInt);
 var
   i: PtrInt;
@@ -11404,7 +11398,188 @@ begin
     b^[i] := {$ifdef FPC}SwapEndian{$else}bswap64{$endif}(a^[i]);
 end;
 
-{$ifdef ISDELPHI}  // use Delphi intrinsic function
+{$ifdef FPC}
+// on arm32/aarch64, the FPC RTL atomic opcodes are no memory barrier, whereas
+// Locked*() are expected to be full barriers, as LOCK on Intel
+// - AARCH64 and ARMv7 have dedicated asm in an include file
+// - other CPUs (e.g. ARMv6) surround the RTL calls with ReadWriteBarrier
+
+{$ifdef ASMARM}
+
+// optimized Locked*() asm for aarch64 and ARMv7 is located in this include file
+{$include mormot.core.base.asmarm.inc}
+
+{$else}
+
+procedure mul64x64({$ifdef FPC_32}constref{$else}const{$endif} left, right: QWord;
+  out product: THash128Rec);
+var
+  l0, l1, r0, r1: cardinal;
+  t0, t1, t2: QWord;
+begin
+  l0 := cardinal(left);
+  l1 := cardinal(left shr 32);
+  r0 := cardinal(right);
+  r1 := cardinal(right shr 32);
+  t0 := QWord(l0) * r0;
+  t1 := QWord(l1) * r0 + (t0 shr 32);
+  t2 := QWord(l0) * r1 + cardinal(t1);
+  PQWordArray(@product)[0] := (t2 shl 32) or cardinal(t0);
+  PQWordArray(@product)[1] := QWord(l1) * r1 + (t1 shr 32) + (t2 shr 32);
+end;
+
+{$ifdef CPUINTEL}
+procedure ReadWriteBarrier; inline;
+begin // Intel/AMD system.Interlocked* FPC RTL functions use LOCK 
+end;  // which has a memory barrier: this function is a no-op
+{$endif CPUINTEL}
+
+function InterlockedIncrement(var I: integer): integer;
+begin
+  ReadWriteBarrier;
+  result := system.InterlockedIncrement(I);
+  ReadWriteBarrier;
+end;
+
+function InterlockedDecrement(var I: integer): integer;
+begin
+  ReadWriteBarrier;
+  result := system.InterlockedDecrement(I);
+  ReadWriteBarrier;
+end;
+
+procedure LockedInc32(int32: PInteger);
+begin
+  ReadWriteBarrier;
+  system.InterlockedIncrement(int32^);
+  ReadWriteBarrier;
+end;
+
+procedure LockedDec32(int32: PInteger);
+begin
+  ReadWriteBarrier;
+  system.InterlockedDecrement(int32^);
+  ReadWriteBarrier;
+end;
+
+function LockedExc(var Target: PtrUInt; NewValue, Comperand: PtrUInt): boolean;
+begin
+  ReadWriteBarrier;
+  result := system.InterlockedCompareExchange(pointer(Target), pointer(NewValue),
+    pointer(Comperand)) = pointer(Comperand);
+  ReadWriteBarrier;
+end;
+
+function LockedExc32(var Target: cardinal; NewValue, Comperand: cardinal): boolean;
+begin
+  ReadWriteBarrier;
+  result := system.InterlockedCompareExchange(Target, NewValue,
+    Comperand) = Comperand;
+  ReadWriteBarrier;
+end;
+
+procedure LockedAdd32(var Target: cardinal; Increment: cardinal);
+begin
+  ReadWriteBarrier;
+  system.InterlockedExchangeAdd(Target, Increment);
+  ReadWriteBarrier;
+end;
+
+procedure LockedDec(var Target: PtrUInt; Decrement: PtrUInt);
+begin
+  ReadWriteBarrier;
+  system.InterlockedExchangeAdd(pointer(Target),
+    pointer(PtrUInt(-PtrInt(Decrement))));
+  ReadWriteBarrier;
+end;
+
+procedure LockedInc64(int64: PInt64);
+begin
+  ReadWriteBarrier;
+  {$ifdef FPC_64}
+  InterlockedIncrement64(int64^); // we can use the existing 64-bit RTL function
+  {$else}
+  with PInt64Rec(int64)^ do
+    if system.InterlockedIncrement(Lo) = 0 then
+      LockedInc32(@Hi); // collission is highly unprobable
+  {$endif FPC_64}
+  ReadWriteBarrier;
+end;
+
+procedure LockedAdd(var Target: PtrUInt; Increment: PtrUInt);
+begin
+  ReadWriteBarrier;
+  InterlockedExchangeAdd(pointer(Target), pointer(Increment));
+  ReadWriteBarrier;
+end;
+
+{$endif ASMARM}
+
+function StrCntDecFree(var refcnt: TStrCnt): boolean;
+begin
+  // follow declocked() FPC RTL semantic without additional memory barrier
+  {$ifdef STRCNT32}
+  result := system.InterLockedDecrement(refcnt) <= 0;
+  {$else}
+  result := system.InterLockedDecrement64(refcnt) <= 0;
+  {$endif STRCNT32}
+end;
+
+function DACntDecFree(var refcnt: TDACnt): boolean;
+begin
+  // follow declocked() FPC RTL semantic without additional memory barrier
+  {$ifdef DACNT32}
+  result := system.InterLockedDecrement(refcnt) <= 0;
+  {$else}
+  result := system.InterLockedDecrement64(refcnt) <= 0;
+  {$endif DACNT32}
+end;
+
+function bswap32(a: cardinal): cardinal;
+begin
+  result := SwapEndian(a); // use fast platform-specific function
+end;
+
+procedure bswap32array(a: PCardinalArray; n: PtrInt);
+begin
+  repeat // assume n > 0 like the asm
+    dec(n);
+    a[n] := SwapEndian(a[n]);
+  until n = 0;
+end;
+
+function bswap64({$ifdef FPC_X86}constref{$else}const{$endif} a: QWord): QWord;
+begin
+  result := SwapEndian(a); // use fast platform-specific function
+end;
+
+{$else} // we use Delphi intrinsic functions or emulate them if missing
+
+procedure LockedInc32(int32: PInteger);
+begin
+  AtomicIncrement(int32^);
+end;
+
+procedure LockedDec32(int32: PInteger);
+begin
+  AtomicDecrement(int32^);
+end;
+
+function LockedExc(var Target: PtrUInt; NewValue, Comperand: PtrUInt): boolean;
+begin
+  result := AtomicCmpExchange(pointer(Target),
+    pointer(NewValue), pointer(Comperand)) = pointer(Comperand);
+end;
+
+function LockedExc32(var Target: cardinal; NewValue, Comperand: cardinal): boolean;
+begin
+  result := AtomicCmpExchange(Target, NewValue, Comperand) = Comperand;
+end;
+
+procedure LockedAdd32(var Target: cardinal; Increment: cardinal);
+begin
+  AtomicIncrement(Target, Increment);
+end;
 
 function InterlockedIncrement(var I: integer): integer; // FPC intrinsic naming
 begin
@@ -11466,99 +11641,21 @@ begin
   until n = 0;
 end;
 
-function BSRdword(c: cardinal): cardinal;
-const
-  _debruijn32: array[0..31] of byte = (
-    0, 9, 1, 10, 13, 21, 2, 29, 11, 14, 16, 18, 22, 25, 3, 30,
-    8, 12, 20, 28, 15, 17, 24, 7, 19, 27, 23, 6, 26, 5, 4, 31);
-begin // http://graphics.stanford.edu/~seander/bithacks.html#IntegerLogDeBruijn
-  if c <> 0 then
-  begin
-    c := c or (c shr 1);
-    c := c or (c shr 2);
-    c := c or (c shr 4);
-    c := c or (c shr 8);
-    c := c or (c shr 16);
-    c := c * $07c4acdd; // explicit step for 32-bit truncation
-    result := _debruijn32[c shr 27];
-  end
-  else
-    result := 255;
-end;
-
-function BSRqword(const q: Qword): cardinal;
+procedure mul64x64(const left, right: QWord; out product: THash128Rec);
 var
-  c: cardinal; // CPU32 friendly, but fast also on CPU64
+  l: TQWordRec absolute left;
+  r: TQWordRec absolute right;
+  t1, t2: TQWordRec;
 begin
-  c := q shr 32;
-  if c = 0  then
-    result := BsrDword(cardinal(q)) // search in lowest 32-bit
-  else
-    result := BsrDword(c) or 32;   // search in highest 32-bit
+  t1.V := QWord(l.L) * r.L;
+  product.c0 := t1.L;
+  t2.V := QWord(l.H) * r.L + t1.H;
+  t1.V := QWord(l.L) * r.H + t2.L;
+  product.H := QWord(l.H) * r.H + t2.H + t1.H;
+  product.c1 := t1.V;
 end;
 
-{$else}
-
-procedure LockedDec(var Target: PtrUInt; Decrement: PtrUInt);
-begin
-  InterlockedExchangeAdd(pointer(Target), pointer(PtrUInt(-PtrInt(Decrement))));
-end;
-
-procedure LockedInc64(int64: PInt64);
-begin
-  {$ifdef FPC_64}
-  InterlockedIncrement64(int64^); // we can use the existing 64-bit RTL function
-  {$else}
-  with PInt64Rec(int64)^ do
-    if InterlockedIncrement(Lo) = 0 then
-      InterlockedIncrement(Hi); // collission is highly unprobable
-  {$endif FPC_64}
-end;
-
-function StrCntDecFree(var refcnt: TStrCnt): boolean;
-begin
-  // fallback to RTL asm e.g. for ARM
-  {$ifdef STRCNT32}
-  result := InterLockedDecrement(refcnt) <= 0;
-  {$else}
-  result := InterLockedDecrement64(refcnt) <= 0;
-  {$endif STRCNT32}
-end; // we don't check for ismultithread global
-
-function DACntDecFree(var refcnt: TDACnt): boolean;
-begin
-  // fallback to RTL asm e.g. for ARM
-  {$ifdef DACNT32}
-  result := InterLockedDecrement(refcnt) <= 0;
-  {$else}
-  result := InterLockedDecrement64(refcnt) <= 0;
-  {$endif DACNT32}
-end;
-
-procedure LockedAdd(var Target: PtrUInt; Increment: PtrUInt);
-begin
-  InterlockedExchangeAdd(pointer(Target), pointer(Increment));
-end;
-
-function bswap32(a: cardinal): cardinal;
-begin
-  result := SwapEndian(a); // use fast platform-specific function
-end;
-
-procedure bswap32array(a: PCardinalArray; n: PtrInt);
-begin
-  repeat // assume n > 0 like the asm
-    dec(n);
-    a[n] := SwapEndian(a[n]);
-  until n = 0;
-end;
-
-function bswap64({$ifdef FPC_X86}constref{$else}const{$endif} a: QWord): QWord;
-begin
-  result := SwapEndian(a); // use fast platform-specific function
-end;
-
-{$endif ISDELPHI}
+{$endif FPC}
 
 function IntegerScan(P: PCardinalArray; Count: PtrInt; Value: cardinal): PCardinal;
 begin
@@ -11882,6 +11979,26 @@ end;
 
 {$endif ASMINTELNOTPIC}
 
+{$ifdef ISDELPHI}
+{$ifdef HASBITINTRINSICS} // Delphi 10.4 introduced them
+function BSRdword(c: cardinal): cardinal;
+begin
+  if c = 0 then
+    result := 255
+  else
+    result := 31 - CountLeadingZeros32(c);
+end;
+
+function BSRqword(const q: qword): cardinal;
+begin
+  if q = 0 then
+    result := 255
+  else
+    result := 63 - CountLeadingZeros64(q);
+end;
+{$endif HASBITINTRINSICS} // Delphi < 10.4 will use asmx86/x64.inc functions
+{$endif ISDELPHI}
+
 
 { ************ Buffers (e.g. Hashing and SynLZ compression) Raw Functions }
 
@@ -12019,15 +12136,88 @@ begin
     result := (result and $7fff) or (integer(PWord(in_p + 2)^) shl 15);
 end;
 
+type // state machine used by SynLZ[de]compress1pas[partial]sub() functions
+  TSynLzContext = record
+    src, srcend, srcendmatch, dst, dstend: PAnsiChar;
+    cwpoint: PCardinal;
+    cwmask: cardinal;
+    offset: ^TOffsets;
+    cache: PCardinalArray;
+  end;
+
+procedure SynLZcompress1passub(var ctx: TSynLzContext);
+var
+  src, dst, o: PAnsiChar;
+  v, cached, cwmask: cardinal;
+  h, t, tmax: PtrUInt;
+begin // better code generation with sub-functions for raw encoding
+  cwmask := 1;
+  src := ctx.src;
+  dst := ctx.dst;
+  repeat
+    v := PCardinal(src)^;
+    h := ((v shr 12) xor v) and 4095;
+    o := ctx.offset[h];           // not faster with a transient pointer
+    ctx.offset[h] := src;
+    cached := v xor ctx.cache[h]; // o=nil if cache[h] is uninitialized
+    ctx.cache[h] := v;
+    if (cached and $00ffffff = 0) and
+       (o <> nil) and
+       (src - o > 2) then
+    begin
+      ctx.cwpoint^ := ctx.cwpoint^ or cwmask;
+      inc(src, 2);
+      inc(o, 2);
+      t := 1;
+      tmax := ctx.srcend - src - 1;
+      if tmax >= (255 + 16) then
+        tmax := (255 + 16);
+      while (o[t] = src[t]) and
+            (t < tmax) do
+        inc(t);
+      inc(src, t);
+      h := h shl 4;
+      // here we have always t>0
+      if t <= 15 then
+      begin
+        // mark 2 to 17 bytes -> size=1..15
+        PWord(dst)^ := integer(t or h);
+        inc(dst, 2);
+      end
+      else
+      begin
+        // mark 18 to (255+16) bytes -> size=0, next byte=t
+        dec(t, 16);
+        PWord(dst)^ := h; // size=0
+        dst[2] := AnsiChar(t);
+        inc(dst, 3);
+      end;
+    end
+    else
+    begin
+      dst^ := src^;
+      inc(src);
+      inc(dst);
+    end;
+    cwmask := cwmask shl 1;
+    if cwmask = 0 then
+    begin
+      ctx.cwpoint := pointer(dst);
+      PCardinal(dst)^ := cwmask;
+      inc(PCardinal(dst));
+      inc(cwmask);
+    end;
+  until src > ctx.srcendmatch;
+  ctx.src := src; // store end position
+  ctx.dst := dst;
+  ctx.cwmask := cwmask
+end;
+
 function SynLZcompress1pas(src: PAnsiChar; size: integer; dst: PAnsiChar): integer;
 var
-  dstbeg,          // initial dst value
-  srcend,          // real last byte available in src
-  srcendmatch,     // last byte to try for hashing
-  o: PAnsiChar;
-  cwbit: byte;
-  cwpoint: PCardinal;
-  v, h, cached, t, tmax: PtrUInt;
+  cwmask: cardinal;
+  ctx: TSynLzContext;
+  dstbeg: PAnsiChar;
   offset: TOffsets;
   cache: array[0..4095] of cardinal; // 16KB+16KB=32KB on stack (48KB for cpu64)
 begin
@@ -12041,7 +12231,7 @@ begin
   end
   else
   begin
-    PCardinal(dst)^ := size; // size<32768 -> stored as word
+    PWord(dst)^ := size; // size<32768 -> stored as word
     if size = 0 then
     begin
       result := 2;
@@ -12050,319 +12240,303 @@ begin
     inc(dst, 2);
   end;
   // 2. compress
-  srcend := src + size;
-  srcendmatch := srcend - (6 + 5);
-  cwbit := 0;
-  cwpoint := pointer(dst);
+  ctx.srcend := src + size;
+  ctx.srcendmatch := ctx.srcend - (6 + 5);
+  ctx.cwpoint := pointer(dst);
   PCardinal(dst)^ := 0;
-  inc(dst, SizeOf(cwpoint^));
-  FillCharFast(offset, SizeOf(offset), 0); // fast 16KB/32KB reset to 0
-  // 1. main loop to search using hash[]
-  if src <= srcendmatch then
-    repeat
-      v := PCardinal(src)^;
-      h := ((v shr 12) xor v) and 4095;
-      o := offset[h];
-      offset[h] := src;
-      cached := v xor {%H-}cache[h]; // o=nil if cache[h] is uninitialized
-      cache[h] := v;
-      if (cached and $00ffffff = 0) and
-         (o <> nil) and
-         (src - o > 2) then
-      begin
-        cwpoint^ := cwpoint^ or (cardinal(1) shl cwbit);
-        inc(src, 2);
-        inc(o, 2);
-        t := 1;
-        tmax := srcend - src - 1;
-        if tmax >= (255 + 16) then
-          tmax := (255 + 16);
-        while (o[t] = src[t]) and
-              (t < tmax) do
-          inc(t);
-        inc(src, t);
-        h := h shl 4;
-        // here we have always t>0
-        if t <= 15 then
-        begin
-          // mark 2 to 17 bytes -> size=1..15
-          PWord(dst)^ := integer(t or h);
-          inc(dst, 2);
-        end
-        else
-        begin
-          // mark 18 to (255+16) bytes -> size=0, next byte=t
-          dec(t, 16);
-          PWord(dst)^ := h; // size=0
-          dst[2] := ansichar(t);
-          inc(dst, 3);
-        end;
-      end
-      else
-      begin
-        dst^ := src^;
-        inc(src);
-        inc(dst);
-      end;
-      if cwbit < 31 then
-      begin
-        inc(cwbit);
-        if src <= srcendmatch then
-          continue
-        else
-          break;
-      end
-      else
-      begin
-        cwpoint := pointer(dst);
-        PCardinal(dst)^ := 0;
-        inc(dst, SizeOf(cwpoint^));
-        cwbit := 0;
-        if src <= srcendmatch then
-          continue
-        else
-          break;
-      end;
-    until false;
-  // 2. store remaining bytes
-  if src < srcend then
-    repeat
-      dst^ := src^;
-      inc(src);
-      inc(dst);
-      if cwbit < 31 then
-      begin
-        inc(cwbit);
-        if src < srcend then
-          continue
-        else
-          break;
-      end
-      else
-      begin
-        PCardinal(dst)^ := 0;
-        inc(dst, 4);
-        cwbit := 0;
-        if src < srcend then
-          continue
-        else
-          break;
-      end;
-    until false;
+  inc(PCardinal(dst));
+  if src <= ctx.srcendmatch then
+  begin
+    FillCharFast(offset, SizeOf(offset), 0); // fast 16KB/32KB reset to 0
+    ctx.src := src;
+    ctx.dst := dst;
+    ctx.offset := @offset;
+    ctx.cache := @cache;
+    SynLZcompress1passub(ctx);
+    src := ctx.src;
+    dst := ctx.dst;
+    cwmask := ctx.cwmask;
+  end
+  else
+    cwmask := 1;
+  while src < ctx.srcend do // remaining bytes
+  begin
+    dst^ := src^;
+    inc(src);
+    inc(dst);
+    cwmask := cwmask shl 1;
+    if cwmask = 0 then
+    begin
+      ctx.cwpoint := pointer(dst);
+      PCardinal(dst)^ := cwmask;
+      inc(PCardinal(dst));
+      inc(cwmask);
+    end;
+  end;
   result := dst - dstbeg;
 end;
 
-// better code generation with sub-functions for raw decoding
-procedure SynLZdecompress1passub(src, src_end, dst: PAnsiChar; var offset: TOffsets);
+procedure MoveByPtr(src, dst: PPtrUIntArray; max: PtrUInt);
+  {$ifdef HASINLINE} inline; {$endif}
 var
-  last_hashed: PAnsiChar; // initial src and dst value
-  {$ifdef CPU64}
-  o: PAnsiChar;
-  {$endif CPU64}
-  cw, cwbit: cardinal;
-  v, t, h: PtrUInt;
-label
-  nextCW;
+  i, c: PtrUInt; // RISC targets are likely to have more registers
 begin
-  last_hashed := dst - 1;
-nextCW:
-  cw := PCardinal(src)^;
-  inc(src, 4);
-  cwbit := 1;
-  if src < src_end then
+  max := max shr POINTERSHR;
+  i := 0;
+  repeat
+    c := src[i];
+    dst[i] := c;
+    inc(i);
+  until i = max; // this loop pattern is faster than -count + inc(count) on RISC
+end;
+
+procedure MoveSynLzLiterals(src, dst: PAnsiChar; n: PtrUInt);
+  {$ifdef HASINLINE} inline; {$endif}
+var
+  c: PtrUInt;
+begin
+  if n < SizeOf(c) then
+  begin
     repeat
-      if cw and cwbit = 0 then
-      begin
-        dst^ := src^;
-        inc(src);
-        inc(dst);
-        if src >= src_end then
-          break;
-        if last_hashed < dst - 3 then
-        begin
-          inc(last_hashed);
-          v := PCardinal(last_hashed)^;
-          offset[((v shr 12) xor v) and 4095] := last_hashed;
-        end;
-        cwbit := cwbit shl 1;
-        if cwbit <> 0 then
-          continue
-        else
-          goto nextCW;
-      end
-      else
-      begin
-        h := PWord(src)^;
-        inc(src, 2);
-        t := (h and 15) + 2;
-        if t = 2 then
-        begin
-          t := ord(src^) + (16 + 2);
-          inc(src);
-        end;
-        h := h shr 4;
-        {$ifdef CPU64}
-        o := offset[h];
-        if PtrUInt(dst - o) < t then // overlap -> move byte-by-byte
-          MoveByOne(o, dst, t)
-        else if t <= 8 then
-          PInt64(dst)^ := PInt64(o)^ // much faster in practice
-        else
-          MoveFast(o^, dst^, t);     // safe since src_endmatch := src_end-(6+5)
-        {$else}
-        if PtrUInt(dst - offset[h]) < t then
-          MoveByOne(offset[h], dst, t)
-        else if t > 8 then
-          MoveFast(offset[h]^, dst^, t)
-        else
-          PInt64(dst)^ := PInt64(offset[h])^;
-        {$endif CPU64}
-        if src >= src_end then
-          break;
-        if last_hashed < dst then
-          repeat // decompressed bytes should update the hash table
-            inc(last_hashed);
-            v := PCardinal(last_hashed)^;
-            offset[((v shr 12) xor v) and 4095] := last_hashed;
-          until last_hashed >= dst;
-        inc(dst, t);
-        last_hashed := dst - 1;
-        cwbit := cwbit shl 1;
-        if cwbit <> 0 then
-          continue
-        else
-          goto nextCW;
-      end;
-    until false;
+      dec(n);
+      dst[n] := src[n];
+    until n = 0;
+    exit;
+  end;
+  c := PPtrUInt(src + n - SizeOf(c))^;
+  PPtrUInt(dst + n - SizeOf(c))^ := c;
+  n := (n - 1) shr POINTERSHR;
+  while n <> 0 do
+  begin
+    dec(n);
+    c := PPtrUIntArray(src)[n];
+    PPtrUIntArray(dst)[n] := c;
+  end;
+end;
+
+function SynLzHash(last, dst: PAnsiChar; var offset: TOffsets): PAnsiChar;
+  {$ifdef HASINLINE} inline; {$endif}
+var
+  v: cardinal;
+begin
+  if last < dst then
+    repeat
+      inc(last);
+      v := PCardinal(last)^;
+      offset[((v shr 12) xor v) and 4095] := last;
+    until last >= dst;
+  result := last;
+end;
+
+procedure SynLZdecompress1passub(var ctx: TSynLzContext);
+var
+  src, dst, o, hashed: PAnsiChar;
+  cw: cardinal;
+  bits, run, t: PtrUInt;
+begin
+  src := ctx.src;
+  dst := ctx.dst;
+  hashed := dst - 1;
+  cw := 0;
+  bits := 0;
+  while src < ctx.srcend do
+  begin
+    // read a control word once exhausting its 32 bits
+    if bits = 0 then
+    begin
+      if src + 4 >= ctx.srcend then
+        break; // avoid buffer overflow
+      cw := PCardinal(src)^;
+      inc(src, 4);
+      bits := 32;
+    end;
+    if cw and 1 = 0 then
+    begin
+      // compute the number of consecutive literal bits before the next match
+      run := bits;
+      if cw <> 0 then
+        run := {$ifdef FPC} BsfDWord {$else} CountTrailingZeros32 {$endif}(cw);
+      // the last control word may be only partially used
+      t := ctx.srcend - src;
+      if run > t then
+        run := t;
+      // move all litterals at once - don't hash them yet
+      MoveSynLzLiterals(pointer(src), pointer(dst), run);
+      inc(src, run);
+      inc(dst, run);
+      dec(bits, run);
+      cw := cw shr run;
+      if src >= ctx.srcend then
+        break;
+      continue;
+    end;
+    // match token: first register all preceding literal positions
+    hashed := SynLzHash(hashed, dst - 3, ctx.offset^);
+    t := (PtrUInt(PByte(src)^) and 15) + 2;
+    o := ctx.offset^[PWord(src)^ shr 4];
+    inc(src, 2);
+    if t = 2 then
+    begin
+      t := ord(src^) + 18;
+      inc(src);
+    end;
+    if PtrUInt(dst - o) < t then
+      MoveByOne(o, dst, t)
+    else if t <= 8 then
+      PInt64(dst)^ := PInt64(o)^
+    else
+    begin
+      PPtrUInt(dst + t - SizeOf(o))^ := PPtrUInt(o + t - SizeOf(o))^;
+      MoveByPtr(pointer(o), pointer(dst), t - 1);
+    end;
+    if src >= ctx.srcend then
+      break;
+    // need post-match hash synchronization
+    SynLzHash(hashed, dst, ctx.offset^);
+    inc(dst, t);
+    hashed := dst - 1;
+    // consume the single match bit
+    cw := cw shr 1;
+    dec(bits);
+  end;
 end;
 
 function SynLZdecompress1pas(src: PAnsiChar; size: integer; dst: PAnsiChar): integer;
 var
-  offset: TOffsets;
-  srcend: PAnsiChar;
+  ctx: TSynLzContext;
+  offset: TOffsets; // stack-allocated working buffer
 begin
-  srcend := src + size;
   result := PWord(src)^;
   if result = 0 then
     exit;
+  ctx.srcend := src + size;
   inc(src, 2);
   if result and $8000 <> 0 then
   begin
     result := (result and $7fff) or (integer(PWord(src)^) shl 15);
     inc(src, 2);
   end;
-  SynLZdecompress1passub(src, srcend, dst, offset);
+  ctx.src := src;
+  ctx.dst := dst;
+  ctx.offset := @offset;
+  SynLZdecompress1passub(ctx);
 end;
 
-procedure SynLZdecompress1partialsub(src, dst, src_end, dst_end: PAnsiChar;
-  var offset: TOffsets);
+function SynLZdecompress1partialsub(var ctx: TSynLzContext): PtrInt;
 var
-  lasthashed: PAnsiChar; // initial src and dst value
-  cwbit, cw: integer;
-  v, t, h: PtrUInt;
-  {$ifdef CPU64}
-  o: PAnsiChar;
-  {$endif CPU64}
-label
-  nextCW;
+  src, dst, o, hashed: PAnsiChar;
+  cw: cardinal;
+  bits, run, t: PtrUInt;
 begin
-  lasthashed := dst - 1;
-nextCW:
-  cw := PCardinal(src)^;
-  inc(src, 4);
-  cwbit := 1;
-  if src < src_end then
-    repeat
-      if cw and cwbit = 0 then
-      begin
-        dst^ := src^;
-        inc(src);
-        inc(dst);
-        if (src >= src_end) or
-           (dst >= dst_end) then
-          break;
-        if lasthashed < dst - 3 then
-        begin
-          inc(lasthashed);
-          v := PCardinal(lasthashed)^;
-          offset[((v shr 12) xor v) and 4095] := lasthashed;
-        end;
-        cwbit := cwbit shl 1;
-        if cwbit <> 0 then
-          continue
-        else
-          goto nextCW;
-      end
-      else
-      begin
-        h := PWord(src)^;
-        inc(src, 2);
-        t := (h and 15) + 2;
-        h := h shr 4;
-        if t = 2 then
-        begin
-          t := ord(src^) + (16 + 2);
-          inc(src);
-        end;
-        if dst + t >= dst_end then
-        begin
-          // avoid buffer overflow by all means
-          MoveByOne(offset[h], dst, dst_end - dst);
-          break;
-        end;
-        {$ifdef CPU64}
-        o := offset[h];
-        if (t <= 8) or
-           (PtrUInt(dst - o) < t) then
-          MoveByOne(o, dst, t)
-        else
-          MoveFast(o^, dst^, t);
-        {$else}
-        if (t <= 8) or
-           (PtrUInt(dst - offset[h]) < t) then
-          MoveByOne(offset[h], dst, t)
-        else
-          MoveFast(offset[h]^, dst^, t);
-        {$endif CPU64}
-        if src >= src_end then
-          break;
-        if lasthashed < dst then
-          repeat
-            inc(lasthashed);
-            v := PCardinal(lasthashed)^;
-            offset[((v shr 12) xor v) and 4095] := lasthashed;
-          until lasthashed >= dst;
-        inc(dst, t);
-        lasthashed := dst - 1;
-        cwbit := cwbit shl 1;
-        if cwbit <> 0 then
-          continue
-        else
-          goto nextCW;
-      end;
-    until false;
+  src := ctx.src;
+  dst := ctx.dst;
+  hashed := dst - 1;
+  cw := 0;
+  bits := 0;
+  while dst < ctx.dstend do
+  begin
+    // read a control word once exhausting its 32 bits
+    if bits = 0 then
+    begin
+      if src + 4 >= ctx.srcend then
+        break;
+      cw := PCardinal(src)^;
+      inc(src, 4);
+      bits := 32;
+    end;
+    if cw and 1 = 0 then
+    begin
+      // compute the number of consecutive literal bits before the next match
+      run := bits;
+      if cw <> 0 then
+        run := {$ifdef FPC} BsfDWord {$else} CountTrailingZeros32 {$endif}(cw);
+      // the last control word may be only partially used or we may reach dstend
+      t := ctx.srcend - src;
+      if run > t then
+        run := t;
+      t := ctx.dstend - dst;
+      if run > t then
+        run := t;
+      if run = 0 then
+        break;
+      // move all litterals at once - don't hash them yet
+      MoveSynLzLiterals(pointer(src), pointer(dst), run);
+      inc(src, run);
+      inc(dst, run);
+      dec(bits, run);
+      cw := cw shr run;
+      continue;
+    end;
+    // match token: first register all preceding literal positions
+    if src + 2 > ctx.srcend then
+      break;
+    hashed := SynLzHash(hashed, dst - 3, ctx.offset^);
+    run := (PtrUInt(PByte(src)^) and 15) + 2;
+    o := ctx.offset^[PWord(src)^ shr 4];
+    if o = nil then
+      break; // invalid input
+    inc(src, 2);
+    if run = 2 then
+    begin
+      if src >= ctx.srcend then
+        break;
+      run := ord(src^) + 18;
+      inc(src);
+    end;
+    t := ctx.dstend - dst;
+    if run >= t then // avoid buffer overflow by all means
+    begin
+      MoveByOne(o, dst, t);
+      inc(dst, t);
+      break;
+    end
+    else if (t < 8) or
+            (PtrUInt(dst - o) < run) then
+      MoveByOne(o, dst, run)
+    else if run <= 8 then
+      PInt64(dst)^ := PInt64(o)^
+    else
+    begin
+      PPtrUInt(dst + run - SizeOf(o))^ := PPtrUInt(o + run - SizeOf(o))^;
+      MoveByPtr(pointer(o), pointer(dst), run - 1);
+    end;
+    inc(dst, run);
+    if src >= ctx.srcend then
+      break;
+    // need post-match hash synchronization
+    SynLzHash(hashed, dst - run, ctx.offset^);
+    hashed := dst - 1;
+    // consume the single match bit
+    cw := cw shr 1;
+    dec(bits);
+  end;
+  result := dst - ctx.dst;
 end;
 
 function SynLZdecompress1partial(src: PAnsiChar; size: integer; dst: PAnsiChar;
   maxDst: integer): integer;
 var
   offset: TOffsets;
-  srcend: PAnsiChar;
+  ctx: TSynLzContext;
 begin
-  srcend := src + size;
-  result := PWord(src)^;
-  if result = 0 then
+  result := 0;
+  if (maxDst <= 0) or
+     (size < 2) then
     exit;
-  inc(src, 2);
-  if result and $8000 <> 0 then
-  begin
-    result := (result and $7fff) or (integer(PWord(src)^) shl 15);
+  ctx.srcend := src + size;
+  if PWord(src)^ and $8000 <> 0 then // actual stored length is just skipped
+    if size < 4 then
+      exit
+    else
+      inc(src, 4)
+  else
     inc(src, 2);
-  end;
-  if maxDst < result then
-    result := maxDst;
-  if result > 0 then
-    SynLZdecompress1partialsub(src, dst, srcend, dst + result, offset);
+  FillCharFast(offset, SizeOf(offset), 0); // reset to 0 to detect invalid input
+  ctx.src := src;
+  ctx.dst := dst;
+  ctx.dstend := dst + maxDst;
+  ctx.offset := @offset;
+  result := SynLZdecompress1partialsub(ctx); // returns bytes written in dst[]
 end;
 
 function CompressSynLZ(var Data: RawByteString; Compress: boolean): RawUtf8;
@@ -12630,9 +12804,10 @@ begin
   result := buf;
 end;
 
-procedure TSynTempBuffer.Init(const Source: RawByteString);
+function TSynTempBuffer.Init(const Source: RawByteString): PUtf8Char;
 begin
   Init(pointer(Source), length(Source));
+  result := buf;
 end;
 
 function TSynTempBuffer.Init(Source: PUtf8Char): PUtf8Char;
@@ -13311,11 +13486,11 @@ var
   tab: PWordArray;
 begin
   tab := @TwoDigitLookupW;
-  {$ifdef WIN64DELPHI}
+  {$ifdef CPU64}
   d100 := (QWord(Y) * DIV100_INV) shr 37; // we can avoid div on Delphi Win64
   {$else}
   d100 := Y div 100; // FPC will use fast reciprocal (and x86 has its own asm)
-  {$endif WIN64DELPHI}
+  {$endif CPU64}
   PCardinal(P)^ := tab[d100];
   PWordArray(P)[1] := tab[Y - (d100 * 100)];
 end;
@@ -14126,44 +14301,50 @@ end;
 {$if not defined(ASMX64AVX0) and not defined(ASMX86)} // fallback if no asm
 
 procedure DynArrayHashTableAdjust(P: PIntegerArray; deleted: integer; count: PtrInt);
+var
+  v: integer; // a temporary variable seems better especially on ARM
 begin
   repeat
     dec(count, 8);
-    dec(P[0], ord(P[0] > deleted)); // branchless code is 10x faster than if :)
-    dec(P[1], ord(P[1] > deleted));
-    dec(P[2], ord(P[2] > deleted));
-    dec(P[3], ord(P[3] > deleted));
-    dec(P[4], ord(P[4] > deleted));
-    dec(P[5], ord(P[5] > deleted));
-    dec(P[6], ord(P[6] > deleted));
-    dec(P[7], ord(P[7] > deleted));
+    v := P[0]; P[0] := v - ord(v > deleted);
+    v := P[1]; P[1] := v - ord(v > deleted);
+    v := P[2]; P[2] := v - ord(v > deleted);
+    v := P[3]; P[3] := v - ord(v > deleted);
+    v := P[4]; P[4] := v - ord(v > deleted);
+    v := P[5]; P[5] := v - ord(v > deleted);
+    v := P[6]; P[6] := v - ord(v > deleted);
+    v := P[7]; P[7] := v - ord(v > deleted);
     P := @P[8];
   until count < 8;
   while count > 0 do
   begin
     dec(count);
-    dec(P[count], ord(P[count] > deleted));
+    v := P[count];
+    P[count] := v - ord(v > deleted);
   end;
 end;
 
 procedure DynArrayHashTableAdjust16(P: PWordArray; deleted: cardinal; count: PtrInt);
+var
+  v: cardinal; // a temporary variable seems better especially on ARM
 begin
-  repeat // branchless code is 10x faster than if :)
+  repeat
     dec(count, 8);
-    dec(P[0], cardinal(P[0] > deleted));
-    dec(P[1], cardinal(P[1] > deleted));
-    dec(P[2], cardinal(P[2] > deleted));
-    dec(P[3], cardinal(P[3] > deleted));
-    dec(P[4], cardinal(P[4] > deleted));
-    dec(P[5], cardinal(P[5] > deleted));
-    dec(P[6], cardinal(P[6] > deleted));
-    dec(P[7], cardinal(P[7] > deleted));
+    v := P[0]; P[0] := v - cardinal(v > deleted);
+    v := P[1]; P[1] := v - cardinal(v > deleted);
+    v := P[2]; P[2] := v - cardinal(v > deleted);
+    v := P[3]; P[3] := v - cardinal(v > deleted);
+    v := P[4]; P[4] := v - cardinal(v > deleted);
+    v := P[5]; P[5] := v - cardinal(v > deleted);
+    v := P[6]; P[6] := v - cardinal(v > deleted);
+    v := P[7]; P[7] := v - cardinal(v > deleted);
     P := @P[8];
   until count < 8;
   while count > 0 do
   begin
     dec(count);
-    dec(P[count], cardinal(P[count] > deleted));
+    v := P[count];
+    P[count] := v - cardinal(v > deleted);
   end;
 end;
 
@@ -14408,14 +14589,14 @@ end;
 {$ifdef HASCODEPAGE}
 procedure TRawByteStringStream.EnsureDataStringIsUtf8;
 var
-  p: PStrRec;
+  sr: PStrRec;
 begin // faster than EnsureRawUtf8() since in most cases it is already CP_UTF8
-  p := pointer(fDataString);
-  if p = nil then
+  sr := pointer(fDataString);
+  if sr = nil then
     exit;
-  dec(p);
-  if p^.refCnt = 1 then
-    p^.CodePage := CP_UTF8; // just replace in-place (paranoid anyway)
+  dec(sr);
+  if sr^.refCnt = 1 then
+    sr^.CodePage := CP_UTF8; // just replace in-place (paranoid anyway)
 end;
 {$endif HASCODEPAGE}
 

@@ -168,6 +168,8 @@ type
     fCheckLastTix: cardinal;
     /// called before all published properties are executed
     procedure Setup; virtual;
+    /// just like Setup but allow to return false and bypass the whole tests
+    function Prepare: boolean; virtual;
     /// called after all published properties are executed
     // - WARNING: this method should be re-entrant - so using FreeAndNil() is
     // a good idea in this method :)
@@ -292,7 +294,7 @@ type
       retry: integer = 3): RawByteString;
     /// wait up to 5 seconds that a given file is deleted
     function WaitDeleted(const fn: TFileName; const msg: ShortString): boolean;
-    /// execute a method possibly in a dedicated TLoggedWorkThread
+    /// execute a (slow) method possibly in a dedicated TLoggedWorkThread
     // - OnTask() should take some time running, to be worth a thread execution
     // - won't create more background threads than currently available CPU cores,
     // to avoid resource exhaustion and unexpected timeouts on smaller computers,
@@ -304,11 +306,20 @@ type
     /// wait for background thread started by Run() to finish
     procedure RunWait(NotifyThreadCount: boolean = true; TimeoutSec: integer = 60;
       CallSynchronize: boolean = true);
+    /// execute a method in a shared TSynThreadTasks thread pool
+    procedure RunTask(const Worker: TNotifyEvent; const Name: RawUtf8);
+    /// execute a method several times in a shared TSynThreadTasks thread pool
+    procedure RunTasks(const Worker: TNotifyEvent; Count: integer;
+      const Name: RawUtf8);
+    /// wait for background tasks started by RunTask/RunTasks() to finish
+    procedure WaitTasks(const Name: RawUtf8; TimeOutMS: cardinal = 5000);
     /// this method is triggered internally - e.g. by Check() - when a test failed
     procedure TestFailed(const msg: string; notify: boolean = true); overload;
     /// this method can be triggered directly - e.g. after CheckFailed() = true
     procedure TestFailed(const msg: RawUtf8; const args: array of const;
       notify: boolean = true); overload;
+    /// would fail a test on an unexpected Exception
+    procedure FailedRaised(E: Exception; const ctxt: RawUtf8 = '');
     /// will add to the console a message with a speed estimation
     // - speed is computed from the method start or supplied local Timer
     // - returns the number of microsec of the (may be specified) timer
@@ -375,18 +386,18 @@ type
   /// a class used to run a suit of test cases
   TSynTests = class(TSynTest)
   protected
-    fAssertionsFailed: integer;
     fSafe: TOSLock;
     fTestCaseClass: array of TSynTestCaseClass;
-    /// any number not null assigned to this field will display a "../sec" stat
-    fRunConsoleOccurrenceNumber: cardinal;
-    fMultiThread: boolean;
+    fAssertionsFailed: integer;
+    fRunConsoleOccurrenceNumber: cardinal; // <> 0 to display a "../sec" stat
     fFailed: TSynTestFaileds;
     fFailedCount: integer;
     fNotifyProgressLineLen: integer;
     fNotifyProgress: RawUtf8;
     fSaveToFileBeforeExternal: THandle;
+    fMultiThread: boolean;
     fRestrict: TRawUtf8DynArray;
+    fTasks: TSynThreadTasks;
     procedure EndSaveToFileExternal;
     function IsRestricted(const name: RawUtf8): boolean;
     function GetFailedCount: integer;
@@ -467,6 +478,8 @@ type
     // - example of use (code from a TSynTests published method):
     // !  AddCase([TOneTestCase]);
     procedure AddCase(const TestCase: array of TSynTestCaseClass); overload;
+    /// access to a persistent task pool shared during all tests
+    function Tasks: TSynThreadTasks;
     /// call of this method will run all associated tests cases
     // - function will return TRUE if all test passed
     // - all failed test cases will be added to the Failed[] list - which is
@@ -784,6 +797,11 @@ end;
 procedure TSynTestCase.Setup;
 begin
   // do nothing by default
+end;
+
+function TSynTestCase.Prepare: boolean;
+begin
+  result := true; // continue by default
 end;
 
 procedure TSynTestCase.CleanUp;
@@ -1145,7 +1163,10 @@ begin
   if ((not fOwner.fMultiThread) or // avoid timeout e.g. on slow VMs
       (not Threaded)) and
      not ForcedThreaded then
-    OnTask(Sender) // run in main thread
+  begin
+    fOwner.DoLog(sllDebug, 'Run [%]', [TaskName]);
+    OnTask(Sender); // run in main thread
+  end
   else
   begin
     if fBackgroundRun = nil then
@@ -1153,7 +1174,7 @@ begin
       fBackgroundRun := TLoggedWorker.Create(TSynLogTestLog);
       fBackgroundRun.OnBeforeEachTask := OnBeforeEachBackgroundTask;
     end;
-    fOwner.DoLog(sllDebug, 'Run(%,%) using %',
+    fOwner.DoLog(sllDebug, 'Run [%,%] using %',
       [TaskName, ForcedThreaded, fBackgroundRun]);
     fBackgroundRun.Run(OnTask, Sender, TaskName, ForcedThreaded);
   end;
@@ -1174,7 +1195,32 @@ begin
   if not fBackgroundRun.RunWait(TimeoutSec, CallSynchronize) then
     TestFailed(' error: timeout after % sec' + CRLF, [TimeoutSec])
   else if NotifyThreadCount then
-    NotifyProgress([timer.Stop]);
+    NotifyProgress([timer.Stop])
+  else
+    fOwner.DoLog(sllDebug, 'RunWait in %', [timer.Stop]);
+end;
+
+procedure TSynTestCase.RunTask(const Worker: TNotifyEvent;
+  const Name: RawUtf8);
+begin
+  fOwner.DoLog(sllTrace, 'RunTask [%]', [Name]);
+  CheckEqual(fOwner.Tasks.Add(self, Worker), 1, Name);
+end;
+
+procedure TSynTestCase.RunTasks(const Worker: TNotifyEvent;
+  Count: integer; const Name: RawUtf8);
+begin
+  fOwner.DoLog(sllTrace, 'RunTasks count=% [%]', [Count, Name]);
+  CheckEqual(fOwner.Tasks.Add(self, Worker, Count), Count, Name);
+end;
+
+procedure TSynTestCase.WaitTasks(const Name: RawUtf8; TimeOutMS: cardinal);
+var
+  start: Int64;
+begin
+  QueryPerformanceMicroSeconds(start);
+  CheckUtf8(fOwner.Tasks.WaitFor(TimeOutMS), Name);
+  fOwner.DoLog(sllTrace, 'WaitTasks [%] in %', [Name, MicroSecFrom(start)]);
 end;
 
 procedure TSynTestCase.TestFailed(const msg: string; notify: boolean);
@@ -1199,6 +1245,11 @@ procedure TSynTestCase.TestFailed(const msg: RawUtf8; const args: array of const
   notify: boolean);
 begin
   TestFailed(FormatString(msg, args), notify);
+end;
+
+procedure TSynTestCase.FailedRaised(E: Exception; const ctxt: RawUtf8 = '');
+begin
+  TestFailed('%%', [ctxt, ObjectToJsonDebug(E)]);
 end;
 
 procedure TSynTestCase.AddConsole(const msg: string; OnlyLog: boolean);
@@ -1303,6 +1354,37 @@ begin
   inherited Create(Ident);
 end;
 
+destructor TSynTests.Destroy;
+begin
+  EndSaveToFileExternal;
+  inherited Destroy;
+  fTasks.Free;
+  fSafe.Done;
+end;
+
+function TSynTests.Tasks: TSynThreadTasks;
+var
+  n: integer;
+begin
+  result := fTasks;
+  if result <> nil then
+    exit;
+  fSafe.Lock;
+  try
+    if fTasks = nil then
+    begin
+      n := 16;
+      ThreadCountAdjust(n); // adapt to PRISM requirements
+      fTasks := TSynThreadTasks.Create(n, 'testtask');
+    end;
+  finally
+    fSafe.UnLock;
+  end;
+  result := fTasks;
+  DoLog(sllDebug, 'Tasks: initialized shared % with % threads',
+    [result.ClassType, result.WorkThreadCount]);
+end;
+
 procedure TSynTests.EndSaveToFileExternal;
 begin
   if fSaveToFileBeforeExternal = 0 then
@@ -1310,13 +1392,6 @@ begin
   FileClose(StdOut);
   StdOut := fSaveToFileBeforeExternal;
   fSaveToFileBeforeExternal := 0;
-end;
-
-destructor TSynTests.Destroy;
-begin
-  EndSaveToFileExternal;
-  inherited Destroy;
-  fSafe.Done;
 end;
 
 procedure TSynTests.DoColor(aColor: TConsoleColor);
@@ -1358,12 +1433,16 @@ var
   len: integer;
   nfo: PSynTestMethodInfo;
 begin
+  nfo := _CurrentMethodInfo;
+  if nfo <> nil then
+    DoLog(sllTrace, '%: %', [nfo^.TestName, value])
+  else
+    DoLog(sllTrace, 'Progress: %', [value]);
   ConsoleLock;
   try
     if fNotifyProgress = '' then
     begin
       DoColor(ccGreen);
-      nfo := _CurrentMethodInfo;
       if nfo <> nil then
         DoText(['  - ', nfo^.TestName, ':' + CRLF + '     '])
       else
@@ -1514,6 +1593,8 @@ begin
           started := false;
           c := fTestCaseClass[i].Create(self); // add all published methods
           try
+            if not c.Prepare then
+              continue; // by-pass the whole TSynTestCase class
             nfo := nil;
             for t := 0 to c.Count - 1 do
             try
@@ -1579,9 +1660,14 @@ begin
             _CurrentMethodInfo := nil;
             if not started then
               continue;
+            // cleanup any background process or task
             if c.fBackgroundRun.Waiting then
               c.RunWait({notify=}false, {timeout=}120, {synchronize=}true);
-            c.CleanUp; // to be done before Destroy call and after RunWait()
+            if fTasks <> nil then
+              fTasks.WaitFor(120 * MilliSecsPerSec);
+            // Cleanup virtual method to be done before Destroy call
+            c.CleanUp;
+            // notify console
             if c.AssertionsFailed = 0 then
               DoColor(ccLightGreen)
             else

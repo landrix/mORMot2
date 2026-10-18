@@ -77,7 +77,8 @@ type
   // - fClosed is set by OnClose virtual method
   // - fFirstRead is set once TPollAsyncSockets.OnFirstRead is called
   // - fSubRead/fSubWrite flags are set when Subscribe() has been called
-  // - fInList indicates that ConnectionAdd() did register the connection
+  // - fRegistered indicates that the connection is owned by TAsyncConnections,
+  // but does not indicate socket subscription or pending processing
   // - fReadPending states that there is a pending event for this connection
   // - fMemClean is set after TPollAsyncConnection.ReleaseMemoryOnIdle success
   // - note: better keep it to 8 items to fit in a byte (faster access)
@@ -89,7 +90,7 @@ type
     fSubRead,
     fSubWrite,
     {$endif USE_WINIOCP}
-    fInList,
+    fRegistered,
     fReadPending,
     fMemClean
   );
@@ -105,7 +106,7 @@ type
     fHandle: TConnectionAsyncHandle;
     /// low-level 8-bit flags used by the state machine about this connection
     fFlags: TPollAsyncConnectionFlags;
-    /// internal 8-bit flags e.g. for fRW[] or IOCP or to mark AddGC()
+    /// internal 8-bit flags e.g. for fRW[] or IOCP or AddGC()
     fInternalFlags: set of (
       ifWriteWait, ifFromGC, ifInGC, ifSeparateWLock, ifProcessing);
     /// the current (reusable) receiving data buffer of this connection
@@ -296,6 +297,9 @@ type
       events: TPollSocketEvents): boolean; virtual; abstract;
     procedure OnClosed(connection: TPollAsyncConnection); virtual; abstract;
     procedure RegisterConnection(connection: TPollAsyncConnection); virtual; abstract;
+    {$ifndef USE_WINIOCP}
+    procedure ClosePendingRead;
+    {$endif USE_WINIOCP}
     function SubscribeConnection(const caller: ShortString;
       connection: TPollAsyncConnection; sub: TPollSocketEvent): boolean;
     procedure CloseConnection(var connection: TPollAsyncConnection;
@@ -400,7 +404,7 @@ type
       read fRead;
     /// low-level access to the polling class used for send() data
     property PollWrite: TPollWriteSockets
-      write fWrite;
+      read fWrite;
     {$endif USE_WINIOCP}
   end;
 
@@ -431,7 +435,7 @@ type
   protected
     fLastOperation: TAsyncConnectionSec; // as 32-bit monotonic seconds
     fRemoteIP4: cardinal; // may contain cLocalhost32 = 127.0.0.1
-    fRemoteIP: RawUtf8;   // never contains '127.0.0.1'
+    fRemoteIP: RawUtf8;   // follow RemoteIPLocalHostAsVoidInServers
     fOwner: TAsyncConnections;
     // called after TAsyncConnections.GetLastOperationIdleSeconds of no activity
     // - Sender.Write() could be used to send e.g. a hearbeat frame
@@ -638,6 +642,8 @@ type
       out aConnection: TAsyncConnection): boolean; virtual;
     function ConnectionNew(aSocket: TNetSocket; aConnection: TAsyncConnection;
       aAddAndSubscribe: boolean = true): boolean; virtual;
+    procedure ConnectionAbortAndNil(var aConnection: TAsyncConnection;
+      aCallerSocket: TNetSocket = nil);
     function ConnectionDelete(
       aConnection: TPollAsyncConnection): boolean; overload; virtual;
     function LockedConnectionDelete(
@@ -1249,9 +1255,12 @@ type
   /// store THttpProxyUrl.Settings options for a given URI
   THttpProxyUrlOptions = set of THttpProxyUrlOption;
 
+  THttpProxyUrlSettings = class;
+
   /// callback function prototype for THttpProxyServerSettings.AddEvent()
   TOnHttpProxyServerRequest = function(Ctxt: THttpServerRequestAbstract;
-    const Uri: TUriMatchName; Met: TUriRouterMethod): cardinal of object;
+    const Uri: TUriMatchName; Met: TUriRouterMethod;
+    ProxyUrl: THttpProxyUrl): cardinal of object;
 
   /// define one URL content / THttpProxyUrl setting for THttpProxyServer
   THttpProxyUrlSettings = class(TSynAutoCreateFields)
@@ -1613,6 +1622,8 @@ begin
 end;
 
 destructor TPollAsyncConnection.Destroy;
+var
+  sock: TNetSocket;
 begin
   // note: our light locks do not need any specific release
   try
@@ -1622,6 +1633,24 @@ begin
       except
       end;
     BeforeDestroy;
+    // release the socket if Stop() did not, e.g. at shutdown
+    sock := fSocket;
+    if {$ifdef USE_WINIOCP} (fIocpSub = nil) and {$endif}
+       // TWinIocp.Destroy did already close its subscribed sockets
+       (sock <> nil) then
+    begin
+      fSocket := nil;
+      try
+        fSecure := nil;          // perform TLS shutdown
+      except
+        pointer(fSecure) := nil; // leak better than propagated GPF
+      end;
+      if fWr.Len = 0 then
+        sock.SetLinger(-1)       // normal close: don't wait for peer
+      else
+        sock.SetLinger(0);       // unfinished write: RST + discard pending data
+      sock.ShutdownAndClose({rdwr=}false);
+    end;
     // finalize the instance
     fHandle := 0; // to detect any dangling pointer
   except
@@ -2175,7 +2204,7 @@ function TPollAsyncSockets.SubscribeConnection(const caller: ShortString;
 var
   tag: TPollSocketTag absolute connection;
 begin
-  if not (fInList in connection.fFlags) then // not already registered
+  if not (fRegistered in connection.fFlags) then // not already registered
     RegisterConnection(connection);
   result := false;
   if not (sub in [pseRead, pseWrite]) then
@@ -2215,6 +2244,30 @@ begin
       [pointer(connection.fSocket), POLL_SOCKET_EVENT[sub], BOOL_STR[result],
        caller, connection.Handle], self);
 end;
+
+{$ifndef USE_WINIOCP}
+procedure TPollAsyncSockets.ClosePendingRead;
+var
+  i: PtrInt;
+  res: TPollSocketResult;
+  c: TPollAsyncConnection;
+begin
+  // called by TAsyncConnections.Shutdown after all producers/consumers stopped
+  for i := fRead.fPendingIndex to fRead.fPending.Count - 1 do
+  begin
+    // release work still owned by the queue
+    res := fRead.fPending.Events[i];
+    if byte(ResToEvents(res)) = 0 then
+      continue;
+    c := TPollAsyncConnection(ResToTag(res));
+    if (c <> nil) and
+       not (ifInGC in c.fInternalFlags) then
+      CloseConnection(c, 'ClosePendingRead');
+  end;
+  fRead.fPending.Count := 0;
+  fRead.fPendingIndex := 0;
+end;
+{$endif USE_WINIOCP}
 
 procedure TPollAsyncSockets.CloseConnection(
   var connection: TPollAsyncConnection; const caller: ShortString);
@@ -2264,9 +2317,13 @@ begin
   result := true; // if closed or properly read: don't retry
   connection := TPollAsyncConnection(ResToTag(notif));
   if (self = nil) or
-     fTerminated or
      connection.IsClosed then
     exit;
+  if fTerminated then // avoid paranoid leak
+  begin
+    CloseConnection(connection, 'ProcessRead terminated');
+    exit;
+  end;
   connection.fReadThread := Sender;
   LockedInc32(@fProcessingRead);
   try
@@ -2401,6 +2458,10 @@ begin
       end;
     end;
   finally
+    if fTerminated and // avoid paranoid leak
+       (connection <> nil) and
+       not (ifInGC in connection.fInternalFlags) then 
+      CloseConnection(connection, 'ProcessRead shutdown');
     LockedDec32(@fProcessingRead);
   end;
 end;
@@ -2605,7 +2666,7 @@ begin
   // inherited Create; use AfterCreate instead
   fFlags := [fWasActive]; // by definition
   fRemoteIP4 := aRemoteIP.IP4;
-  aRemoteIP.IP(fRemoteIP, {localasvoid=}true);
+  aRemoteIP.IP(fRemoteIP, RemoteIPLocalHostAsVoidInServers);
 end;
 
 procedure TAsyncConnection.Recycle(const aRemoteIP: TNetAddr);
@@ -2622,7 +2683,7 @@ begin
   fIocpSub := nil;
   {$endif USE_WINIOCP}
   fRemoteIP4 := aRemoteIP.IP4;
-  aRemoteIP.IP(fRemoteIP, {localasvoid=}true);
+  aRemoteIP.IP(fRemoteIP, RemoteIPLocalHostAsVoidInServers);
 end;
 
 function TAsyncConnection.OnLastOperationIdle(nowsec: TAsyncConnectionSec): boolean;
@@ -2734,19 +2795,21 @@ end;
 function TAsyncConnectionsThread.GetNextRead(
   out notif: TPollSocketResult): boolean;
 begin
-  result := fOwner.fSockets.fRead.GetOnePending(notif, fProcessName) and
-            not Terminated;
-  if result then
-    if (acoThreadSmooting in fOwner.Options) and
-       (fThreadPollingLastWakeUpTix <> fOwner.fThreadPollingLastWakeUpTix) and
-       not (wuFromSlowProcess in fWakeUp) then
-    begin
-      // ProcessRead() did take some time: wake up another thread
-      // - slow down a little bit the wrk RPS
-      // - but seems to reduce the wrk max latency
-      include(fWakeUp, wuFromSlowProcess); // do it once per Execute loop
-      fOwner.ThreadPollingWakeupOne;       // one thread is enough
-    end;
+  result := false;
+  if Terminated or
+     not fOwner.fSockets.fRead.GetOnePending(notif, fProcessName) then
+    exit;
+  result := true;
+  if (acoThreadSmooting in fOwner.Options) and
+     (fThreadPollingLastWakeUpTix <> fOwner.fThreadPollingLastWakeUpTix) and
+     not (wuFromSlowProcess in fWakeUp) then
+  begin
+    // ProcessRead() did take some time: wake up another thread
+    // - slow down a little bit the wrk RPS
+    // - but seems to reduce the wrk max latency
+    include(fWakeUp, wuFromSlowProcess); // do it once per Execute loop
+    fOwner.ThreadPollingWakeupOne;       // one thread is enough
+  end;
 end;
 
 {$endif USE_WINIOCP}
@@ -2827,8 +2890,7 @@ begin
         atpReadSingle:
           // a single thread to rule them all: polling, reading and processing
           if read.GetOne(ms, fProcessName, notif) then
-            if not Terminated then
-              fOwner.fSockets.ProcessRead(self, notif);
+            fOwner.fSockets.ProcessRead(self, notif);
         atpReadPoll:
           // main thread will just fill pending events from socket polls
           // (no process because a faulty service would delay all reading)
@@ -3013,8 +3075,7 @@ end;
 
 procedure TAsyncConnections.AddGC(aConnection: TPollAsyncConnection; const aContext: ShortString);
 begin
-  if Terminated or
-     (aConnection = nil) or
+  if (aConnection = nil) or // no Terminated check here to avoid leaks
      (ifInGC in aConnection.fInternalFlags) then
     exit;
   include(aConnection.fInternalFlags, ifInGC); // ensure AddGC() done once
@@ -3166,9 +3227,10 @@ begin
     exit;             // use this counter to avoid duplicated calls
   inc(fFlag1);
   {$ifdef USE_WINIOCP}
-  fIocpAccept.Unsubscribe(fIocpAcceptSub);
-  fIocpAccept.Terminate;
+  fIocpAccept.Terminate;  // notify the IOCP queue - no Unsubscribe(fIocpAcceptSub)
   {$endif USE_WINIOCP}
+  if fSockets <> nil then
+    fSockets.fTerminated := true; // shutdown ASAP
   Terminate;
   // terminate the main clients asynchronous logic
   if fSockets <> nil then
@@ -3176,7 +3238,7 @@ begin
     DoLog(sllDebug,
       'Shutdown threads=% total=% reads=%/% writes=%/% now=% hi=% pending=%',
       [length(fThreads), fSockets.Total,
-       fSockets.ReadCount, KB(fSockets.ReadBytes),
+       fSockets.ReadCount,  KB(fSockets.ReadBytes),
        fSockets.WriteCount, KB(fSockets.WriteBytes),
        fConnectionCount, fConnectionHigh, fSockets.Count], self);
     fSockets.Terminate(5000);
@@ -3209,10 +3271,20 @@ begin
           end;
     until (n = 0) or
           (mormot.core.os.GetTickCount64 > endtix);
-    FreeAndNilSafe(fSockets); // FreeAndNil() sets nil before which is incorrect
-    ObjArrayClear(fThreads, {continueonexception=}true);
+    ObjArrayClear(fThreads, {continueonexception=}true); // joins the workers
   end;
+  // the accept/client-connect thread can still be rolling back ConnectionNew
+  if (GetCurrentThreadId <> ThreadID) and
+     not Suspended then
+    WaitFor;                   // eventual end of main accept/connect loop
+  {$ifndef USE_WINIOCP}
+  if fSockets <> nil then
+    fSockets.ClosePendingRead; // purge fRead.fPending[]
+  {$endif USE_WINIOCP}
+  FreeAndNilSafe(fSockets);    // release main TAsyncConnectionsSockets
   // there may be some trailing connection instances to be released
+  if not (acoNoConnectionTrack in fOptions) then // we own them
+    ObjArrayClear(fConnection, {continueonexception=}true, @fConnectionCount);
   FreeGC(fGC1);
   FreeGC(fGC2);
 end;
@@ -3271,7 +3343,7 @@ begin
   if not ConnectionCreate(client, addr, result) then
     client.ShutdownAndClose({rdwr=}false)
   else if not fSockets.Start(result) then
-    FreeAndNil(result);
+    ConnectionAbortAndNil(result);
 end;
 
 procedure TAsyncConnections.DoLog(Level: TSynLogLevel; TextFmt: PUtf8Char;
@@ -3288,31 +3360,38 @@ var
   pool: PPollAsyncConnections;
 begin
   // you can override this class then call ConnectionNew
+  result := false;
+  aConnection := nil;
   if Terminated then
-    result := false
-  else
+    exit;
+  // first try to recycle 2nd gen instances e.g. for short-living HTTP/1.0
+  pool := @fGC2;
+  if (pool^.Count > 0) and
+     pool^.Safe.TryLock then
   begin
-    aConnection := nil;
-    // first try to recycle 2nd gen instances e.g. for short-living HTTP/1.0
-    pool := @fGC2;
-    if (pool^.Count > 0) and
-       pool^.Safe.TryLock then
+    if pool^.Count > 0 then
     begin
-      if pool^.Count > 0 then
-      begin
-        dec(pool^.Count);
-        aConnection := TAsyncConnection(pool^.Items[pool^.Count]);
-      end;
-      pool^.Safe.UnLock;
+      dec(pool^.Count);
+      aConnection := TAsyncConnection(pool^.Items[pool^.Count]);
     end;
-    if aConnection = nil then
-      // need to allocate and initialize a new instance
-      aConnection := fConnectionClass.Create(self, aRemoteIp)
-    else
-      // reuse the existing instance of a closed connection
-      aConnection.Recycle(aRemoteIP);
-    result := ConnectionNew(aSocket, aConnection, {add=}false);
+    pool^.Safe.UnLock;
   end;
+  if aConnection = nil then
+    // need to allocate and initialize a new instance
+    aConnection := fConnectionClass.Create(self, aRemoteIp)
+  else
+    // reuse the existing instance of a closed connection
+    aConnection.Recycle(aRemoteIP);
+  try
+    result := ConnectionNew(aSocket, aConnection, {add=}false);
+    // with aAddAndSubscribe=false, an initial read belongs to its pending queue
+    // or worker until it closes, or SubscribeConnection registers further I/O
+  except
+    on E: Exception do
+      DoLog(sllWarning, 'ConnectionCreate failed as %', [E], self);
+  end;
+  if not result then
+    ConnectionAbortAndNil(aConnection, aSocket); //
 end;
 
 function TAsyncConnections.ConnectionNew(aSocket: TNetSocket;
@@ -3331,7 +3410,7 @@ begin
   end;
   if acoNoConnectionTrack in fOptions then
   begin
-    include(aConnection.fFlags, fInList);
+    include(aConnection.fFlags, fRegistered); // owned by TAsyncConnections
     LockedInc32(@fConnectionCount);
   end
   else if {$ifndef USE_WINIOCP} (fThreadReadPoll = nil) or {$endif}
@@ -3343,7 +3422,8 @@ begin
     DoLog(sllTrace, 'ConnectionNew % sock=% count=% gc=%',
       [aConnection, pointer(aSocket), fConnectionCount,
        ifFromGC in aConnection.fInternalFlags], self);
-  result := true; // indicates aSocket owned by the pool
+  result := true;
+  // aConnection owns aSocket; caller must call Start or ConnectionAbortAndNil
 end;
 
 function TAsyncConnections.LockedConnectionDelete(aConnection: TAsyncConnection;
@@ -3364,7 +3444,7 @@ begin
     if acoVerboseLog in fOptions then
       DoLog(sllTrace, 'ConnectionDelete % ndx=% count=% %',
         [aConnection, aIndex, n, MicroSecFrom(start)], self);
-    aConnection.fSocket := nil;   // ensure is known as disabled
+    exclude(aConnection.fFlags, fRegistered); // only after actual registry removal
     AddGC(aConnection, 'LockedConnectionDelete'); // delayed released
     result := true;
   except
@@ -3377,7 +3457,7 @@ var
   c: ^TPollAsyncConnection;
   i, n: PtrInt;
 begin
-  include(conn.fFlags, fInList); // mark as registered
+  include(conn.fFlags, fRegistered); // owned by TAsyncConnections from now on
   fConnectionLock.WriteLock;
   try
     n := fConnectionCount;
@@ -3413,11 +3493,10 @@ var
 begin
   // don't call fSockets.Stop() here - see ConnectionRemove()
   result := false;
-  if Terminated or
-     (aConnection = nil) or
+  if (aConnection = nil) or // Terminated not here to avoid leaks
      (aConnection.Handle <= 0) then
     exit;
-  if not (fInList in aConnection.fFlags) then
+  if not (fRegistered in aConnection.fFlags) then // not yet owned
   begin
     // this connection was not part of fConnection[] list nor subscribed
     // e.g. HTTP/1.0 short request
@@ -3426,7 +3505,8 @@ begin
     result := true;
     exit;
   end;
-  exclude(aConnection.fFlags, fInList);
+  if Terminated then
+    exit; // registered entries remain owned by fConnection until shutdown
   conn := ConnectionFindAndLock(aConnection.Handle, cWrite, @i);
   if conn <> nil then
     try
@@ -3642,13 +3722,33 @@ begin
     DoLog(sllTrace, 'ConnectionRemove(%)=false', [Handle], self);
 end;
 
+procedure TAsyncConnections.ConnectionAbortAndNil(var aConnection: TAsyncConnection;
+  aCallerSocket: TNetSocket);
+var
+  c: TAsyncConnection;
+begin
+  c := aConnection;
+  aConnection := nil;
+  if (c = nil) or
+     (ifInGC in c.fInternalFlags) then
+    exit;
+  if c.fSocket = aCallerSocket then
+    c.fSocket := nil; // the accept caller will close its rejected socket
+  if fRegistered in c.fFlags then // owned connection
+    fSockets.CloseConnection(TPollAsyncConnection(c), 'ConnectionAbortAndNil')
+  else
+    c.Free; // ConnectionNew never registered this instance
+end;
+
 procedure TAsyncConnections.EndConnection(connection: TAsyncConnection);
 begin
   if acoNoConnectionTrack in fOptions then
   begin
-    connection.fSocket := nil;
-    AddGC(connection, 'EndConnection'); // delayed released
-    InterlockedDecrement(fConnectionCount);
+    if ifInGC in connection.fInternalFlags then
+      exit;
+    exclude(connection.fFlags, fRegistered); // not owned any more
+    LockedDec32(@fConnectionCount);          // before publication to GC
+    AddGC(connection, 'EndConnection');      // also accepts close at shutdown
   end
   else
     ConnectionDelete(connection);
@@ -4075,7 +4175,6 @@ end;
 procedure TAsyncServer.Shutdown;
 var
   i: PtrInt;
-  len: integer; // should be integer
   ev: TNetEvents;
   nl: TNetLayer;
   touchandgo: TNetSocket; // paranoid ensure Accept() is released
@@ -4084,6 +4183,8 @@ begin
   if fFlag2 <> 0 then // fFlag1 used by TAsyncConnections.Shutdown
     exit;             // use this counter to avoid duplicated calls
   inc(fFlag2);
+  if fSockets <> nil then
+    fSockets.fTerminated := true; // shutdown ASAP
   Terminate;
   for i := 0 to high(fThreads) do
     with fThreads[i] do
@@ -4108,8 +4209,9 @@ begin
     begin
       if fSocketsEpoll then
       begin
-        len := 1;
-        touchandgo.Send(@len, len);    // release epoll_wait() in R0 thread
+        // subscribe this writable socket to release epoll_wait() in all threads
+        fSockets.fRead.Subscribe(touchandgo, [pseWrite], {tag=}0);
+        fSockets.fWrite.Subscribe(touchandgo, [pseWrite], {tag=}0);
         ev := touchandgo.WaitFor(100, [neRead, neError]);
         DoLog(sllTrace, 'Shutdown epoll WaitFor=%', [byte(ev)], self);
         SleepHiRes(1);
@@ -4248,24 +4350,48 @@ begin
       res := nrFatalError;
       case e of
         wieAccept:
-          if fIocpAccept.GetNextAccept(sub, client, sin) then
           begin
-            if acoEnableTls in fOptions then
-              res := nrOk
-            else
-              res := client.MakeAsync;
-            if res = nrOk then
+            client := nil;
+            // retrieve the completed accept
+            if fIocpAccept.GetNextAccept(sub, client, sin) then
+              res := nrOk;
+            // always re-arm AcceptEx after consuming its completion
+            if not Terminated then
             begin
               s := nil; // allocate in PrepareNext()
               {$ifdef IOCP_ACCEPT_PREALLOCATE_SOCKETS}
               if socketsalloc <= high(sockets) then
               begin
-                s := sockets[socketsalloc]; // provide one pre-allocated socket
+                s := sockets[socketsalloc];
                 inc(socketsalloc);
               end;
               {$endif IOCP_ACCEPT_PREALLOCATE_SOCKETS}
-              if not fIocpAccept.PrepareNext('next', sub, wieAccept, nil, 0, s) then
-                res := nrFatalError;
+              try
+                if not fIocpAccept.PrepareNext(
+                         'next', sub, wieAccept, nil, 0, s) then
+                  raise EWinIocp.Create(
+                    'TAsyncServer.Execute: rearming AcceptEx failed');
+              except
+                // cannot continue accepting: release any client socket
+                if client <> nil then
+                begin
+                  client.Close;
+                  client := nil;
+                end;
+                raise;
+              end;
+            end;
+            // Prepare the accepted client only if initialization succeeded.
+            // TLS connections remain blocking until TLS setup is finished.
+            if (res = nrOk) and
+               not (acoEnableTls in fOptions) then
+            begin
+              res := client.MakeAsync;
+              if res <> nrOk then
+              begin
+                client.Close;
+                client := nil;
+              end;
             end;
           end;
         wieSend:
@@ -4294,18 +4420,8 @@ begin
         // first check if the server was shut down
         if Terminated then
         begin
-          {$ifndef USE_WINIOCP}
-          // specific behavior from Shutdown method
-          if fSocketsEpoll and
-             (res = nrOK) then
-          begin
-            DoLog(sllDebug, 'Execute: Accept(%) release', [fServer.Port], self);
-            // background subscribe to release epoll_wait() in R0 thread
-            fSockets.fRead.Subscribe(client, [pseRead], {tag=}0);
-            len := 1;
-            client.Send(@len, len); // release touchandgo.WaitFor
-          end;
-          {$endif USE_WINIOCP}
+          if res = nrOk then
+            client.ShutdownAndClose({rdwr=}false);
           break;
         end;
         // check if fServer.Sock.Accept() did return with a socket, or a timeout
@@ -4313,32 +4429,32 @@ begin
           DoLog(sllCustom1, 'Execute: Accept(%) retry', [fServer.Port], self);}
         if res = nrRetry then // timeout
           continue;
-        // check if the remote IP is banned
-        if (res = nrOk) and
-           fBanned.IsBanned(sin) then // IP filtering from blacklist
-        begin
-          if acoVerboseLog in fOptions then
-            DoLog(sllTrace, 'Execute: ban=%', [CardinalToHexShort(sin.IP4)], self);
-          len := ord(HTTP_BANIP_RESPONSE[0]);
-          client.Send(@HTTP_BANIP_RESPONSE[1], len); // 418 I'm a teapot
-          client.ShutdownAndClose({rdwr=}false);    // reject before TLS setup
-          continue;
-        end;
-        // ensure we don't have too many connections on this server instance
-        {$ifdef USE_WINIOCP}
-        if fSockets.fIocpRecvSend.Count > fMaxConnections then
-        {$else}
-        if (fSockets.fRead.Count > fMaxConnections) or
-           (fSockets.fRead.PendingCount > fMaxPending) then
-           // map THttpAsyncServer.HttpQueueLength property value
-        {$endif USE_WINIOCP}
-        begin
-          client.ShutdownAndClose({rdwr=}false); // e.g. for load balancing
-          res := nrTooManyConnections;
-        end;
+        if res = nrOk then
+          // check if the remote IP is banned
+          if fBanned.IsBanned(sin) then // IP filtering from blacklist
+          begin
+            if acoVerboseLog in fOptions then
+              DoLog(sllTrace, 'Execute: ban=%', [CardinalToHexShort(sin.IP4)], self);
+            len := ord(HTTP_BANIP_RESPONSE[0]);
+            client.Send(@HTTP_BANIP_RESPONSE[1], len); // 418 I'm a teapot
+            client.ShutdownAndClose({rdwr=}false);    // reject before TLS setup
+            continue;
+          end
+          // ensure we don't have too many connections on this server instance
+          {$ifdef USE_WINIOCP}
+          else if fSockets.fIocpRecvSend.Count > fMaxConnections then
+          {$else}
+          else if (fSockets.fRead.Count > fMaxConnections) or
+                  (fSockets.fRead.PendingCount > fMaxPending) then
+             // map THttpAsyncServer.HttpQueueLength property value
+          {$endif USE_WINIOCP}
+          begin
+            client.ShutdownAndClose({rdwr=}false); // e.g. for load balancing
+            if Terminated then
+              break;
+            res := nrTooManyConnections;
+          end;
         // handle any socket error in fServer.Sock.Accept()
-        if Terminated then
-          break;
         if res <> nrOK then
         begin
           // failure (too many clients?) -> wait and retry
@@ -4368,7 +4484,7 @@ begin
             {$endif USE_WINIOCP}
           end
           else if connection <> nil then // connection=nil for custom list
-            ConnectionDelete(connection);
+            ConnectionAbortAndNil(connection);
         end
         else
           client.ShutdownAndClose({rdwr=}false);
@@ -4533,9 +4649,9 @@ begin
             break;
           if fHttp.State = hrsWaitProcessing then
             break;
-          if HttpMethodWithNoBody(fHttp.CommandMethod) then
+          if IsHead(fHttp.CommandMethod) then
           begin
-            // no body to wait for (e.g. HEAD request)
+            // no body to wait for HEAD request (but OPTIONS may have one)
             fHttp.State := hrsWaitProcessing;
             break;
           end;
@@ -4667,7 +4783,16 @@ var
       fOwner.DoLog(sllDebug, 'StartRequest(% %/%)=%',
         [aMethod, aUrl.Server, aUrl.Address, ToText(result)^], self);
     finally
-      FreeAndNil(c);
+      {$ifdef USE_WINIOCP}
+      // ConnectEx was prepared on the accept queue, not the recv/send queue.
+      if c.fIocpSub <> nil then
+      begin
+        fOwner.fIocpAccept.Unsubscribe(c.fIocpSub);
+        c.fIocpSub := nil; // a terminated queue keeps its entry until Destroy
+      end;
+      {$endif USE_WINIOCP}
+      fOwner.ConnectionAbortAndNil(TAsyncConnection(c), sock);
+      sock.ShutdownAndClose({rdwr=}false); // not transferred by ConnectionNew
       if (aDestFileName <> '') and
          not DeleteFile(aDestFileName) then
         fOwner.DoLog(sllLastError, 'StartRequest: DeleteFile(%) failed',
@@ -4703,8 +4828,9 @@ begin
       exit;
     sock.MakeAsync;
     result := nrRefused;
-    if not fOwner.ConnectionNew(sock, c, {add=}true) then
+    if not fOwner.ConnectionNew(sock, c) then
       exit;
+    sock := nil; // now owned by c; failure cleanup uses ConnectionAbort
     if aDestFileName <> '' then
     begin
       fOwner.DoLog(sllTrace, 'StartRequest(% %/%) %',
@@ -4759,7 +4885,8 @@ begin
     result := addr.SocketConnect(c.fSocket, -1); // ms=-1 for non-blocking
     if result <> nrOk then
       exit;
-    if fOwner.fSockets.fWrite.Subscribe(c.fSocket, [pseWrite], tag) then
+    result := nrNoSocket;
+    if fOwner.fSockets.SubscribeConnection('client', c, pseWrite) then
       result := nrOk;
     {$endif USE_WINIOCP}
   finally
@@ -5205,27 +5332,19 @@ begin
   end;
   // now THttpAsyncServerConnection.OnRead can get the body
   fServer.IncStat(grHeaderReceived);
-  if not (fHttp.State in [hrsWaitProcessing, hrsWaitAsyncProcessing, hrsUpgraded]) and
-     // HEAD and OPTIONS are requests with Content-Length header but no body
-     HttpMethodWithNoBody(fHttp.CommandMethod) then
-  begin
-    // implement Expect: 100-Continue Header
-    if hfExpect100 in fHttp.HeaderFlags then
-      // client waits for the server to parse the headers and return 100
-      // before sending the request body
-      fServer.fAsync.fSockets.WriteString(self, 'HTTP/1.1 100 Continue'#13#10#13#10);
-    result := DoRequest;
-  end
-  else
-  begin
-    // allow OnBodyDownload callback to supply a stream for the body
-    result := soContinue;
-    if (fHttp.State in
-         [hrsGetBodyChunkedHexFirst, hrsGetBodyContentLengthFirst]) and
-       not (hfConnectionUpgrade in fHttp.HeaderFlags) and
-       Assigned(fServer.fOnBodyDownload) then
-      result := DoBodyDownload;
-  end;
+  result := soContinue;
+  if not (fHttp.State in [hrsGetBodyChunkedHexFirst, hrsGetBodyContentLengthFirst]) then
+    exit;
+  // implement Expect: 100-Continue for a framed request body
+  if hfExpect100 in fHttp.HeaderFlags then
+    // client waits for the server to parse the headers and return 100
+    // before sending the request body
+    fServer.fAsync.fSockets.WriteString(self,
+      'HTTP/1.1 100 Continue'#13#10#13#10);
+  // OnBodyDownload callback can supply a stream for the body - even for HEAD
+  if not (hfConnectionUpgrade in fHttp.HeaderFlags) and
+     Assigned(fServer.fOnBodyDownload) then
+    result := DoBodyDownload;
 end;
 
 function THttpAsyncServerConnection.DoRequest: TPollAsyncSocketOnReadWrite;
@@ -5359,21 +5478,21 @@ begin
   QueryPerformanceMicroSeconds(ctx.ElapsedMicroSec);
   dec(ctx.ElapsedMicroSec, fAfterResponseStart);
   ctx.Connection := fConnectionID;
-  ctx.Method := pointer(fHttp.CommandMethod);
-  ctx.Host := pointer(fHttp.Host);
-  ctx.Url := pointer(fHttp.CommandUri);
-  ctx.User := nil;
+  ctx.Method     := pointer(fHttp.CommandMethod);
+  ctx.Host       := pointer(fHttp.Host);
+  ctx.Url        := pointer(fHttp.CommandUri);
+  ctx.User       := nil;
   if hsrAuthorized in fRequestFlags then
-    ctx.User := pointer(fHttp.BearerToken); // see fServer.Authorization()
-  ctx.Referer := pointer(fHttp.Referer);
-  ctx.UserAgent := pointer(fHttp.UserAgent);
-  ctx.RemoteIP := pointer(fRemoteIP);
-  ctx.Flags := fRequestFlags;
-  ctx.State := fHttp.State;
+    ctx.User     := pointer(fHttp.BearerToken); // see fServer.Authorization()
+  ctx.Referer    := pointer(fHttp.Referer);
+  ctx.UserAgent  := pointer(fHttp.UserAgent);
+  ctx.RemoteIP   := pointer(fRemoteIP);
+  ctx.Flags      := fRequestFlags;
+  ctx.State      := fHttp.State;
   ctx.StatusCode := fRespStatus;
-  ctx.Received := fBytesRecv;
-  ctx.Sent := fBytesSend;
-  ctx.Tix64 := fServer.fAsync.fLastOperationMS; // ProcessIdleTix() GetTickCount64
+  ctx.Received   := fBytesRecv;
+  ctx.Sent       := fBytesSend;
+  ctx.Tix64      := fServer.fAsync.fLastOperationMS; // from ProcessIdleTix()
   try
     fServer.fOnAfterResponse(ctx); // e.g. THttpLogger or THttpAnalyzer
   except
@@ -5614,12 +5733,7 @@ begin
     T.ToHttpDateShort(fHttpDateNowUtc, 'GMT'#13#10, 'Date: ');
   end;
   // ensure log file(s) are flushed/consolidated if needed
-  if fLogger <> nil then
-    fLogger.OnIdle(fAsync.fLastOperationMS) // = ProcessIdleTix() GetTickCount64
-  else if fAnalyzer <> nil then
-    fAnalyzer.OnIdle(fAsync.fLastOperationMS);
-  if Assigned(fOnIdle) then
-    fOnIdle(self, fAsync.fLastOperationMS); // custom callback
+  DoIdle(fAsync.fLastOperationMS, fAsync.fLastOperationSec);
   // clean interned HTTP headers at least every 16 secs
   if (fInterning <> nil) and
      (fAsync <> nil) then
@@ -5637,15 +5751,6 @@ begin
       fInterningTix := tix;
     end;
   end;
-  // BlackListUri regular refresh support
-  if (fBlackListUriNextTix <> 0) and
-     (fAsync.LastOperationSec >= fBlackListUriNextTix) then
-    RefreshBlackListUri(fAsync.LastOperationSec);
-  {$ifdef OSPOSIX}
-  if Assigned(fSspiKeyTab) and
-     fSspiKeyTab.TryRefresh(fAsync.fLastOperationSec) then
-    fAsync.DoLog(sllDebug, 'IdleEverySecond: refreshed %', [fSspiKeyTab], self);
-  {$endif OSPOSIX}
 end;
 
 procedure THttpAsyncServer.AppendHttpDate(var Dest: TRawByteStringBuffer);
@@ -5861,7 +5966,7 @@ begin
     hashes := HashFileRaw(fn, fAlgos);
     if hashes = nil then
       exit; // no such file
-    fHashCache.Add(name, hashes);
+    fHashCache.Add(name, hashes); // first insertion wins on contention
   end;
   // return the pre-computed hash of this file
   i := 0;
@@ -6414,12 +6519,12 @@ begin
   if fSettings.Server.ServerName <> '' then
     fServer.ServerName := fSettings.Server.ServerName; // override 'mORMot (OS)'
   if fServer.Logger <> nil then
-    fServer.Logger.Settings := fSettings.Server.Log; // override default
+    fServer.Logger.Settings := fSettings.Server.Log;   // override default
   fav := StringFromFile(fSettings.Server.FaviconFile);
   if fav = '' then
     fav := 'default';
   fServer.SetFavIcon(fav); // do once
-  fServer.IdleEverySecond;
+  fServer.IdleEverySecond; // initial setup of background processing
   fServer.OnIdle := OnIdle;
   if not (psoDisableGzip in fSettings.Server.Options) then
     fServer.RegisterCompress(CompressGZip);
@@ -6487,7 +6592,10 @@ begin
       PtrArrayAdd(fUrl, one);
       // validate source as local file folder or remote http(s) server
       hps := hpsUndefined;
-      if s.Source <> '' then
+      if Assigned(s.OnRequest) then
+        // execute a callback event
+        hps := hpsEvent
+      else if s.Source <> '' then
         if IsHttp(s.Source) then
         begin
           // detects also 'http://unix:/path/to/socket.sock:/url/path'
@@ -6503,10 +6611,7 @@ begin
             s.fLocalFolder := IncludeTrailingPathDelimiter(s.fLocalFolder);
             hps := hpsLocalFolder;
           end;
-        end
-      else if Assigned(s.OnRequest) then
-        // execute a callback event
-        hps := hpsEvent;
+        end;
       one.fSource := hps;
       if hps = hpsUndefined then
       begin
@@ -6700,7 +6805,7 @@ begin
             html, hpoNoSubFolder in opt);
           if Assigned(one.fMemCache) and
              not (hpoDisableFolderHtmlIndexCache in opt) then
-            one.fMemCache.Add(dig.sha1, html);
+            one.fMemCache.Add(dig.sha1, html); // first inserted wins
         end;
         loginfo := 'html';
         result := Ctxt.SetOutContent(
@@ -6823,38 +6928,34 @@ var
   uri: TUriMatchName;
   met: TUriRouterMethod;
 begin
-  result := HTTP_NOTFOUND; // 404 by default
   // retrieve O(1) execution context
+  result := HTTP_NOTFOUND; // 404 by default
   one := Ctxt.RouteOpaque;
   if (one = nil) or
      one.Settings.Disabled or
      (one.Source = hpsUndefined) then
     exit;
   // validate the request method
+  result := HTTP_NOTALLOWED; // 405 Method Not Allowed
   if not (UriMethod(Ctxt.Method, met) and
           (met in one.Settings.Methods)) then
-  begin
-    result := HTTP_NOTALLOWED; // 405 Method Not Allowed
     exit;
-  end;
   // retrieve path and resource/file name from URI
   Ctxt.RouteAt(0, uri.Path);
   if uri.Path.Len > 512 then // obviously invalid
     exit;
   uri.ParsePath; // compute uri.Name for file-level TUriMatch
   // ensure was not marked as rejected
+  result := HTTP_FORBIDDEN; // 403
   if (one.Settings.RejectCsv <> '') and
      one.fReject.Check(one.Settings.RejectCsv, uri, PathCaseInsensitive) then
-  begin
-    result := HTTP_FORBIDDEN; // 403
     exit;
-  end;
   // actual request processing
   result := HTTP_NOTALLOWED; // 405 Method Not Allowed
   case one.Source of
     hpsEvent:
-      result := one.Settings.OnRequest(Ctxt, uri, met);
-      // no cache for callback methods (by design)
+      result := one.Settings.OnRequest(Ctxt, uri, met, one);
+      // no cache nor method filtering for callback (by design)
   else
     case met of
       urmGet,

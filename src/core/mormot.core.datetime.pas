@@ -1606,11 +1606,11 @@ begin
      (Day = 0) or             // 1..xx
      (cardinal(Year - 1) >= 9999) then  // 1..9999 as FPC RTL itself
     exit;
-  {$ifdef WIN64DELPHI}
+  {$ifdef CPU64}
   d := (QWord(Year) * DIV100_INV) shr 37; // we can avoid div on Delphi Win64
   {$else}
   d := Year div 100; // use fast reciprocal on FPC, plain div on Delphi Win32
-  {$endif WIN64DELPHI}
+  {$endif CPU64}
   m := Year - (d * 100);
   if Day > DaysPerMonth[(Year and 3 = 0) and // inlined IsLeapYear()
             ((m <> 0) or ((d and 3) = 0))][Month] then
@@ -1744,12 +1744,41 @@ begin
   result := tmp;
 end;
 
+function Iso8601FractionToMS(P: PUtf8Char; L: PtrInt): cardinal;
+  {$ifdef HASINLINE} inline; {$endif}
+var
+  c: cardinal;
+begin
+  result := 0;
+  if L <= 0 then
+    exit;
+  c := ord(P[0]) - 48;
+  if c > 9 then
+    exit;
+  result := c * 100;
+  if L < 2 then
+    exit;
+  c := ord(P[1]) - 48;
+  if c > 9 then
+    exit;
+  inc(result, c * 10);
+  if L < 3 then
+    exit;
+  c := ord(P[2]) - 48;
+  if c <= 9 then
+    inc(result, c);
+end;
+
 procedure Iso8601ToDateTimePUtf8CharVar(P: PUtf8Char; L: PtrInt;
   var result: TDateTime);
 var
   b, y, m, d, h, mi, ss, ms: cardinal;
   time: TDateTime;
+  {$ifdef FPC}
+  y100: cardinal;
+  {$else}
   d100: TDiv100Rec;
+  {$endif FPC}
   {$ifdef CPUX86NOTPIC}
   tab: TNormTableByte absolute ConvertHexToBin;
   {$else}
@@ -1851,10 +1880,17 @@ begin
     end;
     if y > 9999 then
       exit; // avoid integer overflow e.g. if '0000' is an invalid date
-    Div100(y, d100{%H-});
-    unaligned(result) := cardinal(cardinal(D1 * d100.d) shr 2) +
-                         cardinal(cardinal(D0 * d100.m) shr 2) +
+    {$ifdef FPC}
+    y100 := y div 100; // FPC will use fast reciprocal
+    unaligned(result) := cardinal(cardinal(D1 * y100) shr 2) +
+                         cardinal(cardinal(D0 * (y - y100 * 100)) shr 2) +
                          cardinal(cardinal(D2 * m + 2) div 5) + d;
+    {$else}
+    Div100(y, d100{%H-});
+    result := cardinal(cardinal(D1 * d100.d) shr 2) +
+              cardinal(cardinal(D0 * d100.m) shr 2) +
+              cardinal(cardinal(D2 * m + 2) div 5) + d;
+    {$endif FPC}
     unaligned(result) := unaligned(result) - D1899; // avoid sign issue
     if L < 15 then
       exit; // not enough space to retrieve the time
@@ -1874,16 +1910,8 @@ begin
   ss := ord(P[13]) * 10 + ord(P[14]) - (48 + 480);
   if (L > 16) and
      (P[15] = '.') then
-  begin
     // one or more digits representing a decimal fraction of a second
-    ms := ord(P[16]) * 100 - 4800;
-    if L > 17 then
-      ms := ms {%H-}+ byte(P[17]) * 10 - 480;
-    if L > 18 then
-      ms := ms + byte(P[18]) - 48;
-    if ms > MilliSecsPerSec then
-      ms := 0;
-  end
+    ms := Iso8601FractionToMS(@P[16], L - 16)
   else
     ms := 0;
   if (h >= 24) or
@@ -1989,14 +2017,12 @@ begin
   S := ord(P[4]) * 10 + ord(P[5]) - (48 + 480);
   if (L > 6) and
      (P[6] = '.') then
-  begin
     // one or more digits representing a decimal fraction of a second
-    MS := ord(P[7]) * 100 - 4800;
-    if L > 7 then
-      MS := MS {%H-}+ ord(P[8]) * 10 - 480;
-    if L > 8 then
-      MS := MS + ord(P[9]) - 48;
-  end
+    if (L > 7) and
+       (P[7] in ['0'..'9']) then
+      MS := Iso8601FractionToMS(@P[7], L - 7)
+    else
+      exit
   else
     MS := 0;
   if (H < 24) and
@@ -2076,16 +2102,19 @@ begin
     unaligned(result) := date + Time;
 end;
 
-{$ifndef CPUX86NOTPIC}
-procedure YearToPChar2(tab: PWordArray; Y: PtrUInt; P: PUtf8Char); inline;
+procedure YearToPCharTab(tab: PWordArray; Y: PtrUInt; P: PUtf8Char);
+  {$ifdef HASINLINE} inline; {$endif}
 var
-  d100: TDiv100Rec;
+  d100: PtrUInt;
 begin
-  Div100(Y, d100{%H-});
-  PWordArray(P)[0] := tab[d100.D];
-  PWordArray(P)[1] := tab[d100.M];
+  {$ifdef CPU64}
+  d100 := (Y * DIV100_INV) shr 37; // we can avoid div on Delphi Win64
+  {$else}
+  d100 := Y div 100; // FPC use fast reciprocal (and x86 has YearToPChar asm)
+  {$endif CPU64}
+  PCardinal(P)^ := tab[d100];
+  PCardinal(P + 2)^ := tab[Y - (d100 * 100)];
 end;
-{$endif CPUX86NOTPIC}
 
 function DateToIso8601PChar(P: PUtf8Char; Expanded: boolean;
   Y, M, D: PtrUInt): PUtf8Char;
@@ -2101,7 +2130,7 @@ begin
   YearToPChar(Y, P);
   {$else}
   tab := @TwoDigitLookupW;
-  YearToPChar2(tab, Y, P);
+  YearToPCharTab(tab, Y, P);
   {$endif CPUX86NOTPIC}
   inc(P, 4);
   if Expanded then
@@ -2109,14 +2138,14 @@ begin
     P^ := '-';
     inc(P);
   end;
-  PWord(P)^ := tab[M];
+  PCardinal(P)^ := tab[M];
   inc(P, 2);
   if Expanded then
   begin
     P^ := '-';
     inc(P);
   end;
-  PWord(P)^ := tab[D];
+  PCardinal(P)^ := tab[D];
   result := P + 2;
 end;
 
@@ -2138,28 +2167,28 @@ begin
   {$ifndef CPUX86NOTPIC}
   tab := @TwoDigitLookupW;
   {$endif CPUX86NOTPIC}
-  PWord(P)^ := tab[H];
+  PCardinal(P)^ := tab[H];
   inc(P, 2);
   if Expanded then
   begin
     P^ := ':';
     inc(P);
   end;
-  PWord(P)^ := tab[M];
+  PCardinal(P)^ := tab[M];
   inc(P, 2);
   if Expanded then
   begin
     P^ := ':';
     inc(P);
   end;
-  PWord(P)^ := tab[S];
+  PCardinal(P)^ := tab[S];
   inc(P, 2);
   if WithMS then
   begin
     {$ifdef CPUX86NOTPIC}
     YearToPChar(MS, P);
     {$else}
-    YearToPChar2(tab, MS, P);
+    YearToPCharTab(tab, MS, P);
     {$endif CPUX86NOTPIC}
     P^ := '.'; // override first digit
     inc(P, 4);
@@ -3218,26 +3247,25 @@ end;
 
 procedure TSynSystemTime.ToLogTime(Dest: PUtf8Char);
 var
-  d100: TDiv100Rec;
   {$ifdef CPUX86NOTPIC}
   tab: TWordArray absolute TwoDigitLookupW;
   {$else}
   tab: PWordArray;
   {$endif CPUX86NOTPIC}
 begin
-  Div100(Year, d100{%H-});
-  {$ifndef CPUX86NOTPIC}
+  {$ifdef CPUX86NOTPIC}
+  YearToPChar(Year, Dest);
+  {$else}
   tab := @TwoDigitLookupW;
+  YearToPCharTab(tab, Year, Dest);
   {$endif CPUX86NOTPIC}
-  PWord(Dest)^     := tab[d100.D];
-  PWord(Dest + 2)^ := tab[d100.M];
-  PWord(Dest + 4)^ := tab[PtrUInt(Month)];
-  PWord(Dest + 6)^ := tab[PtrUInt(Day)];
+  PCardinal(Dest + 4)^ := tab[PtrUInt(Month)];
+  PCardinal(Dest + 6)^ := tab[PtrUInt(Day)];
   Dest[8] := ' ';
-  PWord(Dest + 9)^  := tab[PtrUInt(Hour)];
-  PWord(Dest + 11)^ := tab[PtrUInt(Minute)];
-  PWord(Dest + 13)^ := tab[PtrUInt(Second)];
-  PWord(Dest + 15)^ := tab[PtrUInt(Millisecond) shr 4]; // rounded in 0..62 range
+  PCardinal(Dest + 9)^  := tab[PtrUInt(Hour)];
+  PCardinal(Dest + 11)^ := tab[PtrUInt(Minute)];
+  PCardinal(Dest + 13)^ := tab[PtrUInt(Second)];
+  PCardinal(Dest + 15)^ := tab[PtrUInt(Millisecond) shr 4]; // rounded in 0..62 range
 end;
 
 procedure TSynSystemTime.AddLogTime(WR: TTextWriter);
@@ -3299,20 +3327,20 @@ begin
   {$ifndef CPUX86NOTPIC}
   tab := @TwoDigitLookupW;
   {$endif CPUX86NOTPIC}
-  PWord(P)^ := tab[Day];
+  PCardinal(P)^ := tab[Day];
   PCardinal(P + 2)^ := PCardinal(@HTML_MONTH_NAMES[Month])^;
   P[2] := '/'; // overwrite HTML_MONTH_NAMES[][0]
   P[6] := '/';
   y := Year;
   d100 := y div 100;
-  PWord(P + 7)^  := tab[d100];
-  PWord(P + 9)^  := tab[y - (d100 * 100)];
+  PCardinal(P + 7)^  := tab[d100];
+  PCardinal(P + 9)^  := tab[y - (d100 * 100)];
   P[11] := ':';
-  PWord(P + 12)^ := tab[Hour];
+  PCardinal(P + 12)^ := tab[Hour];
   P[14] := ':';
-  PWord(P + 15)^ := tab[Minute];
+  PCardinal(P + 15)^ := tab[Minute];
   P[17] := ':';
-  PWord(P + 18)^ := tab[Second];
+  PCardinal(P + 18)^ := tab[Second];
   P[20] := ' ';
   result := 21;
 end;
@@ -3440,6 +3468,7 @@ var
   {$else}
   tab: PWordArray;
   {$endif CPUX86NOTPIC}
+  P: PUtf8Char;
 begin
   if IsZero or
      (high(result) < 12) then
@@ -3457,13 +3486,14 @@ begin
   {$ifndef CPUX86NOTPIC}
   tab := @TwoDigitLookupW;
   {$endif CPUX86NOTPIC}
-  result[0] := #12;
-  PWord(@result[1])^  := tab[Year];
-  PWord(@result[3])^  := tab[Month];
-  PWord(@result[5])^  := tab[Day];
-  PWord(@result[7])^  := tab[Hour];
-  PWord(@result[9])^  := tab[Minute];
-  PWord(@result[11])^ := tab[Second];
+  p := @result;
+  p[0] := #12;
+  PCardinal(p + 1)^  := tab[Year];
+  PCardinal(p + 3)^  := tab[Month];
+  PCardinal(p + 5)^  := tab[Day];
+  PCardinal(p + 7)^  := tab[Hour];
+  PCardinal(p + 9)^  := tab[Minute];
+  PCardinal(p + 11)^ := tab[Second];
 end;
 
 procedure TSynSystemTime.ToHuman(var Text: RawUtf8);
@@ -4615,13 +4645,20 @@ begin
   T.AddLogTime(self);
 end;
 
-function Value3Digits(V: cardinal; P: PUtf8Char; W: PWordArray): cardinal;
+function Value3Digits(V: PtrUInt; P: PUtf8Char; W: PWordArray): PtrUInt;
   {$ifdef HASINLINE}inline;{$endif}
 begin
-  result := V div 100;
-  PWord(P + 1)^ := W[V - result * 100];
+  {$ifdef CPU64}
+  result := (V * DIV100_INV) shr 37;    // we can avoid div on Delphi Win64
+  PWord(P + 1)^ := W[V - result * 100]; // not PCardinal()
+  V := result;
+  result := (result * DIV10_INV) shr 35;
+  {$else}
+  result := V div 100; // fast reciprocal on FPC, plain div on Delphi Win32
+  PWord(P + 1)^ := W[V - result * 100]; // not PCardinal()
   V := result;
   result := result div 10;
+  {$endif CPU64}
   P^ := AnsiChar(V - result * 10 + 48);
 end;
 

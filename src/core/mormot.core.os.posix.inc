@@ -2111,7 +2111,10 @@ begin
     if p.revents and (POLLIN or POLLPRI) <> 0 then
       result := 1   // something is available
     else
-      result := -1; // HUP/ERR/NVAL: not readable console input
+      result := -1  // HUP/ERR/NVAL: not readable console input
+  else if (result < 0) and
+          (fpgeterrno = ESysEINTR) then
+    result := 0;    // interrupted by a signal: nothing pending yet
 end;
 
 procedure ConsoleErrorWrite(const text: RawUtf8);
@@ -3040,10 +3043,22 @@ end;
 
 function setenv(name, value: PUtf8Char; replace: integer): integer;
   cdecl external clib name 'setenv';
+function unsetenv(name: PUtf8Char): integer;
+  cdecl external clib name 'unsetenv';
 
 function _SetSystemEnv(const name, value: RawUtf8): boolean;
+var
+  v: pointer;
 begin
-  result := setenv(pointer(name), pointer(value), {replace=}1) = 0;
+  v := pointer(value);
+  if v = nil then
+    v := @NULCHAR;
+  result := setenv(pointer(name), v, {replace=}1) = 0;
+end;
+
+function _UnsetSystemEnv(const name: RawUtf8): boolean;
+begin
+  result := unsetenv(pointer(name)) = 0;
 end;
 
 procedure GetUserHost(out User, Host: RawUtf8);
@@ -5539,9 +5554,13 @@ var
   function RedirectOutput(killing: boolean; var redir: RawByteString): boolean;
   var
     u: RawUtf8;
+    pending: integer;
   begin
     result := false; // return false on pipe closed
-    if WaitReadPending(fd, wait) > 0 then
+    pending := WaitReadPending(fd, wait);
+    if pending < 0 then
+      exit; // HUP/ERR with nothing left to read = the child closed its stdout
+    if pending > 0 then
     begin
       n := fpread(fd, @tmp, SizeOf(tmp));
       if n <= 0 then

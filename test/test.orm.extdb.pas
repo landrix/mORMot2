@@ -914,8 +914,14 @@ var
       res: ISqlDBRows;
       id, lastid, i, n, n1: integer;
       IDs: TIntegerDynArray;
+      names: TRawUtf8DynArray;
+      ndx: TSqlDBIndexDefineDynArray;
       Row, RowDoc, all: variant;
       r, v: PDocVariantData;
+      fields, expected: TSqlDBColumnDefineDynArray;
+      f, e: ^TSqlDBColumnDefine;
+      json: RawUtf8;
+      stmt: ISqlDBStatement;
 
       procedure DoInsert;
       var
@@ -924,7 +930,7 @@ var
         for i := 0 to high(IDs) do
           Check(proxy.ExecuteNoResult(
             'INSERT INTO People (ID,FirstName,LastName,YearOfBirth,YearOfDeath) ' +
-            'VALUES (?,?,?,?,?)', [IDs[i], 'FirstName New ' + Int32ToUtf8(i),
+            'VALUES (?,?,?,?,?)', [IDs[i], Make(['FirstName New ', i]),
             'New Last', i + 1400, 1519]) = 1);
       end;
 
@@ -945,6 +951,68 @@ var
       TSynLogTestLog.EnterLocal(log, proxy, msg);
       if proxy <> Props then
         Check(proxy.UserID = 'user');
+      // metadata should be transmitted as retrieved on the server side
+      proxy.GetFields('CustomProps', fields);
+      Props.GetFields('CustomProps', expected);
+      f := pointer(fields);
+      e := pointer(expected);
+      if CheckEqual(length(fields), length(expected), 'GetFields') then
+        for i := 1 to length(fields) do
+        begin
+          CheckEqual(f^.ColumnName, e^.ColumnName);
+          CheckEqual(f^.ColumnTypeNative, e^.ColumnTypeNative);
+          CheckEqual(f^.ColumnLength, e^.ColumnLength);
+          CheckEqual(f^.ColumnPrecision, e^.ColumnPrecision);
+          CheckEqual(f^.ColumnScale, e^.ColumnScale);
+          Check(f^.ColumnType = e^.ColumnType);
+          Check(f^.ColumnIndexed = e^.ColumnIndexed);
+          inc(f);
+          inc(e);
+        end;
+      proxy.GetFields('People', fields);
+      SaveJson(fields, TypeInfo(TSqlDBColumnDefineDynArray),
+        [twoIgnoreDefaultInRecord, twoEnumSetsAsTextInRecord], json);
+      CheckEqual(json,
+       '[{"ColumnName":"ID","ColumnTypeNative":"INTEGER","ColumnType":"ftInt64","' +
+       'ColumnIndexed":true},{"ColumnName":"FirstName","ColumnTypeNative":"TEXT",' +
+       '"ColumnType":"ftUtf8"},{"ColumnName":"LastName","ColumnTypeNative":"TEXT"' +
+       ',"ColumnType":"ftUtf8"},{"ColumnName":"Data","ColumnTypeNative":"BLOB","C' +
+       'olumnType":"ftBlob"},{"ColumnName":"YearOfBirth","ColumnTypeNative":"INTE' +
+       'GER","ColumnType":"ftInt64"},{"ColumnName":"YearOfDeath","ColumnTypeNativ' +
+       'e":"INTEGER","ColumnType":"ftInt64"}]');
+      Check(names = nil);
+      proxy.GetTableNames(names);
+      CheckEqual(RawUtf8ArrayToCsv(names),
+        'ADest,ADests,ASource,AuthGroup,AuthUser,CustomProps,Dali1,Dali2,FtsTest,F' +
+        'tsTest_content,FtsTest_segdir,FtsTest_segments,People,PeopleArray,PeopleO' +
+        'bject,test');
+      proxy.GetFieldDefinitions('PEOPLE', names, {withkeys=}false);
+      CheckEqual(RawUtf8ArrayToCsv(names),
+        'ID [INTEGER] *,FirstName [TEXT],LastName [TEXT],Data [BLOB],YearOfBirth [' +
+        'INTEGER],YearOfDeath [INTEGER]');
+      proxy.GetFieldDefinitions('PEOPLE', names, {withkeys=}true);
+      CheckEqual(RawUtf8ArrayToCsv(names),
+        'ID [INTEGER] *,FirstName [TEXT],LastName [TEXT],Data [BLOB],YearOfBirth [' +
+        'INTEGER],YearOfDeath [INTEGER]');
+      proxy.GetIndexes('ADests', ndx);
+      CheckEqual(DynArraySaveJson(ndx, TypeInfo(TSqlDBIndexDefineDynArray)),
+       '[{"IndexName":"IndexADestsDest","TypeDesc":"BTREE","Filter":"","KeyColumn' +
+       's":"Dest","IncludedColumns":"","IsUnique":false,"IsPrimaryKey":false,"IsU' +
+       'niqueConstraint":false},{"IndexName":"IndexADestsSource","TypeDesc":"BTRE' +
+       'E","Filter":"","KeyColumns":"Source","IncludedColumns":"","IsUnique":fals' +
+       'e,"IsPrimaryKey":false,"IsUniqueConstraint":false}]');
+      // the same statement instance should be executable several times
+      stmt := proxy.NewThreadSafeStatementPrepared(
+        'select count(*) from People where YearOfDeath=?', true, true);
+      for i := 1 to 3 do
+      begin
+        stmt.Bind(1, 1519);
+        stmt.ExecutePrepared;
+        Check(stmt.Step, 'reuse');
+        CheckEqual(stmt.ColumnInt(0), DoCount, 'reuse');
+        stmt.Instance.Reset;
+      end;
+      stmt := nil;
       proxy.ExecuteNoResult('delete from people where ID>=?', [50000]);
       res := proxy.Execute('select * from People where YearOfDeath=?', [1519]);
       Check(res <> nil);
@@ -1110,9 +1178,14 @@ begin
           props.ExecuteNoResult('insert into MaxIDTest (ID) values (?)', [10]);
           // make 'select max(ID)' fail: ExecuteDirect() returns nil
           props.ExecuteNoResult('alter table MaxIDTest rename to MaxIDAway', []);
-          CheckEqual(ext.EngineLockedNextID, 0, 'no ID on select failure');
-          CheckEqual(ext.EngineLockedNextID, 0, 'no counter from 0');
-          CheckEqual(ext.EngineAdd(ndx, '{"FirstName":"a"}'), 0, 'add');
+          TSynLog.Family.ExceptionIgnoreCurrentThread := true;
+          try
+            CheckEqual(ext.EngineLockedNextID, 0, 'no ID on select failure');
+            CheckEqual(ext.EngineLockedNextID, 0, 'no counter from 0');
+            CheckEqual(ext.EngineAdd(ndx, '{"FirstName":"a"}'), 0, 'add');
+          finally
+            TSynLog.Family.ExceptionIgnoreCurrentThread := false;
+          end;
           // once the database is back, max(ID) is retrieved again
           props.ExecuteNoResult('alter table MaxIDAway rename to MaxIDTest', []);
           CheckEqual(ext.EngineLockedNextID, 11, 'recovered');

@@ -980,6 +980,7 @@ function ServerSspiDataNtlm(const aInData: RawByteString): boolean;
 // - will raise an ESynSspi if authentication failed (e.g. invalid credentials)
 // - server must send aOutData to the client (if any), and if True was returned,
 // call this function again with any new data receive from the client
+// - consider mormot.net.client HTTP "Negotiate" KerberosServerAuthHeader() wrapper
 function ServerSspiAuth(var aSecContext: TSecContext;
   const aInData: RawByteString; out aOutData: RawByteString): boolean;
 
@@ -987,6 +988,7 @@ function ServerSspiAuth(var aSecContext: TSecContext;
 // - aSecContext must be received from a previous successful call to
 // ServerSspiAuth()
 // - aUserName contains authenticated user name
+// - consider mormot.net.client HTTP "Negotiate" KerberosServerAuthHeader() wrapper
 procedure ServerSspiAuthUser(var aSecContext: TSecContext;
   out aUserName: RawUtf8);
 
@@ -1037,9 +1039,6 @@ const
   /// HTTP header to be set for authentication
   // - GSS API only supports Negotiate/Kerberos - NTLM is unsafe and deprecated
   SECPKGNAMEHTTPWWWAUTHENTICATE = 'WWW-Authenticate: Negotiate ';
-
-  /// HTTP header pattern received for authentication
-  SECPKGNAMEHTTPAUTHORIZATION = 'AUTHORIZATION: NEGOTIATE ';
 
   /// by default, no GSSAPI is to be loaded with the Windows SSPI
   GssApi_LastLoadError = '';
@@ -2372,7 +2371,7 @@ end;
 
 function ServerSspiDataNtlm(const aInData: RawByteString): boolean;
 begin
-  result := (aInData <> '') and
+  result := (length(aInData) >= SizeOf(cardinal)) and
             (PCardinal(aInData)^ or $20202020 = NTLM_LO);
 end;
 

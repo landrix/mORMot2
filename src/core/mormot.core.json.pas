@@ -506,6 +506,12 @@ procedure RemoveCommentsFromJson(P: PUtf8Char); overload;
 // - won't remove the comments in-place, but allocate a new string
 function RemoveCommentsFromJson(const s: RawUtf8): RawUtf8; overload;
 
+/// remove any JSON_BASE64_MAGIC from JSON strings
+// - the supplied instance will be modified in-place for performance, as such:
+// ! Json := FetchAllAsJson(...);
+// ! RemoveMagicFromJson(Json);
+procedure RemoveMagicFromJson(var json: RawUtf8);
+
 /// helper to retrieve the bit mapped integer value of a set from its JSON text
 // - Names and MaxValue should be retrieved from RTTI
 // - if supplied P^ is a JSON integer number, will read it directly
@@ -4713,6 +4719,77 @@ function RemoveCommentsFromJson(const s: RawUtf8): RawUtf8;
 begin
   FastSetString(result, pointer(s), length(s));
   RemoveCommentsFromJson(pointer(result)); // remove in-place // /* and trailing ,
+end;
+
+procedure RemoveMagicFromJson(var json: RawUtf8);
+var
+  pos: PtrInt;
+  p, d, b: PUtf8Char;
+  sr: PStrRec;
+begin
+  p := pointer(json);
+  if p = nil then
+    exit;
+  dec(p);
+  repeat
+    repeat
+      inc(p);
+      if p^ = #0 then
+        exit;       // leave untouched if no JSON_BASE64_MAGIC_C
+    until p^ = '"'; // next "string" - PosChar() seems overkill
+    if PCardinal(p)^ = JSON_BASE64_MAGIC_QUOTE_C then
+      break;
+    p := GotoEndOfJsonString2(p + 1, @JSON_CHARS);
+    if p^ <> '"' then
+      exit;
+  until false;
+  inc(p);           // include initial "
+  sr := pointer(PAnsiChar(pointer(json)) - SizeOf(sr^));
+  if sr^.refCnt <> 1 then
+  begin
+    pos := p - pointer(json);                // position of first U+FFF0 3 bytes
+    d := FastNewString(sr^.length, CP_UTF8); // sr^.length used below
+    sr := pointer(d - SizeOf(sr^));
+    MoveFast(pointer(json)^, d^, pos);       // include opening "
+    inc(d, pos);    // points after '"'
+  end
+  else
+    d := p;         // in-place modification and resize for refCnt=1
+  repeat
+    b := p + 3;     // skip JSON_BASE64_MAGIC_C
+    p := GotoEndOfJsonString2(b, @JSON_CHARS);
+    if p^ <> '"' then
+      break;        // invalid input
+    repeat
+      repeat
+        inc(p);
+      until p^ in [#0, '"']; // next "string" - PosChar() seems overkill
+      if p^ <> #0 then
+      begin
+        if PCardinal(p)^ = JSON_BASE64_MAGIC_QUOTE_C then
+          break;
+        p := GotoEndOfJsonString2(p + 1, @JSON_CHARS);
+        if p^ = '"' then
+          continue; // parse whole block until JSON_BASE64_MAGIC_C appears
+      end;
+      p := nil;
+      break;
+    until false;
+    if p = nil then // no more "string"
+      break;
+    inc(p);         // PCardinal(p)^ = JSON_BASE64_MAGIC_QUOTE_C
+    pos := p - b;
+    MoveFast(b^, d^, pos);
+    inc(d, pos);    // points after '"'
+  until false;
+  pos := sr^.length - (b - pointer(json));
+  MoveFast(b^, d^, pos); // copy whole tail
+  inc(d, pos);
+  d^ := #0;         // make ASCIIZ
+  sr^.length := d - PUtf8Char(sr) - SizeOf(sr^); // store new length
+  inc(sr);
+  if sr <> pointer(json) then
+    FastAssignNewNotVoid(json, sr); // eventually replace json
 end;
 
 function ParseEndOfObject(P: PUtf8Char; out EndOfObject: AnsiChar): PUtf8Char;

@@ -81,6 +81,10 @@ function HtmlEscapeString(const text: string;
 function HtmlEscapeShort(const text: RawUtf8;
   fmt: TTextWriterHtmlFormat = hfAnyWhere): ShortString;
 
+/// escape some UTF-8 text into a HTML ShortString
+procedure HtmlEscapeShortVar(const text: RawUtf8; var short: ShortString;
+  fmt: TTextWriterHtmlFormat = hfAnyWhere);
+
 /// escape some RTL string text into UTF-8 HTML
 // - just a wrapper around TTextWriter.AddHtmlEscapeString() process,
 // replacing < > & " chars depending on the HTML layer
@@ -510,9 +514,9 @@ type
     fTab: PAnsiCharToByte; // = XML_KIND[] lookup table (inlined on FPC only)
     {$endif FPCX86NOTPIC}
     fBegin, fCur, fToken, fAfter: PUtf8Char;
-    fStackLen: array[byte] of byte;     // 255-byte names
-    fStackPos: array[byte] of cardinal; // 32-bit offsets from fBegin
-    fSave: array[0..31] of TQwordRec;   // for Save/Restore (len=fStackLen[255])
+    fStackLen: TByteToByte;           // 255-byte names
+    fStackPos: TByteToCardinal;       // 32-bit offsets from fBegin
+    fSave: array[0..31] of TQwordRec; // for Save/Restore (len=fStackLen[255])
   end;
 
 const
@@ -1395,16 +1399,22 @@ begin
 end;
 
 function HtmlEscapeShort(const text: RawUtf8; fmt: TTextWriterHtmlFormat): ShortString;
+begin
+  HtmlEscapeShortVar(text, result, fmt);
+end;
+
+procedure HtmlEscapeShortVar(const text: RawUtf8; var short: ShortString;
+  fmt: TTextWriterHtmlFormat);
 var
   temp: TLocalWriter;
 begin
   if NeedsHtmlEscape(pointer(text), fmt) then
   begin
-    __AddHtmlEscape(temp.Init(result), pointer(text), {TextLen=}0, fmt);
+    __AddHtmlEscape(temp.Init(short), pointer(text), {TextLen=}0, fmt);
     temp.Done;
   end
   else
-    Ansi7StringToShortString(text, result);
+    Ansi7StringToShortString(text, short);
 end;
 
 function HtmlEscapeString(const text: string; fmt: TTextWriterHtmlFormat): RawUtf8;

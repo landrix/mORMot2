@@ -56,10 +56,10 @@ uses
   {$ifdef USELIBCURL}  // as set in mormot.defines.inc
   mormot.lib.curl,
   {$endif USELIBCURL}
-  {$ifdef DOMAINRESTAUTH}
+  {$ifndef NOKERBEROSCLIENT}
   mormot.lib.sspi,   // void unit on POSIX
   mormot.lib.gssapi, // void unit on Windows
-  {$endif DOMAINRESTAUTH}
+  {$endif NOKERBEROSCLIENT}
   mormot.crypt.core,
   mormot.crypt.secure;
 
@@ -399,7 +399,11 @@ type
     // - otherwise, will use this value as explicit proxy server name
     // - used only during initial connection
     Proxy: RawUtf8;
-    /// the timeout to be used for the whole connection, as supplied to Create()
+    /// optional Proxy by-pass list - as defined by Windows WinINet/WinHttp API
+    ProxyByPass: RawUtf8;
+    /// legacy common timeout in milliseconds, as supplied to Create()
+    // - fallback for unspecified ConnectTimeoutMS/SendTimeoutMS/ReceiveTimeoutMS
+    // - 0 keeps the backend defaults; this is not a total request deadline
     CreateTimeoutMS: integer;
     /// allow HTTP/HTTPS authentication to take place at server request
     Auth: THttpRequestAuthOptions;
@@ -416,10 +420,22 @@ type
     /// allow to customize the User-Agent header
     // - for TWinHttp, should be set at constructor level
     UserAgent: RawUtf8;
+    /// connection setup timeout in milliseconds, used when creating the client
+    // - a positive value overrides CreateTimeoutMS for this phase
+    // - 0 (or a negative value) uses CreateTimeoutMS, then the backend default
+    // - changing these options does not change an already open connection:
+    // use the live socket properties, or create a new client from these options
+    ConnectTimeoutMS: integer;
+    /// send timeout in milliseconds, with the same fallback as ConnectTimeoutMS
+    SendTimeoutMS: integer;
+    /// receive timeout in milliseconds, with the same fallback as ConnectTimeoutMS
+    ReceiveTimeoutMS: integer;
     /// may be used to initialize this record on stack with zeroed values
     procedure Init;
     /// may be used to initialize this record on stack with HTTP client values
     procedure InitDefault;
+    /// use CreateTimeoutMS to compute missing Connect/Send/ReceiveTimeoutMS
+    procedure ComputeTimeouts;
     /// reset this record, calling FillZero() on Password/Token SpiUtf8 values
     procedure Clear;
     /// setup web authentication using the Basic access algorithm
@@ -438,11 +454,12 @@ type
     procedure AuthorizeBearer(const Value: SpiUtf8);
     /// compare the Auth fields, depending on their scheme
     function SameAuth(Another: PHttpRequestExtendedOptions): boolean;
-    /// persist all fields of this record as a TDocVariant
+    /// persist TLS, proxy, authentication and timeout settings as a TDocVariant
+    // - timeout keys are tm (legacy), tc (connect), ts (send), tr (receive)
     // - returns e.g. {"ti":1,"as":3} for TLS.IgnoreCertificateErrors = true
     // and Auth.Scheme = wraNegotiate
     function ToDocVariant(const Secret: RawByteString = ''): variant;
-    /// persist all fields of this record as a URI-encoded TDocVariant
+    /// persist ToDocVariant() settings as a URI-encoded TDocVariant
     // - returns e.g. '/root?ti=1&as=3' for TLS.IgnoreCertificateErrors = true
     // and Auth.Scheme = wraNegotiate and UriRoot = '/root'
     function ToUrlEncode(const UriRoot: RawUtf8;
@@ -840,6 +857,8 @@ type
   protected
     fExtendedOptions: THttpRequestExtendedOptions;
     fLastRequestTix: cardinal; // GetTickSec for RecreateConnectionAfterSecs
+    fAuthDigestAlgo: TDigestAlgo;
+    fAuthPurge: set of (apReferer, apAuthorization);
     fReferer: RawUtf8;
     fAccept: RawUtf8;
     fProcessName: RawUtf8;
@@ -847,31 +866,25 @@ type
     fProxyAuthHeader: RawUtf8;
     fRequestContext: RawUtf8;
     fRangeStart, fRangeEnd: Int64;
-    fAuthDigestAlgo: TDigestAlgo;
-    fAuthPurge: set of (apReferer, apAuthorization);
     fOnAuthorize, fOnProxyAuthorize: TOnHttpClientSocketAuthorize;
     fOnBeforeRequest: TOnHttpClientSocketRequest;
     fOnProtocolRequest: TOnHttpClientRequest;
     fOnAfterRequest: TOnHttpClientSocketRequest;
     fOnRedirect: TOnHttpClientSocketRequest;
-    fConnectTimeout, fSendTimeout, fReceiveTimeout: integer;
-    {$ifdef DOMAINRESTAUTH}
+    {$ifndef NOKERBEROSCLIENT}
     fAuthorizeSspiSpn: RawUtf8;
-    {$endif DOMAINRESTAUTH}
+    {$endif NOKERBEROSCLIENT}
+    procedure SetTunnelForUri(const uri: TUri);
+    function SameTunnelForUri(const uri: TUri; opt: PHttpRequestExtendedOptions): boolean;
     procedure SetAuthBearer(const Value: SpiUtf8);
-    procedure SetSendTimeout(aSendTimeout: integer); override;
-    procedure SetReceiveTimeout(aReceiveTimeout: integer); override;
+    procedure DoCreate(aTimeOut: integer); override;
+    procedure DoOpenOptions(const aUri: TUri; var aOptions: THttpRequestExtendedOptions;
+      const aOnLog: TSynLogProc; aClient: TCrtSocket);
     procedure RequestSendHeader(const url, method: RawUtf8); virtual;
     procedure RequestClear; virtual;
     function OnAuthorizeDigest(Sender: THttpClientSocket;
       var Context: THttpClientRequest; const Authenticate: RawUtf8): boolean;
   public
-    /// common initialization of all constructors
-    // - this overridden method will set the UserAgent with some default value
-    // - you can customize the default client timeouts by setting appropriate
-    // aTimeout parameters (in ms) if you left the 0 default parameters,
-    // it would use global HTTP_DEFAULT_RECEIVETIMEOUT variable values
-    constructor Create(aTimeOut: integer = 0); override;
     /// finalize this instance
     destructor Destroy; override;
     /// constructor to create a client connection to a given URI
@@ -886,8 +899,6 @@ type
     // - as used e.g. by TSimpleHttpClient
     constructor OpenOptions(const aUri: TUri;
       var aOptions: THttpRequestExtendedOptions; const aOnLog: TSynLogProc = nil);
-    /// change timeout details in a single call
-    procedure SetTimeouts(aConnectTimeout, aSendTimeout, aReceiveTimeout: integer);
     /// after Create(), open or bind to a given server port
     // - overriden to support HTTP proxy without CONNECT
     procedure OpenBind(const aServer, aPort: RawUtf8; doBind: boolean;
@@ -974,7 +985,7 @@ type
     /// setup web authentication using the Digest access algorithm
     procedure AuthorizeDigest(const UserName: RawUtf8; const Password: SpiUtf8;
       Algo: TDigestAlgo = daMD5_Sess);
-    {$ifdef DOMAINRESTAUTH}
+    {$ifndef NOKERBEROSCLIENT}
     /// setup web authentication using Kerberos via SSPI/GSSAPI for this instance
     // - will store the user/paswword credentials, and set OnAuthorizeSspi callback
     // - if Password is '', will search for an existing Kerberos token on UserName
@@ -1012,7 +1023,7 @@ type
     // unless you use a user@TLD or a keytab and the domain is extracted from it
     property AuthorizeSspiSpn: RawUtf8
       read fAuthorizeSspiSpn write fAuthorizeSspiSpn;
-    {$endif DOMAINRESTAUTH}
+    {$endif NOKERBEROSCLIENT}
 
     /// the optional 'Accept: ' header value
     property Accept: RawUtf8
@@ -1146,7 +1157,8 @@ var
   // - can be set manually to a forced global value
   DefaultHttpClientSocketProxy: TUri;
 
-  /// force GetProxyForUri(fromSystem=true) in GetSystemProxyUri() function
+  /// the fromSystem parameter used within GetSystemProxyUri() function
+  // - warning: WinHTTP proxy usage is not set by default
   DefaultHttpClientSocketProxyAuto: boolean;
 
   /// disable proxy for any IPv4 '1.2.3.4' address in GetSystemProxyUri() function
@@ -1162,8 +1174,14 @@ var
 // THttpClientSocket.Open() constructor
 // - if proxy is set, will return its value from @temp, otherwise return
 // @DefaultHttpClientSocketProxy or call GetProxyForUri() to fill and return @temp
+// - optional bypass is a Windows-style proxy bypass list
 // - return nil if no proxy is to be used for this URI
-function GetSystemProxyUri(const uri, proxy: RawUtf8; var temp: TUri): PUri;
+function GetSystemProxyUri(const uri: TUri; const proxy, bypass: RawUtf8;
+  var temp: TUri): PUri; overload;
+
+/// compatibility wrapper to the homonymous GetSystemProxyUri(TUri) function
+function GetSystemProxyUri(const uri, proxy: RawUtf8; var temp: TUri;
+  const bypass: RawUtf8 = ''): PUri; overload;
 
 /// ask the Operating System to return the Tunnel/Proxy settings for a given URI
 // - return DefaultHttpClientSocketProxy.URI or call GetProxyForUri()
@@ -1176,19 +1194,50 @@ function GetSystemProxy(const uri: RawUtf8): RawUtf8;
 // WinHttpGetProxyInfo from mormot.lib.winhttp to use the Internet Explorer
 // settings or system PAC file
 // - return '' if no proxy is defined
-function GetProxyForUri(const uri: RawUtf8;
-  fromSystem: boolean = true): RawUtf8;
+function GetProxyForUri(const uri: TUri; fromSystem: boolean = true): RawUtf8;
+
+{$ifdef USEWININET}
+/// wrapper to WinHttpGetProxyInfo() as used by GetProxyForUri()
+procedure GetWinProxyForUri(const uri: TUri; var proxy: RawUtf8);
+{$endif USEWININET}
+
+/// check if a host matches a Windows-style proxy bypass list
+// - ByPass is a semicolon-delimited list of case-insensitive host masks
+// - '*' is recognized as wildcard; '<local>' matches host names with no dot
+function ProxyByPassMatch(const Host, ByPass: RawUtf8): boolean;
+
+/// check if a host matches a NO_PROXY environment variable value
+// - NoProxy is a comma-delimited list of case-insensitive host/domain names
+// - a domain name matches itself and all its sub-domains
+// - an optional leading '.' before a domain name is ignored
+// - '*' as a single item matches any host
+function NoProxyMatch(const Host, NoProxy: RawUtf8): boolean;
 
 /// parse a URI into its final resource name
 // - optionally sanitize the output to be filename-compatible
 // - note that it returns an UTF-8 string as resource URI, not TFileName
 function ExtractResourceName(const uri: RawUtf8; sanitize: boolean = true): RawUtf8;
 
-{$ifdef DOMAINRESTAUTH}
+{$ifndef NOKERBEROSCLIENT}
 /// setup Kerberos tls-server-end-point channel binding on a given TLS connection
 procedure KerberosChannelBinding(const Tls: INetTls; var SecContext: TSecContext;
   var Temp: THash512Rec);
-{$endif DOMAINRESTAUTH}
+
+/// parse HTTP input headers and perform Negotiate/Kerberos Server authentication
+// - is a cross-platform wrapper over SSPI on Windows and GSSAPI on POSIX
+// - validate InputAuth or 'Authorization: Negotiate <base64>' in InputHeaders
+// - assumes a simple single-roundtrip Negotiate/Kerberos handshake
+// - NTLM is explicitly rejected - requires Kerberos from Negotiate on Windows
+// - on POSIX, the caller may call TServerSspiKeyTab.PrepareKeyTab beforehand to
+// select a specific keytab; otherwise the default GSSAPI credentials are used
+// - returns '' if no valid authentication could be completed, otherwise the
+// 'WWW-Authenticate: Negotiate ...' response header without trailing CRLF
+// - SSPI/GSSAPI processing errors may raise ESynSspi/EGssApi
+// - can optionally return the authenticated user name
+// - defined in this unit to avoid a dependency to mormot.net.server.pas
+function KerberosServerAuthHeader(const InputHeaders: RawUtf8;
+  InputAuth: PUtf8Char = nil; AuthUser: PRawUtf8 = nil): RawUtf8;
+{$endif NOKERBEROSCLIENT}
 
 
 { ******************** Additional Client Protocols Support }
@@ -1226,8 +1275,6 @@ type
   THttpRequest = class
   protected
     fServer: RawUtf8;
-    fProxyName: RawUtf8;
-    fProxyByPass: RawUtf8;
     fPort: TNetPort;
     fLayer: TNetLayer;
     fKeepAlive: cardinal;
@@ -1245,8 +1292,10 @@ type
       const data: RawByteString; const header: RawUtf8;
       aIgnoreTlsCertificateErrors: boolean; timeout: integer; outHeaders: PRawUtf8;
       outStatus: PInteger; outError: PString = nil): RawByteString;
+    procedure DoInternalConnect(const aServer, aPort: RawUtf8;
+      aHttps: boolean; aLayer: TNetLayer);
     // inherited class should override those abstract methods
-    procedure InternalConnect(ConnectionTimeOut, SendTimeout, ReceiveTimeout: cardinal); virtual; abstract;
+    procedure InternalConnect; virtual; abstract;
     procedure InternalCreateRequest(const aMethod, aUrl: RawUtf8); virtual; abstract;
     procedure InternalSendRequest(const aMethod: RawUtf8; const aData:
       RawByteString); virtual; abstract;
@@ -1414,11 +1463,11 @@ type
     /// the remote server optional proxy, as specified to the class constructor
     // - you may set 'none' to disable any Proxy, or keep '' to use the OS proxy
     property ProxyName: RawUtf8
-      read fProxyName;
+      read fExtendedOptions.Proxy;
     /// the remote server optional proxy by-pass list, as specified to the class
     // constructor
     property ProxyByPass: RawUtf8
-      read fProxyByPass;
+      read fExtendedOptions.ProxyByPass;
     /// called before and after Upload process
     property OnUpload: TOnHttpRequest
       read fOnUpload write fOnUpload;
@@ -1550,8 +1599,7 @@ type
   protected
     // those internal methods will raise an EWinINet exception on error
     procedure RaiseFromLastError(const ctxt: ShortString);
-    procedure InternalConnect(ConnectionTimeOut, SendTimeout,
-      ReceiveTimeout: cardinal); override;
+    procedure InternalConnect; override;
     procedure InternalCreateRequest(const aMethod, aUrl: RawUtf8); override;
     procedure InternalCloseRequest; override;
     procedure InternalAddHeader(const hdr: RawUtf8); override;
@@ -1601,8 +1649,7 @@ type
     // you can override this method e.g. to disable/enable some protocols
     function InternalGetProtocols: cardinal; virtual;
     // those internal methods will raise an EWinHttp exception on error
-    procedure InternalConnect(ConnectionTimeOut, SendTimeout,
-      ReceiveTimeout: cardinal); override;
+    procedure InternalConnect; override;
     procedure InternalCreateRequest(const aMethod, aUrl: RawUtf8); override;
     procedure InternalCloseRequest; override;
     procedure InternalAddHeader(const hdr: RawUtf8); override;
@@ -1678,8 +1725,7 @@ type
     fLast: record
       dlTotal, dlNow, ulTotal, ulNow: Int64;
     end;
-    procedure InternalConnect(
-      ConnectionTimeOut, SendTimeout, ReceiveTimeout: cardinal); override;
+    procedure InternalConnect; override;
     procedure InternalCreateRequest(const aMethod, aUrl: RawUtf8); override;
     procedure InternalSendRequest(const aMethod: RawUtf8;
       const aData: RawByteString); override;
@@ -1728,8 +1774,7 @@ type
     procedure DoValidateServerCertificate(const Sender: TObject;
       const ARequest: TURLRequest; const Certificate: TCertificate;
       var Accepted: boolean);
-    procedure InternalConnect(
-      ConnectionTimeOut, SendTimeout, ReceiveTimeout: cardinal); override;
+    procedure InternalConnect; override;
     procedure InternalCreateRequest(const aMethod, aUrl: RawUtf8); override;
     procedure InternalSendRequest(const aMethod: RawUtf8;
       const aData: RawByteString); override;
@@ -3718,33 +3763,57 @@ begin
   result := GetSetName(TypeInfo(TWGetAlternateState), st, trimmed);
 end;
 
-function GetProxyForUri(const uri: RawUtf8; fromSystem: boolean): RawUtf8;
 {$ifdef USEWININET}
+procedure GetWinProxyForUri(const uri: TUri; var proxy: RawUtf8);
 var
   pi: TProxyInfo;
-{$endif USEWININET}
 begin
-  if not IdemPChar(pointer(uri), 'HTTPS://') or
+  if WinHttpGetProxyInfo(Utf8ToSynUnicode(uri.URI({norm=}true)), pi) <> 0 then
+    exit;
+  proxy := SynUnicodeToUtf8(pi.URL);
+  if (pi.Bypass <> '') and
+     ProxyByPassMatch(uri.Server,
+       StringReplaceChars(SynUnicodeToUtf8(pi.Bypass), ' ', ';')) then
+    proxy := '';
+end;
+{$endif USEWININET}
+
+function GetProxyForUri(const uri: TUri; fromSystem: boolean): RawUtf8;
+var
+  noproxy: RawUtf8;
+begin
+  result := '';
+  if not (uri.UriScheme in HTTP_SCHEME) then
+    exit;
+  if not uri.Https or
      not GetSystemEnv('HTTPS_PROXY', result{%H-}) then // from cache
     result := GetSystemEnv('HTTP_PROXY');
+  if (result <> '') and
+     GetSystemEnv('NO_PROXY', noproxy) then
+  begin
+    if NoProxyMatch(uri.Server, noproxy) then
+      result := '';
+    exit;
+  end;
   {$ifdef USEWININET}
   if (result = '') and
-     fromsystem then
+     fromSystem then
     // no environment variable was set -> try using mormot.lib.winhttp
-    if WinHttpGetProxyInfo(Utf8ToSynUnicode(uri), pi) = 0 then
-      result := SynUnicodeToUtf8(pi.URL);
+    GetWinProxyForUri(uri, result);
   {$endif USEWININET}
 end;
 
-function GetSystemProxyUri(const uri, proxy: RawUtf8; var temp: TUri): PUri;
+function GetSystemProxyUri(const uri: TUri; const proxy, bypass: RawUtf8;
+  var temp: TUri): PUri;
 begin
   if IsNone(proxy) or
-     (not temp.From(uri)) or
-     (temp.Address = '') or
-     (not (temp.UriScheme in [usHttp, usHttps])) or
-     IsLocalHost(pointer(temp.Address)) or // no proxy for "127.x.x.x"
+     (uri.Server = '') or
+     (not (uri.UriScheme in HTTP_SCHEME)) or
+     IsLocalHost(pointer(uri.Server)) or   // no proxy for "127.x.x.x"
+     ((bypass <> '') and
+      ProxyByPassMatch(uri.Server, bypass)) or
      (DefaultHttpClientSocketProxyNotForIp4 and
-      NetIsIP4(pointer(temp.Address))) then  // plain "1.2.3.4" IP has no proxy
+      NetIsIP4(pointer(uri.Server))) then  // plain "1.2.3.4" IP has no proxy
     result := nil
   else if (proxy <> '') and
           temp.From(proxy) then
@@ -3757,12 +3826,133 @@ begin
     result := nil;
 end;
 
+function GetSystemProxyUri(const uri, proxy: RawUtf8; var temp: TUri;
+  const bypass: RawUtf8): PUri;
+var
+  u: TUri;
+begin
+  if u.From(uri) then
+    result := GetSystemProxyUri(u, proxy, bypass, temp)
+  else
+    result := nil;
+end;
+
 function GetSystemProxy(const uri: RawUtf8): RawUtf8;
+var
+  u: TUri;
 begin
   if DefaultHttpClientSocketProxy.Server <> '' then
     result := DefaultHttpClientSocketProxy.URI
+  else if u.From(uri) then
+    result := GetProxyForUri(u, DefaultHttpClientSocketProxyAuto)
   else
-    result := GetProxyForUri(uri, DefaultHttpClientSocketProxyAuto);
+    result := '';
+end;
+
+function ProxyMatch(const Text: RawUtf8; Rule: PUtf8Char; RuleLen: PtrInt): boolean;
+var
+  t, r, star, retry: PtrInt;
+begin
+  result := false;
+  t := 1;    // Text[] is 1-indexed
+  r := 0;    // Rule[] is 0-indexed
+  star := 0; // follow r = Rule[] index
+  retry := 0;
+  while t <= length(Text) do
+    if (r < RuleLen) and
+       (Rule[r] = '*') then
+    begin
+      inc(r);
+      star := r;
+      retry := t;
+    end
+    else if (r < RuleLen) and
+            (NormToUpperAnsi7[Text[t]] = NormToUpperAnsi7[Rule[r]]) then
+    begin
+      inc(t);
+      inc(r);
+    end
+    else if star <> 0 then
+    begin
+      r := star;
+      inc(retry);
+      t := retry;
+    end
+    else
+      exit;
+  while (r < RuleLen) and
+        (Rule[r] = '*') do
+    inc(r);
+  result := r >= RuleLen;
+end;
+
+function ProxyByPassMatch(const Host, ByPass: RawUtf8): boolean;
+var
+  rule, p: PUtf8Char;
+  rulelen: PtrInt;
+begin
+  if Host <> '' then
+  begin
+    result := true;
+    p := pointer(ByPass);
+    while p <> nil do
+    begin
+      rulelen := GetNextItemTrimedBuffer(p, ';', rule);
+      if rulelen <> 0 then
+        if PropNameEquals('<local>', pointer(rule), rulelen) then
+        begin
+          if PosExChar('.', Host) = 0 then
+            exit;
+        end
+        else if ProxyMatch(Host, rule, rulelen) then
+          exit;
+    end;
+  end;
+  result := false;
+end;
+
+function NoProxyMatch(const Host, NoProxy: RawUtf8): boolean;
+var
+  rule, p, h: PUtf8Char;
+  rulelen, hostlen: PtrInt;
+  isip: boolean;
+begin
+  hostlen := length(Host);
+  if (hostlen <> 0) and
+     (NoProxy <> '') then
+  begin
+    result := true;
+    h := pointer(Host);
+    isip := NetIsIP4(h) or
+            NetIsIP6(h);
+    p := pointer(NoProxy);
+    while p <> nil do
+    begin
+      rulelen := GetNextItemTrimedBuffer(p, ',', rule);
+      if rulelen = 0 then
+        continue;
+      // '*' means no proxy for anything
+      if (rulelen = 1) and
+         (rule^ = '*') then
+        exit;
+      // '.example.com' is the same as 'example.com'
+      if rule^ = '.' then
+      begin
+        inc(rule);
+        dec(rulelen);
+        if rulelen = 0 then
+          continue;
+      end;
+      if rulelen <= hostlen then
+        if IdemPropNameUSameLenNotNull(h + hostlen - rulelen, rule, rulelen) then
+          if hostlen = rulelen then
+            exit
+          else if not isip and
+                  (Host[hostlen - rulelen] = '.') then
+            exit;
+    end;
+  end;
+  result := false;
 end;
 
 function ExtractResourceName(const uri: RawUtf8; sanitize: boolean): RawUtf8;
@@ -3782,47 +3972,23 @@ end;
 
 { THttpClientSocket }
 
-constructor THttpClientSocket.Create(aTimeOut: integer);
-begin
-  if aTimeOut = 0 then
-    aTimeOut := HTTP_DEFAULT_RECEIVETIMEOUT;
-  fConnectTimeout := aTimeOut;
-  fSendTimeout := aTimeOut;
-  fReceiveTimeout := aTimeOut;
-  if Assigned(OnHttpClientSocketLog) and
-     not Assigned(OnLog) then
-    OnLog := OnHttpClientSocketLog;
-  inherited Create(aTimeOut);
-  if fExtendedOptions.UserAgent = '' then
-    fExtendedOptions.UserAgent := DefaultUserAgent(self);
-  fAccept := '*/*';
-end;
-
 destructor THttpClientSocket.Destroy;
 begin
   fExtendedOptions.Clear;
   inherited Destroy;
 end;
 
-procedure THttpClientSocket.SetSendTimeout(aSendTimeout: integer);
+procedure THttpClientSocket.DoCreate(aTimeOut: integer);
 begin
-  fSendTimeout := aSendTimeout;
-  inherited SetSendTimeout(aSendTimeout);
-end;
-
-procedure THttpClientSocket.SetReceiveTimeout(aReceiveTimeout: integer);
-begin
-  fReceiveTimeout := aReceiveTimeout;
-  inherited SetReceiveTimeout(aReceiveTimeout);
-end;
-
-procedure THttpClientSocket.SetTimeouts(
-  aConnectTimeout, aSendTimeout, aReceiveTimeout: integer);
-begin
-  fConnectTimeout := aConnectTimeout;
-  fTimeOut := aReceiveTimeout;  // higher-level wait used by RequestInternal()
-  SetSendTimeout(aSendTimeout); // virtual calls e.g. for THttpClientWebSockets
-  SetReceiveTimeout(aReceiveTimeout);
+  if aTimeOut = 0 then
+    aTimeOut := HTTP_DEFAULT_RECEIVETIMEOUT;
+  if Assigned(OnHttpClientSocketLog) and
+     not Assigned(OnLog) then
+    OnLog := OnHttpClientSocketLog;
+  inherited DoCreate(aTimeOut);
+  if fExtendedOptions.UserAgent = '' then
+    fExtendedOptions.UserAgent := DefaultUserAgent(self);
+  fAccept := '*/*';
 end;
 
 constructor THttpClientSocket.OpenUri(const aUri: TUri; const aUriFull,
@@ -3831,7 +3997,7 @@ begin
   if not (aUri.UriScheme in [usHttp .. usUdp]) and
      NetClientProtocols.FindAndCopy(aUri.Scheme, fOnProtocolRequest) then
   begin
-    Create(aTimeOut); // no socket involved - but keep Request() logic
+    DoCreate(aTimeOut); // no socket involved - but keep Request() logic
     fOpenUriFull := aUriFull;  // e.g. to call PatchCreateFromUrl() WinAPI
   end
   else
@@ -3840,13 +4006,25 @@ end;
 
 constructor THttpClientSocket.OpenOptions(const aUri: TUri;
   var aOptions: THttpRequestExtendedOptions; const aOnLog: TSynLogProc);
-var
-  temp: TUri;
-  pu: PUri;
+begin
+  DoOpenOptions(aUri, aOptions, aOnLog, nil);
+end;
+
+procedure THttpClientSocket.DoOpenOptions(const aUri: TUri;
+  var aOptions: THttpRequestExtendedOptions; const aOnLog: TSynLogProc;
+  aClient: TCrtSocket);
 begin
   // setup the proper options before any connection
   fExtendedOptions := aOptions;
-  Create(fExtendedOptions.CreateTimeoutMS);
+  DoCreate(fExtendedOptions.CreateTimeoutMS);
+  if aClient <> nil then
+    SetTimeoutsFrom(aClient)
+  else
+  begin
+    fExtendedOptions.ComputeTimeouts;
+    SetTimeouts(fExtendedOptions.ConnectTimeoutMS,
+      fExtendedOptions.SendTimeoutMS, fExtendedOptions.ReceiveTimeoutMS);
+  end;
   if Assigned(aOnLog) then
     OnLog := aOnLog; // allow to debug ASAP
   if fExtendedOptions.Auth.Scheme = wraDigest then
@@ -3855,16 +4033,14 @@ begin
     fAuthDigestAlgo := daMD5_Sess;
   end
   else if fExtendedOptions.Auth.Scheme in wraNegotiates then
-    {$ifdef DOMAINRESTAUTH}
-    fOnAuthorize := OnAuthorizeSspi;     // as AuthorizeSspiUser()
-    {$else}
+    {$ifdef NOKERBEROSCLIENT}
     EHttpSocket.RaiseUtf8('%.Open: unsupported AuthScheme=%',
       [self, ToText(fExtendedOptions.Auth.Scheme)^]);
-    {$endif DOMAINRESTAUTH}
+    {$else}
+    fOnAuthorize := OnAuthorizeSspi;     // as AuthorizeSspiUser()
+    {$endif NOKERBEROSCLIENT}
   TLS := fExtendedOptions.TLS;
-  pu := GetSystemProxyUri(aUri.URI, fExtendedOptions.Proxy, temp);
-  if pu <> nil then
-    Tunnel := pu^;
+  SetTunnelForUri(aUri);
   // actually connect to the server (inlined TCrtSock.Open)
   OpenBind(aUri.Server, aUri.Port, {bind=}false, aUri.Https, aUri.Layer);
   aOptions.TLS := TLS; // copy back Peer information after connection
@@ -3880,70 +4056,86 @@ begin
   u.Server := aClient.Server;
   u.Port:= aClient.Port;
   u.Https := aClient.ServerTls;
-  OpenOptions(u, o, aClient.OnLog);
+  DoOpenOptions(u, o, aClient.OnLog, aClient);
+end;
+
+procedure THttpClientSocket.SetTunnelForUri(const uri: TUri);
+var
+  temp: TUri;
+  proxy: PUri;
+begin
+  Tunnel.Clear;
+  proxy := GetSystemProxyUri(uri, fExtendedOptions.Proxy,
+    fExtendedOptions.ProxyByPass, temp);
+  if proxy <> nil then
+    Tunnel := proxy^;
+end;
+
+function THttpClientSocket.SameTunnelForUri(const uri: TUri;
+  opt: PHttpRequestExtendedOptions): boolean;
+var
+  temp: TUri;
+  proxy: PUri;
+begin
+  proxy := GetSystemProxyUri(uri, opt^.Proxy, opt^.ProxyByPass, temp);
+  if proxy = nil then
+    result := Tunnel.Server = ''
+  else
+    result := proxy^.Same(Tunnel.Server, Tunnel.Port, Tunnel.Https) and
+              (proxy^.User = Tunnel.User) and // proxy credential matters
+              (proxy^.Password = Tunnel.Password);
 end;
 
 function THttpClientSocket.SameOpenOptions(const aUri: TUri;
   const aOptions: THttpRequestExtendedOptions): boolean;
-var
-  tun: TUri;
 begin
   result := (aUri.UriScheme in HTTP_SCHEME) and
             aUri.Same(Server, Port, ServerTls) and
             SameNetTlsContext(TLS, aOptions.TLS) and
-            fExtendedOptions.SameAuth(@aOptions.Auth);
-  if result then
-    if tun.From(aOptions.Proxy) then
-      result := tun.Same(Tunnel.Server, Tunnel.Port, Tunnel.Https)
-    else
-      result := (Tunnel.Server = '');
+            fExtendedOptions.SameAuth(@aOptions) and
+            SameTunnelForUri(aUri, @aOptions);
 end;
 
 procedure THttpClientSocket.OpenBind(const aServer, aPort: RawUtf8; doBind,
   aTLS: boolean; aLayer: TNetLayer; aSock: TNetSocket; aReusePort: boolean);
 var
   bak: TUri;
-  backup: integer;
+  port: RawUtf8;
 begin
   if doBind then
     EHttpSocket.RaiseUtf8('%.OpenBind with doBind=true', [self]);
-  backup := fTimeOut;
-  try
-    fTimeOut := fConnectTimeout;
-    fProxyAuthHeader := '';
-    if (not aTLS) and // proxy to https:// destination requires CONNECT
-       (Tunnel.Server <> '') and
-       (Tunnel.Server <> aServer) then
-    begin
-      // plain http:// proxy is implemented in RequestSendHeader not via CONNECT
-      bak := Tunnel;
-      try
-        Tunnel.Clear; // no CONNECT
-        inherited OpenBind(bak.Server, bak.Port, false, bak.Https, bak.Layer);
-        fProxyUrl := bak.URI;
-        if bak.User <> '' then
-          Join(['Proxy-Authorization: Basic ', bak.UserPasswordBase64], fProxyAuthHeader);
-        fSocketLayer := aLayer;
-        include(fFlags, fProxyHttp);
-        if Assigned(OnLog) then
-          OnLog(sllTrace, 'Open(%:%) via proxy %', [aServer, aPort, fProxyUrl], self);
-      finally
-        // always restore server and tunnel params for proper retry
-        fServer := aServer;
-        fPort := aPort; // good enough to keep '' for default port 80
-        exclude(fFlags, fServerTlsEnabled); // any TLS was about the proxy
-        Tunnel := bak;
-      end;
-    end
-    else
-      // regular socket creation if no proxy or toward https://
-      inherited OpenBind(aServer, aPort, {doBind=}false, aTLS, aLayer);
-    // now apply each proper timeout value
-    inherited SetSendTimeout(fSendTimeout);
-    inherited SetReceiveTimeout(fReceiveTimeout);
-  finally
-    fTimeOut := backup;
-  end;
+  fProxyAuthHeader := '';
+  port := aPort;
+  if (port = '') and
+     (aLayer <> nlUnix) then
+    port := DEFAULT_PORT[aTLS];
+  if (not aTLS) and // proxy to https:// destination requires CONNECT
+     (Tunnel.Server <> '') and
+     not Tunnel.Same(aServer, port, Tunnel.Https) then
+  begin
+    // plain http:// proxy is implemented in RequestSendHeader not via CONNECT
+    bak := Tunnel;
+    try
+      Tunnel.Clear; // no CONNECT
+      inherited OpenBind(bak.Server, bak.Port, false, bak.Https, bak.Layer);
+      fProxyUrl := bak.URI;
+      if bak.User <> '' then
+        Join(['Proxy-Authorization: Basic ', bak.UserPasswordBase64], fProxyAuthHeader);
+      fSocketLayer := aLayer;
+      include(fFlags, fProxyHttp);
+      if Assigned(OnLog) then
+        OnLog(sllTrace, 'Open(%:%) via proxy %', [aServer, aPort, fProxyUrl], self);
+    finally
+      // always restore server and tunnel params for proper retry
+      fServer := aServer;
+      fPort := aPort; // good enough to keep '' for default port 80
+      exclude(fFlags, fServerTlsEnabled); // any TLS was about the proxy
+      Tunnel := bak;
+    end;
+  end
+  else
+    // regular socket creation if no proxy or toward https://
+    inherited OpenBind(aServer, aPort, {doBind=}false, aTLS, aLayer);
 end;
 
 function THttpClientSocket.RegisterCompress(aFunction: THttpSocketCompress;
@@ -3977,7 +4169,7 @@ procedure THttpClientSocket.RequestInternal(var ctxt: THttpClientRequest);
       try
         // recreate the connection and try again - like TCrtSocket.ReOpen()
         Close;
-        OpenBind(fServer, fPort, {bind=}false, ServerTls);
+        OpenBind(fServer, fPort, {bind=}false, ServerTls, fSocketLayer);
         HttpStateReset;
         include(ctxt.Retry, rMain);
         fLastRequestTix := 0;
@@ -4049,6 +4241,7 @@ begin
         // that its Size is known when Content-Length: is computed below
         ctxt.InStream.Seek(0, soBeginning); // rewind
       if (dat <> '') or
+         (ctxt.InStream <> nil) or
          (not IsGet(ctxt.Method) and // no message body len/type for GET/HEAD
           not IsHead(ctxt.Method)) then
         CompressDataAndWriteHeaders(ctxt.DataMimeType, dat, ctxt.InStream);
@@ -4076,7 +4269,7 @@ begin
         end;
       end;
       // wait for the HTTP response
-      pending := SockReceivePending(Timeout, @loerr); // select/poll
+      pending := SockReceivePending(ReceiveTimeout, @loerr); // select/poll
       case pending of
         cspDataAvailable:
           ; // ok
@@ -4097,13 +4290,13 @@ begin
           begin
             include(Http.HeaderFlags, hfConnectionClose);
             DoRetry('NoData waiting %ms for headers with peer=%',
-              [TimeOut, SockConnected]); // always retry
+              [ReceiveTimeout, SockConnected]); // always retry
             exit;
           end;
       else // cspSocketError, cspSocketClosed
         begin
           DoRetry('% % waiting %ms for headers',
-            [ToText(pending)^, NetErrorText(loerr), TimeOut]);
+            [ToText(pending)^, NetErrorText(loerr), ReceiveTimeout]);
           exit;
         end;
       end;
@@ -4128,7 +4321,7 @@ begin
       begin
         // error on reading answer -> 505=wrong format
         if Http.CommandResp = '' then
-          DoRetry('Broken Link - timeout=%ms', [TimeOut])
+          DoRetry('Broken Link - timeout=%ms', [ReceiveTimeout])
         else
           DoRetry('Command=%', [Http.CommandResp], HTTP_HTTPVERSIONNONSUPPORTED);
         exit;
@@ -4146,8 +4339,7 @@ begin
            (ctxt.Status <> HTTP_NOTMODIFIED)) or
           (Http.ContentLength > 0) or // server bug of 204,304 with body
           (hfTransferChunked in Http.HeaderFlags)) and
-         // HEAD/OPTIONS
-         not HttpMethodWithNoBody(ctxt.Method) then
+         not IsHead(ctxt.Method) then // HEAD has no body
       begin
         // specific TStreamRedirect expectations
         bodystream := ctxt.OutStream;
@@ -4367,13 +4559,18 @@ begin
       u := ctxt.Url;
       ctxt.Url := Http.HeaderGetValue('LOCATION');
       AppendLine(fRequestContext, [ctxt.Status, ' into ', ctxt.Url]);
-      case ctxt.Status of
-        // https://developer.mozilla.org/en-US/docs/Web/HTTP/Redirections
-        HTTP_MOVEDPERMANENTLY,
-        HTTP_SEEOTHER:
-          if not HttpMethodWithNoBody(Ctxt.Method) then // keep HEAD/OPTIONS
-            ctxt.Method := 'GET';        // but force e.g. POST/PUT into GET
-        // HTTP_TEMPORARYREDIRECT HTTP_PERMANENTREDIRECT should keep the method
+      if ((ctxt.Status = HTTP_MOVEDPERMANENTLY) and
+          IsPost(ctxt.Method)) or
+          // historically allowed POST -> GET conversion for 301
+         ((ctxt.Status = HTTP_SEEOTHER) and
+          not IsHead(ctxt.Method)) then
+          // 303 redirects to a GET request, but keep HEAD
+      begin
+        ctxt.Method := 'GET'; // with no body
+        ctxt.Data := '';
+        ctxt.DataMimeType := '';
+        ctxt.InStream := nil;
+        // HTTP_TEMPORARYREDIRECT and HTTP_PERMANENTREDIRECT preserve the method
       end;
       if (OutStream <> nil) and
          // TStreamRedirect would have set bodystream := nil in RequestInternal
@@ -4393,6 +4590,12 @@ begin
       // apply all RFC 3986 Location: relative/absolute changes
       if not newUri.FromLocation(u, Server, Port, ServerTls, ctxt.Url) then
         break;                              // invalid Location: header
+      if not (newUri.UriScheme in HTTP_SCHEME) then
+      begin
+        AppendLine(fRequestContext,
+          ['Reject redirect into ', newuri.Scheme]);
+        break; // preserve original 3xx status and Location:
+      end;
       if (hroRejectUserInfo in ctxt.RedirectOptions) and
          ((newuri.User <> '') or
           (newuri.Password <> '')) then
@@ -4441,13 +4644,18 @@ begin
       fRedirected := u;
       inc(ctxt.Redirected);
       if crossorigin or
+         (not SameTunnelForUri(newuri, @fExtendedOptions)) or
          (hfConnectionClose in Http.HeaderFlags) or
          (hroForceReconnect in ctxt.RedirectOptions) then
       begin
-        Close; // relocated to another server -> reset the TCP connection
         try
+          // relocated to another server -> reset the TCP connection
+          Close;
           AppendLine(fRequestContext, ['ReOpen ', newuri.URI]);
+          // will proper reuse the timeouts and the proxy of this new URI 
+          SetTunnelForUri(newuri);
           OpenBind(newuri.Server, newuri.Port, {bind=}false, newuri.Https);
+          // ignore newuri.Layer(=nlTcp after HTTP_SCHEME check above)
         except
           on E: Exception do
           begin
@@ -4869,7 +5077,7 @@ begin
   result := true;
 end;
 
-{$ifdef DOMAINRESTAUTH}
+{$ifndef NOKERBEROSCLIENT}
 
 procedure KerberosChannelBinding(const Tls: INetTls; var SecContext: TSecContext;
   var Temp: THash512Rec);
@@ -4885,6 +5093,45 @@ begin
   SecContext.ChannelBindingsHashLen := HashForChannelBinding(cert, hasher, Temp);
   if SecContext.ChannelBindingsHashLen <> 0 then
       SecContext.ChannelBindingsHash := @Temp;
+end;
+
+function KerberosServerAuthHeader(const InputHeaders: RawUtf8;
+  InputAuth: PUtf8Char; AuthUser: PRawUtf8): RawUtf8;
+var
+  authend: PUtf8Char;
+  bin, bout: RawByteString;
+  ctx: TSecContext;
+begin
+  FastAssignNew(result);
+  if AuthUser <> nil then
+    AuthUser^ := '';
+  // locate and parse 'Authorization: Negotiate <base64>'
+  if InputAuth = nil then
+    InputAuth := FindNameValue(pointer(InputHeaders), 'AUTHORIZATION: NEGOTIATE ');
+  if (InputAuth = nil) or
+     not InitializeDomainAuth then
+    exit;
+  authend := PosChar(InputAuth, #13);
+  if (authend = nil) or
+     not Base64ToBin(PAnsiChar(InputAuth), authend - InputAuth, bin) or
+     ServerSspiDataNtlm(bin) then
+    exit;
+  // make the actual authentication using SSPI or GSSAPI
+  InvalidateSecContext(ctx);
+  try
+    if ServerSspiAuth(ctx, bin, bout) then // may raise ESynSspi/EGssApi
+      exit; // only a single roundtrip is supported yet
+    {$ifdef OSWINDOWS} // explicit NTLM rejection is needed on Windows
+    if not PropNameEquals(SecPackageName(ctx), 'Kerberos') then
+      exit;
+    {$endif OSWINDOWS}
+    if AuthUser <> nil then
+      ServerSspiAuthUser(ctx, AuthUser^); // retrieve the authenticated identity
+    // return the token generated by GSSAPI/SSPI as an HTTP response header
+    result := BinToBase64(bout, SECPKGNAMEHTTPWWWAUTHENTICATE, '', false);
+  finally
+    FreeSecContext(ctx);
+  end;
 end;
 
 // see https://developer.mozilla.org/en-US/docs/Web/HTTP/Authentication
@@ -4996,11 +5243,11 @@ begin
   result := false; // final RequestInternal() was done within DoSspi()
 end;
 
-{$endif DOMAINRESTAUTH}
+{$endif NOKERBEROSCLIENT}
 
 function OpenHttp(const aServer, aPort: RawUtf8; aTLS: boolean;
-  aLayer: TNetLayer; const aUrlForProxy: RawUtf8;
-  aTimeout: integer; aTLSContext: PNetTlsContext): THttpClientSocket;
+  aLayer: TNetLayer; const aUrlForProxy: RawUtf8; aTimeout: integer;
+  aTLSContext: PNetTlsContext): THttpClientSocket;
 var
   temp: TUri;
 begin
@@ -5015,15 +5262,14 @@ end;
 
 function OpenHttp(const aUri: RawUtf8; aAddress: PRawUtf8): THttpClientSocket;
 var
-  URI: TUri;
+  u: TUri;
 begin
   result := nil;
-  if URI.From(aUri) then
-  begin
-    result := OpenHttp(URI.Server, URI.Port, URI.Https, URI.Layer);
-    if aAddress <> nil then
-      aAddress^ := URI.Address;
-  end;
+  if not u.From(aUri) then
+    exit;
+  result := OpenHttp(u.Server, u.Port, u.Https, u.Layer, aUri);
+  if aAddress <> nil then
+    aAddress^ := u.Address;
 end;
 
 function DoHttpGet(http: THttpClientSocket; const url, inHeaders: RawUtf8;
@@ -5081,6 +5327,28 @@ begin
   FillZero(Auth.Password);
   FillZero(Auth.Token);
   Init;
+end;
+
+procedure THttpRequestExtendedOptions.ComputeTimeouts;
+var
+  def: integer;
+begin
+  def := CreateTimeoutMS;
+  if ConnectTimeoutMS <= 0 then
+    if def = 0 then
+      ConnectTimeoutMS := HTTP_DEFAULT_CONNECTTIMEOUT
+    else
+      ConnectTimeoutMS := def;
+  if SendTimeoutMS <= 0 then
+    if def = 0 then
+      SendTimeoutMS := HTTP_DEFAULT_SENDTIMEOUT
+    else
+      SendTimeoutMS := def;
+  if ReceiveTimeoutMS <= 0 then
+    if def = 0 then
+      ReceiveTimeoutMS := HTTP_DEFAULT_RECEIVETIMEOUT
+    else
+      ReceiveTimeoutMS := def;
 end;
 
 procedure THttpRequestExtendedOptions.AuthorizeUserPassword(
@@ -5149,10 +5417,16 @@ begin
   result := SaveNetTlsContext(TLS, Secret);
   v.AddNameValuesToObject([
     'p',  Proxy,
+    'pb', ProxyByPass,
     'as', ord(Auth.Scheme),
     'au', Auth.UserName,
     'ap', Auth.Password,
-    'at', Auth.Token], {dontAddDefault=}true);
+    'at', Auth.Token,
+    'tm', CreateTimeoutMS,
+    'tc', ConnectTimeoutMS,
+    'ts', SendTimeoutMS,
+    'tr', ReceiveTimeoutMS], {dontAddDefault=}true);
+  // other fields (e.g. about Retry) are request-specific not per connection
   if v.Count = 0 then
     v.Clear;
 end;
@@ -5176,12 +5450,17 @@ begin
     exit;
   LoadNetTlsContext(TLS, v^, Secret);
   v^.GetAsRawUtf8('p', Proxy);
+  v^.GetAsRawUtf8('pb', ProxyByPass);
   if v^.GetAsInteger('as', s) and
      (cardinal(s) <= cardinal(high(Auth.Scheme))) then
     Auth.Scheme := THttpRequestAuthentication(s);
   v^.GetAsRawUtf8('au', Auth.UserName);
   v^.GetAsRawUtf8('ap', RawUtf8(Auth.Password));
   v^.GetAsRawUtf8('at', RawUtf8(Auth.Token));
+  v^.GetAsInteger('tm', CreateTimeoutMS);
+  v^.GetAsInteger('tc', ConnectTimeoutMS);
+  v^.GetAsInteger('ts', SendTimeoutMS);
+  v^.GetAsInteger('tr', ReceiveTimeoutMS);
 end;
 
 function THttpRequestExtendedOptions.InitFromUrl(const UrlParams: RawUtf8;
@@ -5279,37 +5558,37 @@ begin
     end;
 end;
 
+procedure THttpRequest.DoInternalConnect(const aServer, aPort: RawUtf8;
+  aHttps: boolean; aLayer: TNetLayer);
+begin
+  fLayer := aLayer;
+  fServer := aServer;
+  fHttps := aHttps;
+  fPort := GetCardinal(pointer(aPort));
+  if fLayer <> nlUnix then
+    if fPort = 0 then
+      if fHttps then
+        fPort := 443
+      else
+        fPort := 80;
+  if fExtendedOptions.UserAgent = '' then
+    fExtendedOptions.UserAgent := DefaultUserAgent(self);
+  fExtendedOptions.ComputeTimeouts;
+  InternalConnect;
+end;
+
 constructor THttpRequest.Create(const aServer, aPort: RawUtf8; aHttps: boolean;
   const aProxyName, aProxyByPass: RawUtf8;
   ConnectionTimeOut, SendTimeout, ReceiveTimeout: cardinal;
   aLayer: TNetLayer; const aUserAgent: RawUtf8);
 begin
-  fLayer := aLayer;
-  if fLayer <> nlUnix then
-  begin
-    fPort := GetCardinal(pointer(aPort));
-    if fPort = 0 then
-      if aHttps then
-        fPort := 443
-      else
-        fPort := 80;
-  end;
-  fServer := aServer;
-  fHttps := aHttps;
-  fProxyName := aProxyName;
-  fProxyByPass := aProxyByPass;
-  if fExtendedOptions.UserAgent = '' then
-    if aUserAgent <> '' then
-      fExtendedOptions.UserAgent := aUserAgent
-    else
-      fExtendedOptions.UserAgent := DefaultUserAgent(self);
-  if ConnectionTimeOut = 0 then
-    ConnectionTimeOut := HTTP_DEFAULT_CONNECTTIMEOUT;
-  if SendTimeout = 0 then
-    SendTimeout := HTTP_DEFAULT_SENDTIMEOUT;
-  if ReceiveTimeout = 0 then
-    ReceiveTimeout := HTTP_DEFAULT_RECEIVETIMEOUT;
-  InternalConnect(ConnectionTimeOut, SendTimeout, ReceiveTimeout); // raise exception on error
+  fExtendedOptions.Proxy := aProxyName;
+  fExtendedOptions.ProxyByPass := aProxyByPass;
+  fExtendedOptions.ConnectTimeoutMS := ConnectionTimeOut;
+  fExtendedOptions.SendTimeoutMS    := SendTimeout;
+  fExtendedOptions.ReceiveTimeoutMS := ReceiveTimeout;
+  fExtendedOptions.UserAgent := aUserAgent;
+  DoInternalConnect(aServer, aPort, aHttps, aLayer); // raise exception on error
 end;
 
 constructor THttpRequest.Create(const aUri, aProxyName, aProxyByPass: RawUtf8;
@@ -5320,7 +5599,7 @@ var
 begin
   if not uri.From(aUri) then
     EHttpSocket.RaiseUtf8('%.Create: invalid url=%', [self, aUri]);
-  IgnoreTlsCertificateErrors := aIgnoreTlsCertificateErrors;
+  fExtendedOptions.Tls.IgnoreCertificateErrors := aIgnoreTlsCertificateErrors;
   Create(uri.Server, uri.Port, uri.Https, aProxyName, aProxyByPass,
     ConnectionTimeOut, SendTimeout, ReceiveTimeout, uri.Layer);
 end;
@@ -5330,9 +5609,7 @@ constructor THttpRequest.Create(
 begin
   if aOptions <> nil then
     fExtendedOptions := aOptions^; // to be set before Create=InternalConnect
-  Create(aUri.Server, aUri.Port, aUri.Https, fExtendedOptions.Proxy, {bypass=}'',
-    fExtendedOptions.CreateTimeoutMS, fExtendedOptions.CreateTimeoutMS,
-    fExtendedOptions.CreateTimeoutMS, aUri.Layer);
+  DoInternalConnect(aUri.Server, aUri.Port, aUri.Https, aUri.Layer);
 end;
 
 destructor THttpRequest.Destroy;
@@ -5476,6 +5753,22 @@ end;
 
 { ******************** TWinHttp TWinINet classes }
 
+procedure RemoveHeadInHeaders(var Header: RawUtf8);
+var
+  i: PtrInt;
+begin
+  // trim leading 'HTTP/1.1 200 OK'#$D#$A - needed for WinINet/WinHttp + curl
+  TrimSelf(Header);
+  if not IdemPChar(pointer(Header), 'HTTP/') then
+    exit;
+  i := PosEx(#13#10, Header); // end of line
+  if i = 0 then
+    Header := ''
+  else
+    Delete(Header, 1, i + 1);
+end;
+
+
 {$ifdef USEWININET}
 
 { TWinHttpApi }
@@ -5489,6 +5782,7 @@ begin
   // HTTP_QUERY* and WINHTTP_QUERY* do match -> common to TWinINet + TWinHttp
   result         := InternalGetInfo32(HTTP_QUERY_STATUS_CODE);
   Header         := InternalGetInfo(HTTP_QUERY_RAW_HEADERS_CRLF);
+  RemoveHeadInHeaders(Header); // trim 'HTTP/1.1 200 OK' first line
   Encoding       := InternalGetInfo(HTTP_QUERY_CONTENT_ENCODING);
   AcceptEncoding := InternalGetInfo(HTTP_QUERY_ACCEPT_ENCODING);
   // retrieve received content (if any)
@@ -5578,14 +5872,16 @@ begin
   // WINHTTP_FLAG_SECURE_PROTOCOL_SSL2 and WINHTTP_FLAG_SECURE_PROTOCOL_SSL3
   // are unsafe, disabled at Windows level, therefore never supplied
   result := WINHTTP_FLAG_SECURE_PROTOCOL_TLS1;
-  // Windows 7 and newer support TLS 1.1 & 1.2
-  if OSVersion >= wSeven then
+  if OSVersion >= wSeven then // Windows 7 and newer support TLS 1.1 & 1.2
     result := result or
               WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_1 or
               WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
+  if wsTls13 in WindowsSpecs then // Windows 11 or Server 2022
+    result := result or
+              WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3;
 end;
 
-procedure TWinHttp.InternalConnect(ConnectionTimeOut, SendTimeout, ReceiveTimeout: cardinal);
+procedure TWinHttp.InternalConnect;
 var
   Callback: WINHTTP_STATUS_CALLBACK;
   CallbackRes: PtrInt absolute Callback; // for FPC compatibility
@@ -5594,9 +5890,9 @@ var
 begin
   WinHttpApiInitialize;
   Utf8ToSynUnicode(fExtendedOptions.UserAgent, ua);
-  if IsNone(fProxyName) then
+  if IsNone(fExtendedOptions.Proxy) then
     access := WINHTTP_ACCESS_TYPE_NO_PROXY
-  else if fProxyName = '' then
+  else if fExtendedOptions.Proxy = '' then
     if (OSVersion >= wEightOne) or
        WinHttpForceProxyDetection then
       access := WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY // Windows 8.1 and newer
@@ -5606,8 +5902,8 @@ begin
     access := WINHTTP_ACCESS_TYPE_NAMED_PROXY;
   if access <> WINHTTP_ACCESS_TYPE_NO_PROXY then
   begin
-    Utf8ToSynUnicode(fProxyName, pn);
-    Utf8ToSynUnicode(fProxyByPass, pb);
+    Utf8ToSynUnicode(fExtendedOptions.Proxy, pn);
+    Utf8ToSynUnicode(fExtendedOptions.ProxyByPass, pb);
   end;
   fSession := WinHttpApi.Open(pointer(ua), access, pointer(pn), pointer(pb), 0);
   if (fSession = nil) and
@@ -5625,7 +5921,8 @@ begin
     RaiseFromLastError('Open');
   // cf. http://msdn.microsoft.com/en-us/library/windows/desktop/aa384116
   if not WinHttpApi.SetTimeouts(fSession, HTTP_DEFAULT_RESOLVETIMEOUT,
-     ConnectionTimeOut, SendTimeout, ReceiveTimeout) then
+     fExtendedOptions.ConnectTimeoutMS, fExtendedOptions.SendTimeoutMS,
+     fExtendedOptions.ReceiveTimeoutMS) then
     RaiseFromLastError('SetTimeouts');
   if fHttps or
      (fExtendedOptions.RedirectMax > 0) then // may redirect from http to https
@@ -5680,10 +5977,14 @@ begin
 end;
 
 procedure TWinHttp.InternalAddHeader(const hdr: RawUtf8);
+var
+  w: SynUnicode;
 begin
-  if (hdr <> '') and
-     not WinHttpApi.AddRequestHeaders(FRequest,
-     pointer(Utf8ToSynUnicode(hdr)), length(hdr), WINHTTP_ADDREQ_FLAG_COALESCE) then
+  if hdr = '' then
+    exit;
+  Utf8ToSynUnicode(hdr, w);
+  if not WinHttpApi.AddRequestHeaders(FRequest,
+     pointer(w), length(w), WINHTTP_ADDREQ_FLAG_COALESCE) then
     RaiseFromLastError('AddRequestHeaders');
 end;
 
@@ -5728,7 +6029,7 @@ procedure TWinHttp.InternalSendRequest(const aMethod: RawUtf8;
 
 var
   L: integer;
-  winAuth: cardinal;
+  policy, winAuth: cardinal;
   usr, pwd: SynUnicode;
 begin
   if AuthScheme <> wraNone then
@@ -5765,10 +6066,17 @@ begin
          @SECURITY_FLAG_IGNORE_CERTIFICATES, SizeOf(cardinal)) then
         RaiseFromLastError('SetOption(ignorecert)');
   if fExtendedOptions.RedirectMax > 0 then
-    if WinHttpApi.SetOption(fRequest, WINHTTP_OPTION_REDIRECT_POLICY,
-         @REDIRECT_POLICY_ALWAYS, SizeOf(cardinal)) then
-      WinHttpApi.SetOption(fRequest, WINHTTP_OPTION_MAX_HTTP_AUTOMATIC_REDIRECTS,
-        @fExtendedOptions.RedirectMax, SizeOf(cardinal)); // ignore errors
+    policy := WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP
+  else
+    policy := WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
+  if not WinHttpApi.SetOption(fRequest, WINHTTP_OPTION_REDIRECT_POLICY,
+      @policy, SizeOf(policy)) then
+    RaiseFromLastError('SetOption(redirectpolicy)');
+  if fExtendedOptions.RedirectMax > 0 then
+    if not WinHttpApi.SetOption(fRequest,
+        WINHTTP_OPTION_MAX_HTTP_AUTOMATIC_REDIRECTS,
+        @fExtendedOptions.RedirectMax, SizeOf(fExtendedOptions.RedirectMax)) then
+      RaiseFromLastError('SetOption(redirectmax)');
   L := length(aData);
   if _SendRequest(L) and
      WinHttpApi.ReceiveResponse(fRequest, nil) then
@@ -5876,27 +6184,32 @@ begin
   raise E;
 end;
 
-procedure TWinINet.InternalConnect(
-  ConnectionTimeOut, SendTimeout, ReceiveTimeout: cardinal);
+procedure TWinINet.InternalConnect;
 var
   OpenType: integer;
+  ua, pn, pb: SynUnicode;
 begin
-  if IsNone(fProxyName) then
+  if IsNone(fExtendedOptions.Proxy) then
     OpenType := INTERNET_OPEN_TYPE_DIRECT
-  else if fProxyName = '' then
+  else if fExtendedOptions.Proxy = '' then
     OpenType := INTERNET_OPEN_TYPE_PRECONFIG
   else
     OpenType := INTERNET_OPEN_TYPE_PROXY;
-  fSession := InternetOpenA(pointer(fExtendedOptions.UserAgent), OpenType,
-    pointer(fProxyName), pointer(fProxyByPass), 0);
+  Utf8ToSynUnicode(fExtendedOptions.UserAgent, ua);
+  Utf8ToSynUnicode(fExtendedOptions.Proxy, pn);
+  Utf8ToSynUnicode(fExtendedOptions.ProxyByPass, pb);
+  fSession := InternetOpenW(pointer(ua), OpenType, pointer(pn), pointer(pb), 0);
   if fSession = nil then
     RaiseFromLastError('Open');
-  InternetSetOption(fConnection, INTERNET_OPTION_CONNECT_TIMEOUT,
-    @ConnectionTimeOut, SizeOf(ConnectionTimeOut));
-  InternetSetOption(fConnection, INTERNET_OPTION_SEND_TIMEOUT,
-    @SendTimeout, SizeOf(SendTimeout));
-  InternetSetOption(fConnection, INTERNET_OPTION_RECEIVE_TIMEOUT,
-    @ReceiveTimeout, SizeOf(ReceiveTimeout));
+  if not InternetSetOption(fSession, INTERNET_OPTION_CONNECT_TIMEOUT,
+     @fExtendedOptions.ConnectTimeoutMS, SizeOf(fExtendedOptions.ConnectTimeoutMS)) then
+    RaiseFromLastError('SetConnectTimeout');
+  if not InternetSetOption(fSession, INTERNET_OPTION_SEND_TIMEOUT,
+     @fExtendedOptions.SendTimeoutMS, SizeOf(fExtendedOptions.SendTimeoutMS)) then
+    RaiseFromLastError('SetSendTimeout');
+  if not InternetSetOption(fSession, INTERNET_OPTION_RECEIVE_TIMEOUT,
+     @fExtendedOptions.ReceiveTimeoutMS, SizeOf(fExtendedOptions.ReceiveTimeoutMS)) then
+    RaiseFromLastError('SetReceiveTimeout');
   fConnection := InternetConnectA(fSession, pointer(fServer), fPort,
     nil, nil, INTERNET_SERVICE_HTTP, 0, 0);
   if fConnection = nil then
@@ -6057,19 +6370,20 @@ end;
 
 { TCurlHttp }
 
-procedure TCurlHttp.InternalConnect(
-  ConnectionTimeOut, SendTimeout, ReceiveTimeout: cardinal);
+procedure TCurlHttp.InternalConnect;
+var
+  ms: integer;
 begin
   if not IsAvailable then
     raise ECurlHttp.CreateFmt('No available %s', [LIBCURL_DLL]);
   fHandle := curl.easy_init;
   if curl.globalShare <> nil then
     curl.easy_setopt(fHandle, coShare, curl.globalShare);
-  curl.easy_setopt(fHandle, coConnectTimeoutMs, ConnectionTimeOut); // default=300 !
-  if SendTimeout < ReceiveTimeout then
-    SendTimeout := ReceiveTimeout;
-  if SendTimeout <> 0 then // prevent send+receive forever
-    curl.easy_setopt(fHandle, coTimeoutMs, SendTimeout);
+  curl.easy_setopt(fHandle, coConnectTimeoutMs,
+    fExtendedOptions.ConnectTimeOutMS); // default=300 !
+  ms := MaxPtrInt(fExtendedOptions.ReceiveTimeoutMS, fExtendedOptions.SendTimeoutMS);
+  if ms <> 0 then // prevent send+receive forever
+    curl.easy_setopt(fHandle, coTimeoutMs, ms);
   // coTimeout=CURLOPT_TIMEOUT is global for the transfer, so shouldn't be used
   if fLayer = nlUnix then
     // see CURLOPT_UNIX_SOCKET_PATH doc
@@ -6104,20 +6418,38 @@ begin
   fTls.PassPhrase := aPassPhrase;
 end;
 
+function CurlWriteLastResponseHeader(buffer: PAnsiChar; size, nitems: PtrUInt;
+  opaque: pointer): PtrUInt; cdecl;
+var
+  headers: PRawByteString absolute opaque;
+begin
+  if (headers <> nil) and
+     (size * nitems >= 5) then
+    if IdemPChar(pointer(buffer), 'HTTP/') then
+      // a new HTTP response starts (e.g. redirect): discard previous headers
+      headers^ := '';
+  result := CurlWriteRawByteString(buffer, size, nitems, opaque);
+end;
+
 procedure TCurlHttp.InternalCreateRequest(const aMethod, aUrl: RawUtf8);
 const
   CERT_PEM: RawUtf8 = 'PEM';
+  NO_PROXY: AnsiChar = #0; // non-nil pointer to an empty C string
 begin
   fIn.URL := Join([fRootURL, aUrl]);
-  if fExtendedOptions.RedirectMax > 0 then // url redirection (as TWinHttp)
-    curl.easy_setopt(fHandle, coFollowLocation, 1);
+  curl.easy_setopt(fHandle, coFollowLocation,
+    ord(fExtendedOptions.RedirectMax > 0));
+  if fExtendedOptions.RedirectMax > 0 then
+    curl.easy_setopt(fHandle, coMaxRedirs, fExtendedOptions.RedirectMax);
   //curl.easy_setopt(fHandle,coTCPNoDelay,0); // disable Nagle
   if fLayer = nlUnix then
     curl.easy_setopt(fHandle, coUnixSocketPath, pointer(fServer));
   curl.easy_setopt(fHandle, coURL, pointer(fIn.URL));
-  if (fProxyName <> '') and
-     not IsNone(fProxyName) then
-    curl.easy_setopt(fHandle, coProxy, pointer(fProxyName));
+  if fExtendedOptions.Proxy <> '' then              // '' will use default proxy
+    if IsNone(fExtendedOptions.Proxy) then
+      curl.easy_setopt(fHandle, coProxy, @NO_PROXY) // disable proxies
+    else
+      curl.easy_setopt(fHandle, coProxy, pointer(fExtendedOptions.Proxy));
   if fHttps or
      (fExtendedOptions.RedirectMax > 0) then // may redirect from http to https
     // see https://curl.haxx.se/libcurl/c/simplessl.html
@@ -6128,22 +6460,27 @@ begin
       //curl.easy_setopt(fHandle,coProxySSLVerifyPeer,0);
       //curl.easy_setopt(fHandle,coProxySSLVerifyHost,0);
     end
-    else if fTls.CertFile <> '' then
+    else
     begin
-      curl.easy_setopt(fHandle, coSSLCertType, pointer(CERT_PEM));
-      curl.easy_setopt(fHandle, coSSLCert, pointer(fTls.CertFile));
-      if fTls.PassPhrase <> '' then
-        curl.easy_setopt(fHandle, coSSLCertPasswd, pointer(fTls.PassPhrase));
-      curl.easy_setopt(fHandle, coSSLKeyType, nil);
-      curl.easy_setopt(fHandle, coSSLKey, pointer(fTls.KeyName));
-      curl.easy_setopt(fHandle, coCAInfo, pointer(fTls.CACertFile));
       curl.easy_setopt(fHandle, coSSLVerifyPeer, 1);
-    end
-    else if fTls.CACertFile <> '' then
-      curl.easy_setopt(fHandle, coCAInfo, pointer(fTls.CACertFile));
+      curl.easy_setopt(fHandle, coSSLVerifyHost, 2);
+      if fTls.CertFile <> '' then
+      begin
+        curl.easy_setopt(fHandle, coSSLCertType, pointer(CERT_PEM));
+        curl.easy_setopt(fHandle, coSSLCert, pointer(fTls.CertFile));
+        if fTls.PassPhrase <> '' then
+          curl.easy_setopt(fHandle, coSSLCertPasswd, pointer(fTls.PassPhrase));
+        curl.easy_setopt(fHandle, coSSLKeyType, nil);
+        curl.easy_setopt(fHandle, coSSLKey, pointer(fTls.KeyName));
+        curl.easy_setopt(fHandle, coCAInfo, pointer(fTls.CACertFile));
+        curl.easy_setopt(fHandle, coSSLVerifyPeer, 1);
+      end
+      else if fTls.CACertFile <> '' then
+        curl.easy_setopt(fHandle, coCAInfo, pointer(fTls.CACertFile));
+    end;
   curl.easy_setopt(fHandle, coUserAgent, pointer(fExtendedOptions.UserAgent));
   curl.easy_setopt(fHandle, coWriteFunction, @CurlWriteRawByteString);
-  curl.easy_setopt(fHandle, coHeaderFunction, @CurlWriteRawByteString);
+  curl.easy_setopt(fHandle, coHeaderFunction, @CurlWriteLastResponseHeader);
   fIn.Method := UpperCase(aMethod);
   if fIn.Method = '' then
     fIn.Method := 'GET';
@@ -6191,10 +6528,10 @@ begin
   curl.easy_setopt(fHandle, coUserName, pointer(AuthUserName));
   curl.easy_setopt(fHandle, coPassword, pointer(AuthPassword));
   curl.easy_setopt(fHandle, coXOAuth2Bearer, pointer(AuthToken));
-  curl.easy_setopt(fHandle, coHttpAuth, integer(WRA2CAU[AuthScheme]));
+  curl.easy_setopt(fHandle, coHttpAuth, WRA2CAU[AuthScheme]);
   // 2. main request options
-  // the only verbs which do not expect body in answer are HEAD and OPTIONS
-  curl.easy_setopt(fHandle, coNoBody, ord(HttpMethodWithNoBody(fIn.Method)));
+  // the only verb which do not expect body in answer is HEAD - OPTIONS could
+  curl.easy_setopt(fHandle, coNoBody, ord(IsHead(fIn.Method)));
   // see http://curl.haxx.se/libcurl/c/CURLOPT_CUSTOMREQUEST.html
   curl.easy_setopt(fHandle, coCustomRequest, pointer(fIn.Method));
   if aData <> '' then
@@ -6243,7 +6580,7 @@ var
   P: PUtf8Char;
   s: RawUtf8;
   i: integer;
-  rc: PtrInt; // needed on Linux x86-64
+  rc: TCurlLong; // CURLINFO_RESPONSE_CODE writes C long
 begin
   if Assigned(OnUploadProgress) or
      Assigned(OnDownloadProgress) then
@@ -6266,18 +6603,10 @@ begin
     raise ECurlHttp.Create(res, 'libcurl error %d (%s) on %s %s',
       [ord(res), curl.easy_strerror(res), fIn.Method, fIn.URL]);
   rc := 0;
-  curl.easy_getinfo(fHandle, ciResponseCode, rc);
+  curl.easy_getinfo_long(fHandle, ciResponseCode, rc);
   result := rc;
-  Header := TrimU(fOut.Header);
-  if IdemPChar(pointer(Header), 'HTTP/') then
-  begin
-    i := 6;
-    while Header[i] >= ' ' do
-      inc(i);
-    while ord(Header[i]) in [10, 13] do
-      inc(i);
-    system.Delete(Header, 1, i - 1); // trim leading 'HTTP/1.1 200 OK'#$D#$A
-  end;
+  Header := fOut.Header;
+  RemoveHeadInHeaders(Header); // trim 'HTTP/1.1 200 OK' first line
   P := pointer(Header);
   while P <> nil do
   begin
@@ -6308,22 +6637,22 @@ end;
 
 { TDelphiNetHttp }
 
-procedure TDelphiNetHttp.InternalConnect(
-  ConnectionTimeOut, SendTimeout, ReceiveTimeout: cardinal);
+procedure TDelphiNetHttp.InternalConnect;
 begin
   if fLayer <> nlTcp then
     EHttpSocket.RaiseUtf8('%: unsupported layer %', [self, ord(fLayer)]);
   fClient := THTTPClient.Create;
-  if ConnectionTimeOut > 0 then
-    fClient.ConnectionTimeout := ConnectionTimeOut;
-  if SendTimeout > 0 then
-    fClient.SendTimeout := SendTimeout;
-  if ReceiveTimeout > 0 then
-    fClient.ResponseTimeout := ReceiveTimeout;
+  if fExtendedOptions.ConnectTimeOutMS > 0 then
+    fClient.ConnectionTimeout := fExtendedOptions.ConnectTimeOutMS;
+  if fExtendedOptions.SendTimeoutMS > 0 then
+    fClient.SendTimeout := fExtendedOptions.SendTimeoutMS;
+  if fExtendedOptions.ReceiveTimeoutMS > 0 then
+    fClient.ResponseTimeout := fExtendedOptions.ReceiveTimeoutMS;
   fClient.AllowCookies := false; // as the other THttpRequest classes
-  if (fProxyName <> '') and
-     not IdemPropNameU(fProxyName, 'none') then
-    fClient.ProxySettings := TProxySettings.Create(Utf8ToString(fProxyName));
+  if (fExtendedOptions.Proxy <> '') and
+     not IsNone(fExtendedOptions.Proxy) then
+    fClient.ProxySettings := TProxySettings.Create(
+      Utf8ToString(fExtendedOptions.Proxy));
   fClient.OnValidateServerCertificate := DoValidateServerCertificate;
   FormatUtf8('http%://%:%', [TLS_TEXT[fHttps], fServer, fPort], fRootUrl);
 end;
@@ -6365,7 +6694,7 @@ end;
 procedure TDelphiNetHttp.InternalAddHeader(const hdr: RawUtf8);
 var
   P: PUtf8Char;
-  s: RawUtf8;
+  s, n, v: RawUtf8;
   i: PtrInt;
 begin
   P := pointer(hdr);
@@ -6374,8 +6703,11 @@ begin
     s := GetNextLine(P, P);
     i := PosExChar(':', s);
     if i > 1 then
-      fRequest.AddHeader(Utf8ToString(TrimU(copy(s, 1, i - 1))),
-        Utf8ToString(TrimU(copy(s, i + 1, maxInt))));
+    begin
+      TrimCopy(s, 1, i - 1, n);
+      TrimCopy(s, i + 1, maxInt, v);
+      fRequest.AddHeader(Utf8ToString(n), Utf8ToString(v));
+    end;
   end;
 end;
 
@@ -7059,8 +7391,7 @@ begin
   h := fInHeaders; // pre-computed from Cookies and DefaultHeaders properties
   if InHeaders <> '' then
     AppendLine(h, [InHeaders]);
-  if (InBody <> '') and
-     not HttpMethodWithNoBody(Method) then
+  if InBody <> '' then
   begin
     b := InBody;
     t := InType;

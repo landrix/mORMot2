@@ -595,10 +595,10 @@ procedure TNetSocketWrap.SetLinger(linger: integer);
 var
   v: TLinger;
 begin
-  v.l_linger := linger;
-  v.l_onoff := 0; // don't wait - ord(linger >= 0) would wait
-  // https://docs.microsoft.com/en-us/windows/win32/api/winsock/nf-winsock-closesocket
-  SetOpt(SOL_SOCKET, SO_LINGER, @v, SizeOf(v));
+  v.l_onoff := ord(linger >= 0);
+  v.l_linger := MinPtrInt(high(word), MaxPtrInt(0, linger)); // 16-bit field
+  // best effort (no exception): may be called during socket shutdown
+  setsockopt(TSocket(@self), SOL_SOCKET, SO_LINGER, @v, SizeOf(v));
 end;
 
 procedure TNetSocketWrap.SetCork(cork: boolean);
@@ -858,6 +858,34 @@ begin
        (NetLastError(NO_ERROR, loerr) = nrRetry) then
       exit;
   result := false; // e.g. neError or neClosed with no neRead
+end;
+
+function TNetSocketWrap.Close: TNetResult;
+var
+  sock: TSocket;
+  err: integer;
+  v: TLinger;
+begin
+  result := nrNoSocket;
+  sock := TSocket(@self);
+  if sock = 0 then
+    exit;
+  result := nrOk;
+  if closesocket(sock) = NO_ERROR then
+    exit;
+  err := RawSocketErrNo;
+  if err = WSAEWOULDBLOCK then
+  begin
+    // non-blocking socket with positive SO_LINGER:
+    // disable linger and retry an asynchronous graceful close
+    v.l_onoff := 0;
+    v.l_linger := 0;
+    if setsockopt(sock, SOL_SOCKET, SO_LINGER, @v, SizeOf(v)) = NO_ERROR then
+      if closesocket(sock) = NO_ERROR then
+        exit;
+    err := RawSocketErrNo;
+  end;
+  result := NetErrorFromSystem(err, NO_ERROR);
 end;
 
 
@@ -1639,6 +1667,7 @@ destructor TWinIocp.Destroy;
 var
   tix, endtix, tmp, err: cardinal;
   tmplen: integer;
+  res: TNetResult;
   txt: PAnsiChar;
   sub: PIocpSubscription;
 begin
@@ -1698,9 +1727,11 @@ begin
       end;
       if wioUnsubscribeShutdownSocket in fOptions then
       begin
-        if closesocket(sub^.socket) <> NO_ERROR then // brutal abort
-          fOnLog(sllWarning, 'Destroy: closesocket(%)=%', [
-            pointer(sub^.socket), WinErrorShort(RawSocketErrNo)], self);
+        res := TNetSocket(sub^.socket).Close;
+        if Assigned(fOnLog) and
+           (res <> nrOk) then // brutal abort
+          fOnLog(sllWarning, 'Destroy: Close(%) failed as %',
+            [pointer(sub^.socket), _NR[res]], self);
       end;
       sub := sub.head.next;
     end;
@@ -1716,9 +1747,9 @@ function TWinIocp.Subscribe(socket: TNetSocket;
   tag: TPollSocketTag): PWinIocpSubscription;
 var
   o: PIocpSubscription;
-  res: TNetResult;
   e: TWinIocpEvent;
   sll: TSynLogLevel;
+  lg: TLinger;
 begin
   result := nil;
   if (self = nil) or
@@ -1726,25 +1757,24 @@ begin
     exit;
   if socket = nil then
     raise EWinIocp.Create('Unexpected TWinIocp.Subscribe(nil)');
+  // closesocket() may fail with WSAEWOULDBLOCK with SO_LINGER from AcceptEx()
+  lg.l_onoff := 0;
+  lg.l_linger := 0;
+  if setsockopt(TSocket(socket), SOL_SOCKET, SO_LINGER, @lg, SizeOf(lg)) <> NO_ERROR then
+    raise EWinIocp.Create('TWinIocp.Subscribe: SO_LINGER reset failed');
   o := fOne.New; // returned o^ is filled with zeros
   o^.tag := tag;
   o^.socket := TSocket(socket);
   for e := low(o^.over) to high(o^.over) do
     o^.over[e].event := e; // marker to convert POverlapped to PIocpSubscription
   sll := sllTrace;
-  res := nrOk;
-  if IocpCreate(
-    o^.socket, fIocp, {completionkey=}pointer(o^.head.sequence), 0) = 0 then
-  begin
+  if IocpCreate(o^.socket, fIocp, {completionkey=}pointer(o^.head.sequence), 0) = 0 then
     sll := sllLastError;
-    res := nrFatalError;
-    RaiseLastError('TWinIocp: iocpcreate', EWinIocp);
-  end;
   if Assigned(fOnLog) then
-    fOnLog(sll, 'Subscribe(socket=% seq=%)=% cnt=%',
-      [socket, pointer(o^.head.sequence), _NR[res], Count], self);
-  if res = nrOk then
-    result := pointer(o)
+    fOnLog(sll, 'Subscribe(socket=% seq=%) cnt=%',
+      [socket, pointer(o^.head.sequence), Count], self);
+  if sll = sllTrace then
+    result := pointer(o) // success
   else
     fOne.Free(o);
 end;
@@ -1823,7 +1853,7 @@ begin
           DoCheck(acceptex(o^.Socket, TSocket(netsock), pointer(fAcceptExBuf),
             0, ACCEPTEX_SIZE, ACCEPTEX_SIZE, bytes, @oe^.overlapped));
           if not result then
-            fAcceptExUsed.UnLock; // release AcceptEx() lock on failure
+            AcceptSocketCloseAndUnlock; // release AcceptEx() lock on failure
         end
         else
           fatal := 'concurrent wieAccept'
@@ -2002,6 +2032,17 @@ begin
   until result <> nil;
 end;
 
+procedure TWinIocp.AcceptSocketCloseAndUnlock;
+begin
+  // release the accept socket and lock on failure
+  if fAcceptSocket <> nil then
+  begin
+    fAcceptSocket.Close;
+    fAcceptSocket := nil;
+  end;
+  fAcceptExUsed.UnLock;
+end;
+
 function TWinIocp.GetNextAccept(one: PWinIocpSubscription;
   out Socket: TNetSocket; out Remote: TNetAddr): boolean;
 var
@@ -2010,6 +2051,7 @@ var
   lsock: TSocket;
 begin
   result := false;
+  Socket := nil;
   if (self = nil) or
      (one = nil) or
      fTerminated then
@@ -2021,8 +2063,9 @@ begin
      not Assigned(getacceptexsockaddrs) then
   begin
     if Assigned(fOnLog) then
-      fOnLog(sllWarning, 'GetNextAccept(%)=false',
-        [pointer(one^.socket)], self);
+      fOnLog(sllWarning, 'GetNextAccept(%)=false', [pointer(one^.socket)], self);
+    if fAcceptExUsed.IsLocked then
+      AcceptSocketCloseAndUnlock;
     exit;
   end;
   l := nil;
@@ -2034,20 +2077,31 @@ begin
   if (r = nil) or
      (rlen = 0) or
      (rlen > SizeOf(Remote)) then
+  begin
+    if Assigned(fOnLog) then
+      fOnLog(sllWarning, 'GetNextAccept: getacceptexsockaddrs rlen=%',
+        [rlen], self);
+    AcceptSocketCloseAndUnlock;
     exit;
+  end;
   MoveFast(r^, Remote, rlen);
-  Socket := fAcceptSocket;
-  fAcceptSocket := nil;
   // AcceptEx() sockets need SO_UPDATE_ACCEPT_CONTEXT to inherit the listening
   // socket properties, and before shutdown() getsockname() getpeername() are
   // used - otherwise shutdown(SD_SEND) in Unsubscribe() fails with WSAENOTCONN
   // and no FIN is ever sent to the client on a server-side close
   lsock := TSocket(one^.socket);
-  if (setsockopt(TSocket(Socket), SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT,
-        @lsock, SizeOf(lsock)) <> NO_ERROR) and
-     Assigned(fOnLog) then
-    fOnLog(sllWarning, 'GetNextAccept(%): SO_UPDATE_ACCEPT_CONTEXT failed as %',
-      [pointer(one^.socket), WinErrorShort(RawSocketErrNo)], self);
+  if setsockopt(TSocket(fAcceptSocket), SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT,
+        @lsock, SizeOf(lsock)) <> NO_ERROR then
+  begin
+    if Assigned(fOnLog) then
+      fOnLog(sllWarning, 'GetNextAccept(%): SO_UPDATE_ACCEPT_CONTEXT failed as %',
+        [pointer(one^.socket), WinErrorShort(RawSocketErrNo)], self);
+    AcceptSocketCloseAndUnlock;
+    exit;
+  end;
+  fAcceptSocket.SetLinger(-1); // disable inherited timed linger
+  Socket := fAcceptSocket;
+  fAcceptSocket := nil;
   fAcceptExUsed.UnLock;
   result := true;
   if Assigned(fOnLog) then
@@ -2097,11 +2151,6 @@ end;
 
 { ******************** TLS / HTTPS Encryption Abstract Layer }
 
-// TLS 1.3 is officially supported starting in Windows 11 and Server 2022.
-// Enabling TLS 1.3 on earlier versions of Windows is possible through the
-// registry, but is explictly documented as unsafe by Microsoft.
-// https://learn.microsoft.com/en-us/windows/win32/secauthn/protocols-in-tls-ssl--schannel-ssp-
-
 procedure CredInit(var cred: TSChannelCred; const ctx: TNetTlsContext;
   dwFlags: cardinal; paServCred: pointer; RootStore: HCERTSTORE);
 begin
@@ -2111,8 +2160,7 @@ begin
      (OSVersion >= wSeven) then
     dwFlags := dwFlags or SCH_USE_STRONG_CRYPTO;
   if SChannelEnableTls13 and
-     ((OSVersion in [wEleven, wEleven_64]) or
-      (OSVersion >= wServer2022_64)) and
+     (wsTls13 in WindowsSpecs) and // Windows 11 or Server 2022
      not ctx.DisableTls13 then
   begin
     // new SCH_CREDENTIALS structure is required in order to enable TLS 1.3

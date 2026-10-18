@@ -176,7 +176,8 @@ type
     /// the associated server name (or file, for SQLite3) to be connected to
     property ServerName: RawUtf8
       read fServerName write fServerName;
-    /// the associated database name (if any), or additional options
+    /// the associated database name (if any), or URI-encoded additional options
+    // - e.g. TRestHttpClientGeneric.DefinitionTo() URI-encoded HTTP parameters
     property DatabaseName: RawUtf8
       read fDatabaseName write fDatabaseName;
     /// the associated User Identifier (if any)
@@ -592,7 +593,7 @@ type
   TSynHasher = object
   {$endif USERECORDWITHMETHODS}
   private
-    ctxt: array[1..SHA3_CONTEXT_SIZE] of byte; // enough space for all algorithms
+    ctxt: TSha3;      // enough space for all algorithms
     fAlgo: THashAlgo; // ctxt is better aligned if put first
     procedure CopyTo(out aHasher: TSynHasher); {$ifdef FPC} inline; {$endif}
     procedure Clear;                           {$ifdef FPC} inline; {$endif}
@@ -7913,7 +7914,8 @@ end;
 
 destructor TBinaryCookieGenerator.Destroy;
 begin
-  FillCharFast(fContext, SizeOf(fContext), 0); // anti-forensic measures
+  Finalize(fContext);
+  FillCharFast(fContext, SizeOf(fContext), 0); // anti-forensic
   fAes.Done;
   inherited Destroy;
 end;
@@ -7946,7 +7948,7 @@ begin
        (PRecordTypeInfo <> nil) then
     begin
       BinarySave(PRecordData, tmp, PRecordTypeInfo, rkRecordTypes);
-      pad := tmp.len and AesBlockMod;
+      pad := tmp.len and AES_MOD;
       if pad <> 0 then // AES-CTR is easier if padded on 16 bytes
         inc(tmp.len, 16 - pad);
       if tmp.len > SizeOf(cc.data) then
@@ -8052,7 +8054,7 @@ begin
       exit; // expects a record, but no associated data
     ccend := PAnsiChar(@cc.data) + len;
     if PtrUInt(ccend - BinaryLoad(PRecordData, @cc.data, PRecordTypeInfo, nil,
-         ccend, rkRecordTypes)) > AesBlockMod then
+         ccend, rkRecordTypes)) > AES_MOD then
       exit;
   end;
   result := cc.head.session;
@@ -8269,10 +8271,12 @@ begin
 end;
 
 function TCryptRandom.GetPassword(len: PtrInt): SpiUtf8;
+var
+  c: integer;
 begin
   repeat
     Get(RawByteString(result), Len);
-  until MakeStrongPassword(result);
+  until MakeStrongPassword(result, @c);
 end;
 
 
@@ -8342,8 +8346,11 @@ type
 
 procedure TCryptRandomSysPrng.Get(dst: pointer; dstlen: PtrInt);
 begin
-  FillSystemRandom(dst, dstlen, {allowblocking=}length(fName) > 10);
+  if (dstlen > 0) and
+     not FillSystemRandom(dst, dstlen, {allowblocking=}length(fName) > 10) then
+    ECrypt.RaiseUtf8('%.Get(%): OS API failure', [self, dstlen]);
 end;
+
 
 { TCryptRandomLecuyerPrng }
 
@@ -8361,7 +8368,7 @@ end;
 
 function TCryptRandomLecuyerPrng.Get32: cardinal;
 begin
-  result := ThreadRandom.Next;
+  result := ThreadRandom.Next; // dedicated fast 32-bit generator
 end;
 
 { TCryptRandom32 }
@@ -10920,23 +10927,24 @@ end;
 
 function DerParse(P: PAnsiChar; buf: PByteArray; buflen: PtrInt): PAnsiChar;
 var
-  pos: PtrUInt;
+  pos: PtrInt;
 begin
   result := nil;
   FillZero(buf^, buflen);
   if (P = nil) or
-     (P[0] <> AnsiChar(ASN1_INT)) then
+     (P[0] <> AnsiChar(ASN1_INT)) or
+     (P[1] = #0) then
     exit;
   pos := buflen - ord(P[1]);
   inc(P, 2);
   if P^ = #0 then
   begin
-    inc(P); // negative number appended
+    inc(P); // positive INTEGER with leading zero
     inc(pos);
   end;
+  if pos < 0 then
+    exit; // INTEGER larger than destination buffer
   dec(buflen, pos);
-  if buflen < 0 then
-    exit; // avoid buffer overflow
   MoveFast(P^, buf[pos], buflen);
   result := P + buflen;
 end;

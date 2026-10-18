@@ -75,7 +75,7 @@ type
     Revision: byte;
     SubAuthorityCount: byte;
     IdentifierAuthority: TSidAuth;
-    SubAuthority: array[byte] of cardinal;
+    SubAuthority: TByteToCardinal;
   end;
   PSid = ^TSid;
   PSids = array of PSid;
@@ -3127,6 +3127,9 @@ function LookupToken(tok: THandle; out name, domain: RawUtf8;
 /// retrieve the 'domain\name' combined value of a given Token
 function LookupToken(tok: THandle; const server: RawUtf8 = ''): RawUtf8; overload;
 
+/// retrieve the 'domain\name' combined value of a given Token
+procedure LookupTokenVar(tok: THandle; const server: RawUtf8; var result: RawUtf8);
+
 /// retrieve the binary SID and type of a given account by name
 // - use fully qualified account names (for example, domain_name\user_name)
 function LookupName(const system, account: RawUtf8;
@@ -4127,7 +4130,7 @@ var
   OsSecSafe: TLightLock; // global lock shared by this unit
   SDDL_WKS_INDEX: array[TWellKnownSid] of byte; // into 1..48
   SDDL_WKR_INDEX: array[TWellKnownRid] of byte; // into 49..66
-  SID_SDDLW: packed array[byte] of word absolute SID_SDDL;
+  SID_SDDLW: TByteToWord absolute SID_SDDL;
 
 procedure SddlInitialize;
 var
@@ -8999,6 +9002,11 @@ begin
 end;
 
 function LookupToken(tok: THandle; const server: RawUtf8): RawUtf8;
+begin
+  LookupTokenVar(tok, server, result);
+end;
+
+procedure LookupTokenVar(tok: THandle; const server: RawUtf8; var result: RawUtf8);
 var
   name, domain: RawUtf8;
 begin

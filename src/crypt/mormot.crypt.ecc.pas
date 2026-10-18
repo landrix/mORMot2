@@ -2297,7 +2297,7 @@ begin
       pub := PEccPublicKey(der)^
     else if not Ecc256r1CompressAsn1(SeqToEccPubKey(ckaEcc256, der), pub) then
       exit;
-  result := true; // accept key in raw, PEM or DER format
+  result := pub[0] in [2, 3]; // valid compressed point prefix
 end;
 
 function PemDerRawToEcc(const pem: RawUtf8; out sig: TEccSignature): boolean; overload;
@@ -2544,7 +2544,10 @@ begin
   begin
     // OpenSSL Ecc256r1VerifyUncomp() is actually slower than Ecc256r1Verify()
     Ecc256r1Uncompress(fContent.Head.Signed.PublicKey, fUncompressed);
-    fUncompressedP := @fUncompressed;
+    if IsZero(THash512(fUncompressed)) then
+      result := false
+    else
+      fUncompressedP := @fUncompressed;
   end;
 end;
 
@@ -2863,6 +2866,8 @@ begin
     begin
        // OpenSSL Ecc256r1VerifyUncomp() is actually slower than Ecc256r1Verify()
       Ecc256r1Uncompress(fContent.Head.Signed.PublicKey, fUncompressed);
+      if IsZero(THash512(fUncompressed)) then
+        EEccException.RaiseUtf8('%.CreateNew: Uncompress?', [self]);
       fUncompressedP := @fUncompressed;
     end;
   end;
@@ -3107,7 +3112,7 @@ begin
     dec(Len, 16);
     inc(PHash128(Data));
   end; // may exist with NoHeader=true (e.g. SaveToSource)
-  if Len and AesBlockMod <> 0 then
+  if Len and AES_MOD <> 0 then
     exit;
   FastSetRawByteString(salt, Data, PRIVKEY_SALTSIZE);
   inc(PByte(Data), PRIVKEY_SALTSIZE);
@@ -4823,7 +4828,7 @@ begin
      (_FromKeySetCA <> nil) then
   begin
     fPKI := _FromKeySetCA;
-    InterlockedIncrement(_FromKeySetCARefCount);
+    LockedInc32(@_FromKeySetCARefCount);
   end
   else
     fPKI := aPKI;
@@ -4854,7 +4859,7 @@ begin
       fPKI.Free
     else if (fPKI = _FromKeySetCA) and
             (_FromKeySetCARefCount > 0) then
-      InterlockedDecrement(_FromKeySetCARefCount);
+      LockedDec32(@_FromKeySetCARefCount);
   if ownPrivate in fOwned then
     fPrivate.Free;
   inherited Destroy;
@@ -4917,7 +4922,7 @@ begin
      (_FromKeySetCA <> nil) then
   begin
     ca := _FromKeySetCA;
-    InterlockedIncrement(_FromKeySetCARefCount);
+    LockedInc32(@_FromKeySetCARefCount);
   end;
   // compute priv: TEccCertificateSecret
   priv := nil;

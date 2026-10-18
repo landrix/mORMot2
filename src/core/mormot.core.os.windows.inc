@@ -3151,10 +3151,21 @@ function _SetSystemEnv(const name, value: RawUtf8): boolean;
 var
   n, v: TSynTempBuffer;
 begin
-  result := SetEnvironmentVariableW(Utf8ToWin32PWideChar(name, n),
-                                    Utf8ToWin32PWideChar(value, v));
+  if value = '' then
+    PWideChar(v.InitOnStack)^ := #0 // void but not nil UTF-16 buffer
+  else
+    Utf8ToWin32PWideChar(value, v);
+ result := SetEnvironmentVariableW(Utf8ToWin32PWideChar(name, n), v.buf);
+ n.Done;
+ v.Done;
+end;
+
+function _UnsetSystemEnv(const name: RawUtf8): boolean;
+var
+  n: TSynTempBuffer;
+begin
+  result := SetEnvironmentVariableW(Utf8ToWin32PWideChar(name, n), nil);
   n.Done;
-  v.Done;
 end;
 
 function PatchProcess(Old, New: pointer; Size: PtrInt; Backup: pointer): boolean;
@@ -5337,6 +5348,12 @@ begin
       OsWakeAllOnValue := @WakeByAddressAll;    // defined as stdcall
     end;
   end;
+  if (OSVersion in [wEleven, wEleven_64]) or
+     (OSVersion >= wServer2022_64) then
+    // TLS 1.3 is officially supported starting in Windows 11 and Server 2022.
+    // Enabling TLS 1.3 on earlier versions of Windows is possible through the
+    // registry, but is explictly documented as unsafe by Microsoft.
+    include(WindowsSpecs, wsTls13);
   h := GetModuleHandle(ntdll); // late binding over unstable / altered API
   if h > 0 then
   begin

@@ -49,7 +49,7 @@
     <Description Value="mORMot 2 ORM/SOA/MVC framework"/>
     <License Value="MPL, GPL or LGPL"/>
     <Version Major="2" Minor="4"/>
-    <Files Count="128">
+    <Files Count="130">
       <Item1>
         <Filename Value="../../src/app/mormot.app.console.pas"/>
         <UnitName Value="mormot.app.console"/>
@@ -552,17 +552,25 @@
         <UnitName Value="mormot.crypt.win"/>
       </Item125>
       <Item126>
-        <Filename Value="../../src/lib/mormot.lib.core.pas"/>
-        <UnitName Value="mormot.lib.core"/>
+        <Filename Value="../../src/db/mormot.db.raw.duckdb.pas"/>
+        <UnitName Value="mormot.db.raw.duckdb"/>
       </Item126>
       <Item127>
-        <Filename Value="../../src/lib/mormot.lib.freetype.pas"/>
-        <UnitName Value="mormot.lib.freetype"/>
+        <Filename Value="../../src/db/mormot.db.sql.duckdb.pas"/>
+        <UnitName Value="mormot.db.sql.duckdb"/>
       </Item127>
       <Item128>
+        <Filename Value="../../src/lib/mormot.lib.core.pas"/>
+        <UnitName Value="mormot.lib.core"/>
+      </Item128>
+      <Item129>
+        <Filename Value="../../src/lib/mormot.lib.freetype.pas"/>
+        <UnitName Value="mormot.lib.freetype"/>
+      </Item129>
+      <Item130>
         <Filename Value="../../src/lib/mormot.lib.harfbuzz.pas"/>
         <UnitName Value="mormot.lib.harfbuzz"/>
-      </Item128>
+      </Item130>
     </Files>
     <CompatibilityMode Value="True"/>
     <UsageOptions>

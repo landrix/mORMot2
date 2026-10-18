@@ -213,8 +213,6 @@ type
     procedure TStreamSlow(Context: TObject);
     /// client side geniune 64 bit identifiers generation
     procedure TSynUniqueIdentifierSlow(Sender: TObject);
-    // test TSynQueue with all kind of values in a background thread
-    procedure TSynQueueSlow(Sender: TObject);
   published
     /// test RecordCopy(), TRttiMap and TRttiFilter
     procedure _Records;
@@ -222,8 +220,6 @@ type
     procedure _TSynList;
     /// test the TDynArray object and methods - also launch background *Slow()
     procedure _TDynArray;
-    /// validate the TSynQueue class
-    procedure _TSynQueue;
     /// test TSynNameValue class
     procedure _TSynNameValue;
     /// test TRawUtf8Interning process
@@ -549,6 +545,33 @@ begin // http://graphics.stanford.edu/~seander/bithacks.html#IntegerLogDeBruijn
     result := 255;
 end;
 
+function BSRqwordPurePascal(const q: Qword): cardinal;
+var
+  c: cardinal;
+begin
+  c := q shr 32;
+  if c = 0  then
+    result := BsrDwordPurePascal(cardinal(q)) // search in lowest 32-bit
+  else
+    result := BsrDwordPurePascal(c) or 32;   // search in highest 32-bit
+end;
+
+function BsfDWordPurePascal(c: cardinal): cardinal; // not published yet
+const
+  _debruijn32: array[0..31] of byte = (
+    0, 1, 28, 2, 29, 14, 24, 3, 30, 22, 20, 15, 25, 17, 4, 8,
+    31, 27, 13, 23, 21, 19, 16, 7, 26, 12, 18, 6, 11, 5, 10, 9);
+begin
+  if c <> 0 then
+  begin
+    c := c and not (c - 1); // isolate lowest set bit
+    c := c * $077cb531;     // truncate to 32 bits
+    result := _debruijn32[c shr 27];
+  end
+  else
+    result := 255;
+end;
+
 procedure TTestCoreBase.Bits;
 const
   N = 1000000;
@@ -635,8 +658,24 @@ const
       {$ifdef FPC}
       CheckEqual(popcnt(v), c);
       {$endif FPC}
+      {$ifdef CPU32}
+      v := v or (QWord(rnd.Next) shl 32);
+      {$endif CPU32}
+      CheckEqual(BSRqwordPurePascal(v), BSRqword(v), 'bsrq3');
     end;
     CheckEqual(BSRdwordPurePascal(0), BSRdword(0));
+    CheckEqual(BSRqwordPurePascal(0), BSRqword(0));
+    CheckEqual(BSRdword(0), 255);
+    CheckEqual(BSRqword(0), 255);
+    for i := 1 to 15 do
+    begin
+      v := i;
+      repeat
+        CheckEqual(BSRdwordPurePascal(v), BSRdword(v), 'bsrdi');
+        CheckEqual(BSRqwordPurePascal(v), BSRqword(v), 'bsrqi');
+        v := v shl 1;
+      until v = 0; // all 64-bit
+    end;
     timer.Start;
     for i := 1 to N do
       GetBitsCountPtrInt(i);
@@ -3694,6 +3733,15 @@ begin
     CheckEqual(f, 'file.txt');
     Check(c.Get('t', t));
     CheckEqual(t, 1);
+    // regression for #654: positional argument after a parameter
+    c.Clear;
+    c.RawParams := CsvToRawUtf8DynArray(
+      '--run /config /opt/porter/x.config', ' ');
+    Check(c.Parse(#10, '-', '--'));
+    Check(c.Get('run', f));
+    CheckEqual(f, '/config');
+    CheckEqual(c.Args[0], '/opt/porter/x.config');
+    CheckEqual(c.DetectUnknown, 'Unexpected "/opt/porter/x.config" argument'#10);
   finally
     c.Free;
   end;
@@ -4729,6 +4777,10 @@ var
   c: integer;
   timer: TPrecisionTimer;
 begin
+  CheckEqual(SizeOf(cardinal), SizeOf(TDWordRec), 'TDWordRec');
+  CheckEqual(SizeOf(Int64), SizeOf(Int64Rec), 'Int64Rec');
+  CheckEqual(SizeOf(QWord), SizeOf(TQWordRec), 'TQWordRec');
+  CheckEqual(SizeOf(TFileTime), SizeOf(TQWordRec), 'TFileTime');
   CheckEqual(9007199254740991, MAX_SAFE_JS_INTEGER);
   Check(IsPowerOfTwo(0));
   Check(IsPowerOfTwo(1));
@@ -8811,6 +8863,14 @@ begin
   CheckEqual(tmp, '0002-00-00');
   CheckEqual(DateTimeToIso8601Text(Iso8601ToDateTime('1492-10-12T16:00:00')),
     '1492-10-12T16:00:00');
+  CheckEqual(DateTimeToIso8601(Iso8601ToDateTime('2026-01-01T12:00:23.1Z'),
+      true, 'T', true), '2026-01-01T12:00:23.100');
+  CheckEqual(DateTimeToIso8601(Iso8601ToDateTime('2026-01-01T12:00:23.13Z'),
+      true, 'T', true), '2026-01-01T12:00:23.130');
+  CheckEqual(DateTimeToIso8601(Iso8601ToDateTime('2026-01-01T12:00:23.123Z'),
+      true, 'T', true), '2026-01-01T12:00:23.123');
+  CheckEqual(DateTimeToIso8601(Iso8601ToDateTime('2026-01-01T12:00:23.123456Z'),
+      true, 'T', true), '2026-01-01T12:00:23.123');
 end;
 
 {$R ..\src\mormot.tz.res} // validate our Win11-generated resource file
@@ -10718,19 +10778,35 @@ begin
   CheckEqual(DeleteHeader(Join([s, s, s, 'Auth: 2'#13#10, s]), 'auth'), Join([s, s, s, s]));
   CheckEqual(DeleteHeader(Join([s, s, s, 'Auth: 2'#13#10, 'ab']), 'auth'), Join([s, s, s, 'ab']));
   // some HTTP methods
-  Check(HttpMethodWithNoBody('HEAD'));
-  Check(HttpMethodWithNoBody('head'));
-  Check(HttpMethodWithNoBody('HEADER'));
-  Check(HttpMethodWithNoBody('OPTIONS'));
-  Check(HttpMethodWithNoBody('options'));
-  Check(HttpMethodWithNoBody('OPTION'));
-  Check(HttpMethodWithNoBody('OPTI'));
-  Check(not HttpMethodWithNoBody('toto'));
-  Check(not HttpMethodWithNoBody('HE4D'));
-  Check(not HttpMethodWithNoBody('GET'));
-  Check(not HttpMethodWithNoBody('POST'));
-  Check(not HttpMethodWithNoBody('PUT'));
-  Check(not HttpMethodWithNoBody('OPT'));
+  Check(IsGet('GET'));
+  Check(not IsGet('GeT'));
+  Check(not IsGet('GETS'));
+  Check(IsPost('POST'));
+  Check(not IsPost('PoST'));
+  Check(not IsPost('P0ST'));
+  Check(IsPut('PUT'));
+  Check(not IsPut('PuT'));
+  Check(not IsPut('PUTS'));
+  Check(IsDelete('DELETE'));
+  Check(IsDelete('DELE'));
+  Check(not IsDelete('delete'));
+  Check(IsHead('HEAD'));
+  Check(not IsHead('head'));
+  Check(IsHead('HEADER'));
+  Check(IsOptions('OPTIONS'));
+  Check(not IsOptions('options'));
+  Check(IsOptions('OPTION'));
+  Check(IsOptions('OPTI'));
+  Check(not IsHead('toto'));
+  Check(not IsOptions('toto'));
+  Check(not IsHead('HE4D'));
+  Check(not IsHead('GET'));
+  Check(not IsHead('POST'));
+  Check(not IsHead('PUT'));
+  Check(not IsOptions('OPT'));
+  Check(not IsOptions('GET'));
+  Check(not IsOptions('POST'));
+  Check(not IsOptions('PUT'));
   // mime content types
   CheckEqual(GetMimeContentType('', 'toto.h264'), 'video/H264');
   CheckEqual(GetMimeContentType('', 'toto', 'def1'), 'def1');
@@ -11910,7 +11986,7 @@ begin
   checkEqual(nv.AsCsv('=', ';'), 'a=1;b=be;');
   checkEqual(nv.AsJson, '{"a":"1","b":"be"}');
   tmp.Init('{a:10,b:"bee"}');
-  check(nv.InitFromJson(tmp.buf));
+  check(nv.InitFromJsonBuffer(tmp.buf, false));
   checkEqual(nv.Count, 2);
   checkEqual(nv.Str['a'], '10');
   checkEqual(nv.Str['b'], 'bee');
@@ -11929,9 +12005,13 @@ begin
   checkEqual(nv.DeleteByValue('10'), 0);
   checkEqual(nv.Count, 0);
   checkEqual(nv.AsCsv('=', ';'), '');
-  tmp.Init('{"a":20,b:"bi"]');
-  check(not nv.InitFromJson(tmp.buf));
+  check(not nv.InitFromJson('{"a":20,b:"bi"]'));
   checkEqual(nv.Count, 0);
+  checkEqual(nv.AsCsv('=', ';'), '');
+  checkEqual(nv.AsJson, '{}');
+  check(nv.InitFromJson('{a:10,b:"bee"}', false));
+  checkEqual(nv.Count, 2);
+  checkEqual(nv.AsCsv('=', ';'), 'a=10;b=bee;');
 end;
 
 procedure TTestCoreBase.TSynUniqueIdentifierSlow(Sender: TObject);
@@ -12541,221 +12621,6 @@ begin
     CheckEqual(b, 253);
 finally
     dict.Free;
-  end;
-end;
-
-type
-  TNotifyTask = record // a typical event for TSynQueue record validation
-    Name: string;
-    Payload: RawJson;
-    Active: boolean;
-  end;
-  TNotifyTaskDynArray = array of TNotifyTask;
-
-procedure TTestCoreBase.TSynQueueSlow(Sender: TObject);
-var
-  o, i, j, k, n: integer; // not PtrInt
-  f: TSynQueue;
-  u, v: RawUtf8;
-  r1, r2: TNotifyTask;
-  savedint: TIntegerDynArray;
-  savedu: TRawUtf8DynArray;
-begin
-  // validate TSynQueue with integer values
-  f := TSynQueue.Create(TypeInfo(TIntegerDynArray));
-  try
-    for o := 1 to 1000 do
-    begin
-      checkEqual(f.Count, 0);
-      check(not f.Pending);
-      for i := 1 to o do
-        f.Push(i);
-      check(f.Pending);
-      checkEqual(f.Count, o);
-      check(f.Capacity >= o);
-      f.Save(savedint);
-      check(Length(savedint) = o);
-      check(f.Contains(@o), 'cont0'); // O(n) since queue is a FIFO
-      for i := 1 to o do
-      begin
-        j := -1;
-        check(f.Peek(j), 'peek');
-        checkEqual(j, i);
-        check(f.Contains(@i), 'cont1'); // O(1) since find immediately
-        checkEqual(f.PeekCompare(nil), 1);
-        checkEqual(f.PeekCompare(@j), 0);
-        j := -1;
-        checkEqual(f.PeekCompare(@j), 1);
-        check(not f.PopEquals(@j, j), 'popeq');
-        check(f.Pop(j), 'pop');
-        checkEqual(j, i);
-        if i < 10 then // is O(n) after Pop()
-          check(not f.Contains(@i), 'cont2');
-      end;
-      check(not f.Pending);
-      checkEqual(f.Count, 0);
-      checkEqual(f.PeekCompare(@j), -1);
-      check(f.Capacity > 0);
-      f.Clear; // ensure f.Pop(j) will use leading storage
-      check(not f.Pending);
-      checkEqual(f.Count, 0);
-      checkEqual(f.Capacity, 0);
-      checkEqual(Length(savedint), o);
-      for i := 1 to o do
-        checkEqual(savedint[i - 1], i);
-      n := 0;
-      for i := 1 to o do
-        if i and 7 = 0 then
-        begin
-          j := -1;
-          check(f.Pop(j));
-          check(j and 7 <> 0);
-          dec(n);
-        end
-        else
-        begin
-          f.Push(i);
-          inc(n);
-        end;
-      checkEqual(f.Count, n);
-      check(f.Pending);
-      check(f.Contains(@o) = (o and 7 <> 0), 'cont3');
-      f.Save(savedint);
-      checkEqual(Length(savedint), n);
-      for i := 1 to n do
-        check(savedint[i - 1] and 7 <> 0);
-      for i := 1 to n do
-      begin
-        j := -1;
-        check(f.Peek(j));
-        k := -1;
-        check(f.Pop(k));
-        checkEqual(j, k);
-        check(j and 7 <> 0);
-      end;
-      checkEqual(f.Count, 0);
-      check(f.Capacity > 0);
-    end;
-  finally
-    f.Free;
-  end;
-  // validate TSynQueue with string values
-  f := TSynQueue.Create(TypeInfo(TRawUtf8DynArray));
-  try
-    for o := 1 to 1000 do
-    begin
-      check(not f.Pending);
-      check(f.Count = 0);
-      f.Clear; // ensure f.Pop(j) will use leading storage
-      check(f.Count = 0);
-      check(f.Capacity = 0);
-      n := 0;
-      for i := 1 to o do
-        if i and 7 = 0 then
-        begin
-          u := '7';
-          check(f.Pop(u));
-          check(GetInteger(pointer(u)) and 7 <> 0);
-          dec(n);
-        end
-        else
-        begin
-          u := UInt32ToUtf8(i);
-          f.Push(u);
-          inc(n);
-        end;
-      check(f.Pending);
-      check(f.Count = n);
-      f.Save(savedu);
-      check(Length(savedu) = n);
-      for i := 1 to n do
-        check(GetInteger(pointer(savedu[i - 1])) and 7 <> 0);
-      for i := 1 to n do
-      begin
-        u := '';
-        check(f.Peek(u));
-        check(f.Contains(@u), 'cont4'); // O(1) since find immediately
-        checkEqual(f.PeekCompare(@u), 0);
-        v := '';
-        checkEqual(f.PeekCompare(@v), 1);
-        check(f.Pop(v));
-        check(u = v);
-        check(GetInteger(pointer(u)) and 7 <> 0);
-      end;
-      check(not f.Pending);
-      check(f.Count = 0);
-      check(f.Capacity > 0);
-    end;
-    check(Length(savedu) = length(savedint));
-  finally
-    f.Free;
-  end;
-  // validate TSynQueue with complex record type
-  f := TSynQueue.Create(TypeInfo(TNotifyTaskDynArray));
-  try
-    checkEqual(f.Count, 0);
-    check(not f.Pending);
-    for i := 1 to 100 do
-    begin
-      r1.Name := IntToStr(i);
-      r1.Active := i and 3 = 0;
-      r1.Payload := Make(['{"int":', i, '}']);
-      checkNotEqual(f.Count, i);
-      f.Push(r1);
-      checkEqual(f.Count, i);
-      check(f.Pending);
-    end;
-    for i := 1 to 100 do
-    begin
-      check(f.Pending);
-      RecordZero(@r2, TypeInfo(TNotifyTask));
-      Check(r2.Name = '');
-      Check(not r2.Active);
-      Check(r2.Payload = '');
-      Check(f.Pop(r2));
-      Check(r2.Name = IntToStr(i));
-      Check(r2.Active = (i and 3 = 0));
-    end;
-    checkEqual(f.Count, 0);
-    Check(not f.Pop(r2));
-    checkEqual(f.Count, 0);
-  finally
-    f.Free;
-  end;
-end;
-
-procedure TTestCoreBase._TSynQueue; // should run in the main thread
-var
-  i: PtrInt;
-  ev: TSynEvent;
-begin
-  // validate TSynQueue with all kind of values in a background thread
-  Run(TSynQueueSlow, self, 'TSynQueue', true, false);
-  // validate TSynEvent process in the main thread
-  ev := TSynEvent.Create;
-  try
-    CheckEqual(PtrUInt(GetCurrentThreadID), PtrUInt(MainThreadID), 'mainthread');
-    for i := 1 to 10 do
-    begin
-      // emulate a ResetEvent between the two SetEvent state updates
-      ev.ResetEvent;
-      ev.SetEvent;
-      Check(ev.WaitFor(1000), 'WaitFor signal');
-      ev.SetEvent;
-      ev.ResetEvent;
-      ev.SetEvent;
-      Check(ev.WaitFor(INFINITE), 'WaitFor(INFINITE) signal');
-      // validate the main-thread CheckSynchronize() wrapper as well
-      ev.ResetEvent;
-      ev.SetEvent;
-      Check(ev.WaitForSafe(1000), 'WaitForSafe signal');
-      ev.SetEvent;
-      ev.ResetEvent;
-      ev.SetEvent;
-      Check(ev.WaitForSafe(INFINITE), 'WaitForSafe(INFINITE) signal');
-    end;
-  finally
-    ev.Free;
   end;
 end;
 

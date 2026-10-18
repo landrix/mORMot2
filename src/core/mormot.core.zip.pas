@@ -2717,7 +2717,13 @@ begin
     h := hnext;
   end;
   if prev <> nil then
+  begin
     prev^.nextlocaloffs := fCentralDirectoryOffset; // last file backward search
+    if prev^.local <> nil then
+      // the central directory is in memory and follows the last file data:
+      // allow SearchFromDataDescriptor() to work without any fSource
+      prev^.nextlocal := pointer(fCentralDirectory);
+  end;
   if fCount = 0 then
     fEntry := nil
   else if fCount <> fCentralDirectoryTotalFiles then
@@ -2902,11 +2908,8 @@ end;
 
 type
   // some (MacOs) tools store 0 in local header, and append FLAG_DATADESCRIPTOR
-  TDataDescriptor = packed record
-    signature: cardinal;
-    crc32:     cardinal;
-    zipSize:   cardinal;
-    fullSize:  cardinal;
+  TDataDescriptor = record
+    signature, crc32, zipSize, fullSize:  cardinal;
   end;
 
 function TZipRead.RetrieveFileInfo(Index: integer;

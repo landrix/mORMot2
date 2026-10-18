@@ -474,7 +474,8 @@ type
     wsWeakDpApi,
     wsWeakCng,
     wsWeakHttpApi,
-    wsWeakHttpSys);
+    wsWeakHttpSys,
+    wsTls13);
 
   /// notable Linux distributions, organized by their package management system
   TLinuxDistribution = (
@@ -1818,6 +1819,7 @@ var // raw UTF-8 cache storage for GetSystemEnv()
 /// efficiently return a system environment variable as UTF-8
 // - will maintain a cross-platform cache of allocated environment variables
 function GetSystemEnv(const name: RawUtf8): RawUtf8; overload;
+  {$ifdef HASSAFEINLINE} inline; {$endif}
 
 /// efficiently return a system environment variable as string/TFileName
 // - faster cross-platform implementation of RTL GetEnvironmentVariable()
@@ -2295,9 +2297,8 @@ function ExpandFileName(const FileName: TFileName): TFileName;
 
 type
   /// our internal Win32 64-bit FILETIME value type definition for POSIX
-  TFileTime = packed record
-    dwLowDateTime:  cardinal;
-    dwHighDateTime: cardinal;
+  TFileTime = record
+    dwLowDateTime, dwHighDateTime: cardinal;
   end;
   /// points to one Win32 64-bit FILETIME value
   PFileTime = ^TFileTime;
@@ -2853,10 +2854,13 @@ function SystemErrorShort(error: integer = 0): TShort63;
 // - by design, IsSystemError(seOther) = IsSystemError(seSuccess) are always false
 function IsSystemError(os: TSystemError; ErrorCode: integer = 0): boolean;
 
-/// returns a given error code as plain text
+/// returns a given error code as plain RawUtf8 text
 // - redirects to WinApiErrorShort(error, nil) on Windows, or StrError() on POSIX
 // - e.g. GetErrorText(10) = 'ECHILD (No child processes)' on Linux
 function GetErrorText(error: integer = 0): RawUtf8;
+
+/// returns a given error code as plain RawUtf8 text
+procedure SetErrorText(var text: RawUtf8; error: integer = 0);
 
 /// returns a given error code as plain text ShortString
 function GetErrorShort(error: integer = 0): TShort63;
@@ -4113,7 +4117,8 @@ procedure XorOSEntropy(var e: THash512Rec);
 // may consider that the output Buffer is always filled with randomness
 // - AllowBlocking=false would try /dev/random if /dev/urandom did fail
 // - you should not have to call this low-level procedure, but faster and broader
-// TAesPrng from mormot.crypt.core - also consider the TSystemPrng class
+// TAesPrng from mormot.crypt.core - also consider the TSystemPrng class or
+// TAesPrng.FillRandomTrusted() wrapper method if you require an audited source
 // - if you need some entropy source, consider TAesPrng.GetEntropy() instead
 function FillSystemRandom(Buffer: PByteArray; Len: integer; AllowBlocking: boolean): boolean;
 
@@ -4270,6 +4275,8 @@ function GetFileNameFromUrl(const Uri: RawUtf8): TFileName;
 {$else}
 
 /// internal function just wrapping fppoll(POLLIN or POLLPRI)
+// - returns 1 if some data is pending, 0 on timeout or EINTR, and -1 on
+// HUP/ERR/NVAL with nothing to read (e.g. closed pipe) or on poll() error
 function WaitReadPending(fd, timeout: integer): integer;
 
 type
@@ -4837,7 +4844,7 @@ type
       {$ifdef HASINLINE} inline; {$endif}
     /// leave an OS lock
     procedure UnLock;
-      {$ifdef FPC_OR_DELPHIXE} inline; {$endif} // fail on Delphi 2006-2010
+      {$ifdef HASSAFEINLINE} inline; {$endif}
   end;
   POSLightLock = ^TOSLightLock;
 
@@ -4894,15 +4901,19 @@ type
   end;
   POSRWLightLock = ^TOSRWLightLock;
 
+  /// TLockedListOne.sequence number identifier
+  // - is an incremental random-seeded 30-bit integer > 65535, to track and
+  // avoid ABA problems when pointer instances are recycled
+  TLockedListID = PtrUInt;
+
   /// points to one data entry in TLockedList
   PLockedListOne = ^TLockedListOne;
   /// abstract parent of one data entry in TLockedList, storing two PLockedListOne
   // - TLockedList should store unmanaged records starting with those fields
-  // - sequence field contains an incremental random-seeded 30-bit integer >
-  // 65535, to avoid ABA problems when instances are recycled
+  // - check sequence field to avoid ABA problems when instances are recycled
   TLockedListOne = record
     next, prev: pointer;
-    sequence: PtrUInt;
+    sequence: TLockedListID;
   end;
   /// optional callback event to finalize one TLockedListOne instance
   TOnLockedListOne = procedure(one: PLockedListOne) of object;
@@ -4923,7 +4934,7 @@ type
     Size: integer;
   private
     fHead, fBin: pointer;
-    fSequence: PtrUInt;
+    fSequence: TLockedListID;
     fOnFree: TOnLockedListOne;
   public
     /// initialize the storage for an inherited TLockedListOne size
@@ -4941,6 +4952,8 @@ type
     /// release all to-be-recycled items available in the internal bin
     // - returns how many items have been released from the internal collector
     function EmptyBin: integer;
+    /// search the list for a given TLockedListOne.sequence identifier
+    function Find(ID: TLockedListID): pointer;
     /// raw access to the stored items as PLockedListOne dual-linked list
     property Head: pointer
       read fHead;
@@ -6963,13 +6976,10 @@ end;
 // enumerates let compiler generate the smallest code
 // - all errors are cross-platform, e.g. when used in centralized servers
 
-const
-  NULL_STR: TShort1 = '';
-
 function _GetEnumNameRtti(Info: pointer; Value: integer): PShortString;
 begin
   // naive version - will properly be implemented in mormot.core.rtti.pas anyway
-  result := @NULL_STR;
+  result := @NULCHAR;
   // arm32 is overcomplex and would rather use typinfo and mormot.core.rtti
   {$ifndef FPC_REQUIRES_PROPER_ALIGNMENT}
   if Value < 0 then
@@ -7302,13 +7312,18 @@ begin
 end;
 
 function GetErrorText(error: integer): RawUtf8;
+begin
+  SetErrorText(result, error);
+end;
+
+procedure SetErrorText(var text: RawUtf8; error: integer);
 var
-  txt: ShortString;
+  tmp: ShortString;
 begin
   if error = 0 then
     error := GetLastError;
-  GetErrorShortVar(error, txt);
-  FastSetString(result, @txt[1], ord(txt[0]));
+  GetErrorShortVar(error, tmp);
+  FastSetString(text, @tmp[1], ord(tmp[0]));
 end;
 
 function ArmCpuType(id: word): TArmCpuType;
@@ -8756,6 +8771,9 @@ begin
   AppendShortCharSafe('B', Dest);
 end;
 
+var
+  _OsFlags: set of (fRawExceptionIntercepted, fSystemEnvCached);
+
 {$ifndef NOEXCEPTIONINTERCEPT}
 
 {$ifndef KEEP_STACKFRAMES}
@@ -8822,9 +8840,6 @@ end;
 {$endif WITH_RAISEEXCEPTOBJPROC}
 {$endif WITH_RAISEPROC}
 
-var
-  RawExceptionIntercepted: boolean; // single global Exception interception
-
 // note that SynLogException() will use PerThreadInfo.ExceptionIgnore to avoid
 // recursive exception logging: global _RawLogException should not be set
 // temporarly to nil or exceptions on concurrent threads would not be logged
@@ -8835,10 +8850,10 @@ begin
   GlobalLock;
   try
     _RawLogException := Handler; // e.g. SynLogException() from mormot.core.log
-    if RawExceptionIntercepted or
+    if (fRawExceptionIntercepted in _OsFlags) or
        not Assigned(Handler) then
       exit;
-    RawExceptionIntercepted := true; // intercept once
+    include(_OsFlags, fRawExceptionIntercepted); // intercept once
     {$ifdef WITH_RAISEPROC} // FPC RTL redirection function
     if not Assigned(OldRaiseProc) then
     begin
@@ -10821,7 +10836,7 @@ begin
       if not fRetrieved[clk][i] then
         if clk = clkArg then
           if i >= length(fDescArg) then
-            result := Join([result, 'Unexpected "', fRawParams[i], '" argument', fLineFeed])
+            result := Join([result, 'Unexpected "', fNames[clkArg][i], '" argument', fLineFeed])
           else
             result := Join([result, 'Missing <', fDescArg[i], '> argument', fLineFeed])
         else
@@ -10973,60 +10988,85 @@ begin
     _SystemPath[kind] := IncludeTrailingPathDelimiter(full);
 end;
 
+function EnsureSystemEnvCached: boolean;
+begin
+  if not (fSystemEnvCached in _OsFlags) then
+  begin
+    OSSafe.Lock;
+    if not (fSystemEnvCached in _OsFlags) then
+      _GetSystemEnv;
+    include(_OsFlags, fSystemEnvCached);
+    OSSafe.UnLock;
+  end;
+  result := _SystemEnvNames <> nil;
+end;
+
+function GetSystemEnvIndex(name: PUtf8Char; len: TStrLen): PtrInt;
+begin
+  if (name <> nil) and
+     (len > 0) and
+     EnsureSystemEnvCached then
+    result := {$ifdef OSPOSIX}FindNonVoidRawUtf8{$else}FindNonVoidRawUtf8I{$endif}(
+      pointer(_SystemEnvNames), name, len, length(_SystemEnvNames))
+  else
+    result := -1;
+end;
+
 function GetSystemEnv(name: PUtf8Char; len: TStrLen): pointer;
 var
   ndx: PtrInt;
 begin
-  result := nil;
-  if (name = nil) or
-     (len <= 0) then
-    exit;
-  if _SystemEnvNames = nil then
-  begin
-    OSSafe.Lock;
-    if _SystemEnvNames = nil then
-      _GetSystemEnv;
-    OSSafe.UnLock;
-    if _SystemEnvNames = nil then
-      exit;
-  end;
-  ndx := {$ifdef OSPOSIX}FindNonVoidRawUtf8{$else}FindNonVoidRawUtf8I{$endif}(
-    pointer(_SystemEnvNames), name, len, length(_SystemEnvNames));
+  ndx := GetSystemEnvIndex(name, len);
   if ndx >= 0 then
-    result := pointer(_SystemEnvValues[ndx]); // O(n) fast found in cache
-end;
-
-function GetSystemEnv(const name: RawUtf8): RawUtf8;
-begin
-  result := RawUtf8(GetSystemEnv(pointer(name), length(name)));
-end;
-
-function GetSystemEnvString(const name: RawUtf8): string;
-begin
-  result := string(GetSystemEnv(name)); // use the RTL
+    result := pointer(_SystemEnvValues[ndx]) // O(n) fast found in cache
+  else
+    result := nil; // not found
 end;
 
 function GetSystemEnv(const name: RawUtf8; var res: RawUtf8): boolean;
 var
-  p: pointer;
+  ndx: PtrInt;
 begin
-  p := GetSystemEnv(pointer(name), length(name));
   result := false;
-  if p = nil then
+  ndx := GetSystemEnvIndex(pointer(name), length(name));
+  if ndx < 0 then
     exit;
+  res := _SystemEnvValues[ndx];
   result := true;
-  res := RawUtf8(p);
+end;
+
+function GetSystemEnv(const name: RawUtf8): RawUtf8;
+begin
+  GetSystemEnv(name, result);
+end;
+
+function GetSystemEnvString(const name: RawUtf8): string;
+var
+  tmp: RawUtf8;
+begin
+  if GetSystemEnv(name, tmp) then
+    result := string(tmp) // use the RTL
+  else
+    result := '';
 end;
 
 function SetSystemEnv(const name, value: RawUtf8): boolean;
 begin
-  result := (GetSystemEnv(name) = value) or
-            _SetSystemEnv(name, value);
+  EnsureSystemEnvCached;
+  result :=  _SetSystemEnv(name, value);
 end;
 
 procedure ResetSystemEnv(const name: RawUtf8);
+var
+  ndx: PtrInt;
 begin
-  SetSystemEnv(name, GetSystemEnv(name));
+  if name = '' then
+    exit;
+  ndx := GetSystemEnvIndex(pointer(name), length(name));
+  if ndx >= 0 then
+    _SetSystemEnv(name, _SystemEnvValues[ndx])
+  else
+    _UnsetSystemEnv(name);
 end;
 
 function _GetExecutableLocation(aAddress: pointer): ShortString;
@@ -12246,6 +12286,25 @@ begin
     Safe.UnLock;
   end;
   result := true;
+end;
+
+function TLockedList.Find(ID: TLockedListID): pointer;
+var
+  o: PLockedListOne;
+begin
+  result := nil;
+  if ID = 0 then
+    exit;
+  Safe.Lock;
+  try
+    o := fHead;
+    while (o <> nil) and
+          (o.sequence <> ID) do
+      o := o.next;
+  finally
+    Safe.UnLock;
+  end;
+  result := o;
 end;
 
 
@@ -13551,7 +13610,7 @@ begin
   GlobalCriticalSection.Done;
   {$ifndef NOEXCEPTIONINTERCEPT}
   _RawLogException := nil;
-  RawExceptionIntercepted := true;
+  include(_OsFlags, fRawExceptionIntercepted); // too late
   {$endif NOEXCEPTIONINTERCEPT}
 end;
 

@@ -123,6 +123,7 @@ type
     function CompressContent(const Accepted: THttpSocketCompressSet;
       const OutContentType: RawUtf8; var OutContent: RawByteString): PHttpSocketCompressRec;
     /// adjust HTTP body decompression according to the supplied 'CONTENT-ENCODING'
+    // - won't raise an exception but return nil on decompression error
     function UncompressContent(const ContentEncoding: RawUtf8;
       var Data: RawByteString): PHttpSocketCompressRec;
     /// search for a given compression function by name
@@ -180,22 +181,20 @@ procedure GetHeaderInfo(const Headers: RawUtf8; out ContentLength: Int64;
 /// remove an HTTP header entry as specified by its name (e.g. 'Authorization')
 function DeleteHeader(const Headers, Name: RawUtf8): RawUtf8;
 
-/// 'HEAD' and 'OPTIONS' methods would be detected and return true
-// - will check only the first four chars for efficiency  - requires method <> ''
-function HttpMethodWithNoBody(const method: RawUtf8): boolean;
-  {$ifdef HASINLINE} inline; {$endif}
+// deprecated ambiguous helper - DO NOT USE any more!
+// - use IsHead() when deciding whether an HTTP response can have content
+// - request content presence must be determined from message framing
+function HttpMethodWithNoBody(const method: RawUtf8): boolean; deprecated;
 
 /// encode some text into a mime header compatible value
 // - see https://tools.ietf.org/html/rfc2047
 function MimeHeaderEncode(const header: RawUtf8): RawUtf8;
 
 /// quick check for case-sensitive 'GET' HTTP method name - requires method <> ''
-// - see also HttpMethodWithNoBody()
 function IsGet(const method: RawUtf8): boolean;
   {$ifdef HASINLINE} inline; {$endif}
 
 /// quick check for case-sensitive 'HEAD' HTTP method name - requires method <> ''
-// - see also HttpMethodWithNoBody()
 function IsHead(const method: RawUtf8): boolean;
   {$ifdef HASINLINE} inline; {$endif}
 
@@ -570,6 +569,15 @@ type
     /// check RangeOffset/RangeLength against ContentLength
     // - and update ResponseFlags and ContentLength properties
     function ValidateRange: boolean;
+    /// add a 'Content-Range: bytes */aSize' header to the ResponseHeaders
+    // - as RFC 9110 #15.5.17 states for a 416 response to a byte-range request:
+    // "the sender SHOULD generate a Content-Range header field specifying the
+    // current length of the selected representation"
+    // - also clears rfRange/rfWantRange, so that CompressContentAndFinalizeHead
+    // won't validate the range again against the error page sent instead, and
+    // add a second (wrong) Content-Range header
+    // - returns HTTP_RANGENOTSATISFIABLE, so can be used as a result
+    function RangeNotSatisfiable(aSize: Int64): integer;
     /// (re)initialize the HTTP Server state machine for ProcessRead/ProcessWrite
     procedure ProcessInit;
       {$ifdef HASINLINE} inline; {$endif}
@@ -671,7 +679,7 @@ type
   protected
     fCompressList: THttpSocketCompressList; // two pointers
     procedure HttpStateReset; // Http.Clear + exclude fBodyRetrieved
-      {$ifdef FPC_OR_DELPHIXE} inline; {$endif}
+      {$ifdef HASSAFEINLINE} inline; {$endif}
     procedure CompressDataAndWriteHeaders(const OutContentType: RawUtf8;
       var OutContent: RawByteString; OutStream: TStream);
   public
@@ -927,7 +935,7 @@ type
     fConnectionID: THttpServerConnectionID;                  // 64-bit
     fConnectionFlags: THttpServerRequestFlags;               // 8-bit
     fAuthenticationStatus: THttpServerRequestAuthentication; // 8-bit
-    fInternalFlags: set of (ifUrlParamPosSet);               // 8-bit
+    fInternalFlags: set of (ifUrlParamPosSet, ifRespSent);   // 8-bit
     fOutContentStreamOpt: THttpOutStreamOptions;             // 8-bit
     fRespStatus: integer;
     fConnectionThread: TThread;
@@ -2932,7 +2940,7 @@ const
 
 function PurgeHeaders(const headers: RawUtf8; trim: boolean; upIgnore: PUtf8Char): RawUtf8;
 var
-  pos, len: array[byte] of word; // delete up to 255 entries
+  pos, len: TByteToWord; // delete up to 255 entries within 0..65335 max size
   n, purged, i, l, tot: PtrInt;
   P, next, last: PUtf8Char;
   h: PUtf8Char absolute headers;
@@ -2947,7 +2955,7 @@ begin
     last := nil;
     if upIgnore = nil then
       upIgnore := TOBEPURGED;
-    if PStrLen(h - _STRLEN)^ <= high(pos[0]) then // void pos[]/len[] overflow
+    if PStrLen(P - _STRLEN)^ <= high(pos[0]) then // void pos[]/len[] overflow
       while P^ <> #0 do
       begin
         next := GotoNextLineSmall(P);
@@ -3522,12 +3530,15 @@ function THttpSocketCompressList.UncompressContent(const ContentEncoding: RawUtf
   var Data: RawByteString): PHttpSocketCompressRec;
 begin
   result := FoundCompress(pointer(Algo),
-    pointer(ContentEncoding), length(ContentEncoding));
-  if result = nil then
-    exit;
-  result^.Func(Data, {compress=}false);
-  if Data = '' then
-      result := nil; // error during decompression
+              pointer(ContentEncoding), length(ContentEncoding));
+  if result <> nil then
+    try
+      result^.Func(Data, {compress=}false);
+      if Data = '' then
+        result := nil; // error during decompression
+    except
+      result := nil;   // catch any exception here
+    end;
 end;
 
 procedure THttpSocketCompressList.DecodeAcceptEncoding(P: PUtf8Char;
@@ -3558,7 +3569,8 @@ function THttpSocketCompressList.CompressIndex(const Name: RawUtf8): integer;
 begin
   if (@self = nil) or
      (Algo = nil) or
-     (FoundCompress(pointer(Algo), pointer(Name), length(Name), @result) = nil) then
+     (FoundCompress(pointer(Algo),
+        pointer(Name), length(Name), @result) = nil) then
     result := -1;
 end;
 
@@ -3694,6 +3706,15 @@ begin
     include(ResponseFlags, rfRange);
     result := true;
   end;
+end;
+
+function THttpRequestContext.RangeNotSatisfiable(aSize: Int64): integer;
+begin
+  AppendLine(ResponseHeaders, ['Content-Range: bytes */', aSize]);
+  // clear both flags, otherwise CompressContentAndFinalizeHead would
+  // validate the range once again, against the generated error page
+  ResponseFlags := ResponseFlags - [rfRange, rfWantRange];
+  result := HTTP_RANGENOTSATISFIABLE;
 end;
 
 procedure THttpRequestContext.ParseHeader(P: PUtf8Char; PLen: PtrInt;
@@ -4171,8 +4192,10 @@ var
   Len: PtrInt;
 begin
   Len := ByteScanIndex(pointer(st.P), st.Len, 13); // fast SSE2 or FPC IndexByte
-  result := (PtrUInt(Len) < PtrUInt(st.Len)) and // detect st.Len=0 and/or Len=-1
-            DoProcessParseLine(st, Len);         // enough input: sub-function
+  if PtrUInt(Len) < PtrUInt(st.Len) then  // detect st.Len=0 and/or Len=-1
+    result := DoProcessParseLine(st, Len) // enough input: sub-function
+  else
+    result := false;
 end;
 
 function THttpRequestContext.DoProcessReadBody(var st: TProcessParseLine): boolean;
@@ -4622,10 +4645,8 @@ begin
       result := HTTP_RANGENOTSATISFIABLE;
   if result <> HTTP_SUCCESS then
   begin
+    RangeNotSatisfiable(aLength); // also clears rfRange/rfWantRange
     ContentLength := 0;
-    // clear both flags, otherwise CompressContentAndFinalizeHead would
-    // validate the range once again, against the generated error page
-    ResponseFlags := ResponseFlags - [rfRange, rfWantRange];
     exit;
   end;
   if not (hosNoRange in aOptions) then
@@ -4670,7 +4691,7 @@ begin
   if rfWantRange in ResponseFlags then
     if not ValidateRange then
     begin
-      result := HTTP_RANGENOTSATISFIABLE;
+      result := RangeNotSatisfiable(ContentLength); // ContentLength = file size
       exit;
     end;
   include(ResponseFlags, rfAcceptRange);
