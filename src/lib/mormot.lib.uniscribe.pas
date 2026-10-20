@@ -1127,8 +1127,8 @@ begin
     inc(e);
   end;
   // finalize the generated content
-  for i := 0 to ((SizeOf(dir^) + (n * SizeOf(e^))) shr 2) - 1 do
-    inc(checksum, PCardinalArray(Ttf)[i]);
+  for i := 0 to ((SizeOf(dir^) + (n * SizeOf(e^))) shr 2) - 1 do // big-endian
+    inc(checksum, bswap32(PCardinalArray(Ttf)[i]));
   if head <> nil then // head.checkSumAdjustment is at offset 8
     PCardinal(head + 8)^ := bswap32($B1B0AFBA - checksum);
   SetLength(Ttf, PtrUInt(d) - PtrUInt(Ttf));
