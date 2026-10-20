@@ -308,7 +308,7 @@ type
 /// extract one face of a TrueType Collection as a standalone sfnt font
 // - a 'ttcf' container is not a valid /FontFile2 stream: it must be turned into
 //   a single font, which both backends do with this function
-//   (IFontProvider.GetFaceFile)
+//   (IFontFace.GetFaceFile)
 // - returns '' when ATtc is not a collection, i.e. already a usable sfnt
 function ExtractSfntFromTtc(const ATtc: RawByteString;
   AFaceIndex: integer): RawByteString;
