@@ -31,8 +31,8 @@ implementation
 {$else}
 
 uses
-  SysUtils,
-  Classes,
+  sysutils,
+  classes,
   mormot.core.base,
   mormot.core.os,
   mormot.core.unicode,
@@ -85,7 +85,7 @@ type
     generic_data: pointer;
     generic_finalizer: pointer;
     bbox: FT_BBox;
-    units_per_EM: Word;  // FT_UShort = 2 bytes
+    units_per_EM: word;  // FT_UShort = 2 bytes
     ascender: SmallInt;  // FT_Short  = 2 bytes
     descender: SmallInt; // negative value
     height: SmallInt;
@@ -367,7 +367,7 @@ begin
         ScanFontsDir(IncludeTrailingPathDelimiter(ADir) + sr.Name, AMap)
       else
       begin
-        ext := SysUtils.LowerCase(ExtractFileExt(sr.Name));
+        ext := sysutils.LowerCase(ExtractFileExt(sr.Name));
         if (ext = '.ttf') or (ext = '.otf') or (ext = '.ttc') then
         begin
           if not FreeType.Loaded then
@@ -622,8 +622,8 @@ begin
   Metrics.tmWeight := 400; // FW_NORMAL; caller sets bold separately
   Metrics.tmFirstChar := WideChar(32);
   Metrics.tmLastChar := WideChar(255);
-  Metrics.tmDefaultChar := WideChar(Ord('?'));
-  Metrics.tmBreakChar := WideChar(Ord(' '));
+  Metrics.tmDefaultChar := WideChar(ord('?'));
+  Metrics.tmBreakChar := WideChar(ord(' '));
   Metrics.tmItalic := 0;
   Metrics.tmCharSet := 0; // ANSI_CHARSET
   if ctx^.IsFixedWidth then

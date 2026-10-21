@@ -32,7 +32,7 @@ implementation
 {$else}
 
 uses
-  SysUtils,
+  sysutils,
   mormot.core.base,
   mormot.core.os,
   mormot.lib.core,
