@@ -71,55 +71,55 @@ type
   // FT_FaceRec - we only access the fields we need via typed pointer
   PFT_FaceRec = ^FT_FaceRec;
   FT_FaceRec = record
-    num_faces:        FT_Long;
-    face_index:       FT_Long;
-    face_flags:       FT_Long;
-    style_flags:      FT_Long;
-    num_glyphs:       FT_Long;
-    family_name:      PAnsiChar;
-    style_name:       PAnsiChar;
-    num_fixed_sizes:  FT_Int;
-    available_sizes:  pointer;
-    num_charmaps:     FT_Int;
-    charmaps:         pointer;
-    generic_data:     pointer;
+    num_faces: FT_Long;
+    face_index: FT_Long;
+    face_flags: FT_Long;
+    style_flags: FT_Long;
+    num_glyphs: FT_Long;
+    family_name: PAnsiChar;
+    style_name: PAnsiChar;
+    num_fixed_sizes: FT_Int;
+    available_sizes: pointer;
+    num_charmaps: FT_Int;
+    charmaps: pointer;
+    generic_data: pointer;
     generic_finalizer: pointer;
-    bbox:             FT_BBox;
-    units_per_EM:     Word;        // FT_UShort = 2 bytes
-    ascender:         SmallInt;    // FT_Short  = 2 bytes
-    descender:        SmallInt;    // negative value
-    height:           SmallInt;
-    max_advance_width:  SmallInt;
+    bbox: FT_BBox;
+    units_per_EM: Word;  // FT_UShort = 2 bytes
+    ascender: SmallInt;  // FT_Short  = 2 bytes
+    descender: SmallInt; // negative value
+    height: SmallInt;
+    max_advance_width: SmallInt;
     max_advance_height: SmallInt;
-    underline_position:  SmallInt;
+    underline_position: SmallInt;
     underline_thickness: SmallInt;
-    glyph:           pointer;
-    size:            pointer;
-    charmap:         pointer;
+    glyph: pointer;
+    size: pointer;
+    charmap: pointer;
   end;
 
   // FT_GlyphSlotRec - we only need metrics
   PFT_GlyphMetrics = ^FT_GlyphMetrics;
   FT_GlyphMetrics = record
-    width:         FT_Pos;
-    height:        FT_Pos;
-    horiBearingX:  FT_Pos;
-    horiBearingY:  FT_Pos;
-    horiAdvance:   FT_Pos;
-    vertBearingX:  FT_Pos;
-    vertBearingY:  FT_Pos;
-    vertAdvance:   FT_Pos;
+    width: FT_Pos;
+    height: FT_Pos;
+    horiBearingX: FT_Pos;
+    horiBearingY: FT_Pos;
+    horiAdvance: FT_Pos;
+    vertBearingX: FT_Pos;
+    vertBearingY: FT_Pos;
+    vertAdvance: FT_Pos;
   end;
 
   PFT_GlyphSlotRec = ^FT_GlyphSlotRec;
   FT_GlyphSlotRec = record
-    library_:      FT_Library;
-    face:          FT_Face;
-    next:          pointer;
-    reserved:      FT_UInt;
-    generic_data:  pointer;
+    library_: FT_Library;
+    face: FT_Face;
+    next: pointer;
+    reserved: FT_UInt;
+    generic_data: pointer;
     generic_finalizer: pointer;
-    metrics:       FT_GlyphMetrics;
+    metrics: FT_GlyphMetrics;
     // ... more fields we don't need
   end;
 
@@ -157,19 +157,19 @@ type
   protected
     fLoaded: boolean;
   public
-    Init:             TFT_Init_FreeType;
-    Done:             TFT_Done_FreeType;
-    NewFace:          TFT_New_Face;
-    DoneFace:         TFT_Done_Face;
-    SetCharSize:      TFT_Set_Char_Size;
-    LoadChar:         TFT_Load_Char;
-    LoadSfntTable:    TFT_Load_Sfnt_Table;
-    LoadGlyph:        TFT_Load_Glyph;
-    NewMemoryFace:    TFT_New_Memory_Face;
-    SelectCharmap:    TFT_Select_Charmap;
-    GetCharIndex:     TFT_Get_Char_Index;
+    Init: TFT_Init_FreeType;
+    Done: TFT_Done_FreeType;
+    NewFace: TFT_New_Face;
+    DoneFace: TFT_Done_Face;
+    SetCharSize: TFT_Set_Char_Size;
+    LoadChar: TFT_Load_Char;
+    LoadSfntTable: TFT_Load_Sfnt_Table;
+    LoadGlyph: TFT_Load_Glyph;
+    NewMemoryFace: TFT_New_Memory_Face;
+    SelectCharmap: TFT_Select_Charmap;
+    GetCharIndex: TFT_Get_Char_Index;
     /// the FT_Library instance of FT_Init_FreeType
-    FTLibrary:        FT_Library;
+    FTLibrary: FT_Library;
     /// true once the library is loaded and initialized - false on nil
     function Loaded: boolean;
       {$ifdef HASINLINE} inline; {$endif}
@@ -188,10 +188,10 @@ function LoadFreeType: boolean;
 type
   /// maps a font family name (UTF-8) to the best matching .ttf/.otf file path
   TFontFileMap = record
-    FamilyName: RawUtf8;    // e.g. 'DejaVu Sans'
-    FilePath:   RawUtf8;    // absolute path to the font file
-    Bold:       boolean;
-    Italic:     boolean;
+    FamilyName: RawUtf8; // e.g. 'DejaVu Sans'
+    FilePath: RawUtf8;   // absolute path to the font file
+    Bold: boolean;
+    Italic: boolean;
   end;
   TFontFileMapDynArray = array of TFontFileMap;
 
@@ -210,18 +210,18 @@ type
   /// the record behind a TFontHandle of TFreeTypeFontProvider
   // - public so that mormot.lib.harfbuzz can reach the FT_Face
   TFreeTypeFont = record
-    Face:         FT_Face;   // FreeType2 face handle
-    FilePath:     RawUtf8;   // absolute path (for diagnostics)
-    UnitsPerEM:   integer;   // face^.units_per_EM
-    Ascent:       integer;   // scaled ascender  (design units * 1000 / UPM)
-    Descent:      integer;   // scaled descender (negative)
-    Height:       integer;
+    Face: FT_Face;       // FreeType2 face handle
+    FilePath: RawUtf8;   // absolute path (for diagnostics)
+    UnitsPerEM: integer; // face^.units_per_EM
+    Ascent: integer;     // scaled ascender  (design units * 1000 / UPM)
+    Descent: integer;    // scaled descender (negative)
+    Height: integer;
     IsFixedWidth: boolean;
-    IsSymbol:     boolean;   // only a (3,0) cmap, selected by CreateFace
-    FaceIndex:    integer;   // index of the face opened within a .ttc
-    Data:         RawByteString; // a registered font: FreeType reads these bytes
-    Sfnt:         RawByteString; // cached standalone sfnt built from a .ttc
-    SfntChecked:  boolean;   // true once the file has been tested for 'ttcf'
+    IsSymbol: boolean;    // only a (3,0) cmap, selected by CreateFace
+    FaceIndex: integer;   // index of the face opened within a .ttc
+    Data: RawByteString;  // a registered font: FreeType reads these bytes
+    Sfnt: RawByteString;  // cached standalone sfnt built from a .ttc
+    SfntChecked: boolean; // true once the file has been tested for 'ttcf'
   end;
   PFreeTypeFont = ^TFreeTypeFont;
 
@@ -349,12 +349,12 @@ end;
 
 procedure ScanFontsDir(const ADir: string; var AMap: TFontFileMapDynArray);
 var
-  sr:    TSearchRec;
-  ext:   string;
+  sr: TSearchRec;
+  ext: string;
   entry: TFontFileMap;
-  face:  FT_Face;
+  face: FT_Face;
   fname: RawUtf8;
-  n:     integer;
+  n: integer;
 begin
   if not DirectoryExists(ADir) then
     exit;
@@ -385,12 +385,12 @@ begin
               entry.FilePath);
             if PFT_FaceRec(face)^.style_name <> nil then
             begin
-              entry.Bold   := Pos('Bold',   string(PFT_FaceRec(face)^.style_name)) > 0;
+              entry.Bold := Pos('Bold', string(PFT_FaceRec(face)^.style_name)) > 0;
               entry.Italic := Pos('Italic', string(PFT_FaceRec(face)^.style_name)) > 0;
             end
             else
             begin
-              entry.Bold   := false;
+              entry.Bold := false;
               entry.Italic := false;
             end;
             AMap[n] := entry;
@@ -407,25 +407,25 @@ end;
 function FindFontFile(const AMap: TFontFileMapDynArray;
   const AFaceName: RawUtf8; ABold, AItalic: boolean): RawUtf8;
 var
-  i:     integer;
-  best:  integer;
+  i: integer;
+  best: integer;
   score: integer;
-  s:     integer;
+  s: integer;
 begin
   result := '';
-  best   := -1;
-  score  := -1;
+  best := -1;
+  score := -1;
   for i := 0 to high(AMap) do
   begin
     if SameTextU(AMap[i].FamilyName, AFaceName) then
     begin
       s := 0;
-      if AMap[i].Bold   = ABold   then inc(s, 2);
+      if AMap[i].Bold = ABold then inc(s, 2);
       if AMap[i].Italic = AItalic then inc(s, 2);
       if s > score then
       begin
         score := s;
-        best  := i;
+        best := i;
       end;
     end;
   end;
@@ -494,12 +494,12 @@ function TFreeTypeFontProvider.CreateFace(
 var
   faceName: RawUtf8;
   filePath: RawUtf8;
-  face:     FT_Face;
-  ctx:      PFreeTypeFont;
-  faceRec:  PFT_FaceRec;
+  face: FT_Face;
+  ctx: PFreeTypeFont;
+  faceRec: PFT_FaceRec;
   bold, italic: boolean;
-  data:     RawByteString;
-  index:    integer;
+  data: RawByteString;
+  index: integer;
 begin
   result := nil;
   if not FreeType.Loaded then
@@ -515,7 +515,7 @@ begin
   end
   else
   begin
-    bold   := Request.Weight >= 600;
+    bold := Request.Weight >= 600;
     italic := Request.Italic <> 0;
     faceName := SynUnicodeToUtf8(Request.FaceName);
     filePath := FindFontFile(fFontMap, faceName, bold, italic);
@@ -539,20 +539,20 @@ begin
   // so SetCharSize is not needed here anymore
   faceRec := PFT_FaceRec(face);
   New(ctx);
-  ctx^.Face         := face;
-  ctx^.FilePath     := filePath;
-  ctx^.UnitsPerEM   := faceRec^.units_per_EM;
-  ctx^.Ascent       := ScaleDesignUnit(faceRec^.ascender,    ctx^.UnitsPerEM);
-  ctx^.Descent      := ScaleDesignUnit(faceRec^.descender,   ctx^.UnitsPerEM);
-  ctx^.Height       := ScaleDesignUnit(faceRec^.height,      ctx^.UnitsPerEM);
+  ctx^.Face := face;
+  ctx^.FilePath := filePath;
+  ctx^.UnitsPerEM := faceRec^.units_per_EM;
+  ctx^.Ascent := ScaleDesignUnit(faceRec^.ascender, ctx^.UnitsPerEM);
+  ctx^.Descent := ScaleDesignUnit(faceRec^.descender, ctx^.UnitsPerEM);
+  ctx^.Height := ScaleDesignUnit(faceRec^.height, ctx^.UnitsPerEM);
   ctx^.IsFixedWidth := (faceRec^.face_flags and FT_FACE_FLAG_FIXED_WIDTH) <> 0;
   // FreeType selects no charmap for a face whose only cmap is the symbol one
   // (Wingdings), and FT_Load_Char would then take a code for a glyph index
-  ctx^.IsSymbol     := (faceRec^.charmap = nil) and
-                       (FreeType.SelectCharmap(face, FT_ENCODING_MS_SYMBOL) = 0);
-  ctx^.FaceIndex    := index;
-  ctx^.Data         := data;
-  ctx^.SfntChecked  := false; // New() initializes managed fields only
+  ctx^.IsSymbol := (faceRec^.charmap = nil) and
+                   (FreeType.SelectCharmap(face, FT_ENCODING_MS_SYMBOL) = 0);
+  ctx^.FaceIndex := index;
+  ctx^.Data := data;
+  ctx^.SfntChecked := false; // New() initializes managed fields only
   result := TFreeTypeFontFace.Create(ctx);
 end;
 
@@ -602,30 +602,30 @@ end;
 function TFreeTypeFontFace.GetTextMetrics(out Metrics: TFontMetrics): boolean;
 var
   ctx: PFreeTypeFont;
-  fr:  PFT_FaceRec;
+  fr: PFT_FaceRec;
 begin
   result := false;
   ctx := fFont;
   if ctx = nil then
     exit;
-  fr  := PFT_FaceRec(ctx^.Face);
+  fr := PFT_FaceRec(ctx^.Face);
   FillChar(Metrics, SizeOf(Metrics), 0);
-  Metrics.tmAscent  := ctx^.Ascent;
+  Metrics.tmAscent := ctx^.Ascent;
   Metrics.tmDescent := -ctx^.Descent; // make positive like Windows
-  Metrics.tmHeight  := Metrics.tmAscent + Metrics.tmDescent;
+  Metrics.tmHeight := Metrics.tmAscent + Metrics.tmDescent;
   Metrics.tmInternalLeading := 0;
   Metrics.tmExternalLeading := ScaleDesignUnit(fr^.height, ctx^.UnitsPerEM)
                                 - Metrics.tmHeight;
   // Average char width ~ em-width / 2 (rough estimate)
   Metrics.tmAveCharWidth := ctx^.Ascent div 2;
   Metrics.tmMaxCharWidth := ctx^.Ascent;
-  Metrics.tmWeight       := 400; // FW_NORMAL; caller sets bold separately
-  Metrics.tmFirstChar    := WideChar(32);
-  Metrics.tmLastChar     := WideChar(255);
-  Metrics.tmDefaultChar  := WideChar(Ord('?'));
-  Metrics.tmBreakChar    := WideChar(Ord(' '));
-  Metrics.tmItalic       := 0;
-  Metrics.tmCharSet      := 0; // ANSI_CHARSET
+  Metrics.tmWeight := 400; // FW_NORMAL; caller sets bold separately
+  Metrics.tmFirstChar := WideChar(32);
+  Metrics.tmLastChar := WideChar(255);
+  Metrics.tmDefaultChar := WideChar(Ord('?'));
+  Metrics.tmBreakChar := WideChar(Ord(' '));
+  Metrics.tmItalic := 0;
+  Metrics.tmCharSet := 0; // ANSI_CHARSET
   if ctx^.IsFixedWidth then
     Metrics.tmPitchAndFamily := 0  // fixed pitch: bit 0 = 0
   else
@@ -637,42 +637,42 @@ function TFreeTypeFontFace.GetOutlineMetrics(
   out Metrics: TFontOutlineMetrics): boolean;
 var
   ctx: PFreeTypeFont;
-  fr:  PFT_FaceRec;
+  fr: PFT_FaceRec;
 begin
   result := false;
   ctx := fFont;
   if ctx = nil then
     exit;
-  fr  := PFT_FaceRec(ctx^.Face);
+  fr := PFT_FaceRec(ctx^.Face);
   FillChar(Metrics, SizeOf(Metrics), 0);
-  Metrics.otmSize     := SizeOf(Metrics);
-  Metrics.otmAscent   := ctx^.Ascent;
-  Metrics.otmDescent  := ctx^.Descent; // negative
-  Metrics.otmLineGap  := Metrics.otmAscent - Metrics.otmDescent;
+  Metrics.otmSize := SizeOf(Metrics);
+  Metrics.otmAscent := ctx^.Ascent;
+  Metrics.otmDescent := ctx^.Descent; // negative
+  Metrics.otmLineGap := Metrics.otmAscent - Metrics.otmDescent;
   Metrics.otmItalicAngle := 0;
-  Metrics.otmrcFontBox.Left   := ScaleDesignUnit(fr^.bbox.xMin, ctx^.UnitsPerEM);
+  Metrics.otmrcFontBox.Left := ScaleDesignUnit(fr^.bbox.xMin, ctx^.UnitsPerEM);
   Metrics.otmrcFontBox.Bottom := ScaleDesignUnit(fr^.bbox.yMin, ctx^.UnitsPerEM);
-  Metrics.otmrcFontBox.Right  := ScaleDesignUnit(fr^.bbox.xMax, ctx^.UnitsPerEM);
-  Metrics.otmrcFontBox.Top    := ScaleDesignUnit(fr^.bbox.yMax, ctx^.UnitsPerEM);
-  Metrics.otmMacAscent  := Metrics.otmAscent;
+  Metrics.otmrcFontBox.Right := ScaleDesignUnit(fr^.bbox.xMax, ctx^.UnitsPerEM);
+  Metrics.otmrcFontBox.Top := ScaleDesignUnit(fr^.bbox.yMax, ctx^.UnitsPerEM);
+  Metrics.otmMacAscent := Metrics.otmAscent;
   Metrics.otmMacDescent := Metrics.otmDescent;
-  Metrics.otmEMSquare   := ctx^.UnitsPerEM;
+  Metrics.otmEMSquare := ctx^.UnitsPerEM;
   result := true;
 end;
 
 function TFreeTypeFontFace.GetCharAbcWidths(FirstChar, LastChar: cardinal;
   out Widths: TFontCharAbcArray): boolean;
 var
-  ctx:   PFreeTypeFont;
-  n, i:  integer;
-  slot:  PFT_GlyphSlotRec;
-  adv:   FT_Pos;
-  lsb:   FT_Pos;   // left side bearing (A width)
-  rsb:   FT_Pos;   // right side bearing (C width)
-  code:  cardinal;
+  ctx: PFreeTypeFont;
+  n, i: integer;
+  slot: PFT_GlyphSlotRec;
+  adv: FT_Pos;
+  lsb: FT_Pos; // left side bearing (A width)
+  rsb: FT_Pos; // right side bearing (C width)
+  code: cardinal;
   glyph: FT_UInt;
   range: cardinal;
-  a, c:  integer;
+  a, c: integer;
   total: integer;
   loaded: boolean;
 begin

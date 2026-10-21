@@ -87,10 +87,10 @@ type
   /// HarfBuzz glyph info record (matches hb_glyph_info_t in harfbuzz/hb.h)
   hb_glyph_info_t = packed record
     codepoint: hb_codepoint_t; // shaped glyph ID (not a Unicode codepoint)
-    mask:      hb_mask_t;
-    cluster:   cardinal;       // index of corresponding source character
-    var1_:     cardinal;       // HarfBuzz-internal
-    var2_:     cardinal;       // HarfBuzz-internal
+    mask: hb_mask_t;
+    cluster: cardinal; // index of corresponding source character
+    var1_: cardinal;   // HarfBuzz-internal
+    var2_: cardinal;   // HarfBuzz-internal
   end;
   // array pointer for indexed access to hb_buffer_get_glyph_infos result
   hb_glyph_info_array     = array[0..high(integer) div SizeOf(hb_glyph_info_t) - 1]
@@ -101,9 +101,9 @@ type
   hb_glyph_position_t = packed record
     x_advance: hb_position_t; // horizontal advance in font units
     y_advance: hb_position_t;
-    x_offset:  hb_position_t;
-    y_offset:  hb_position_t;
-    var_:      integer;        // HarfBuzz-internal
+    x_offset: hb_position_t;
+    y_offset: hb_position_t;
+    var_: integer; // HarfBuzz-internal
   end;
   // array pointer for indexed access to hb_buffer_get_glyph_positions result
   hb_glyph_position_array  = array[0..high(integer) div SizeOf(hb_glyph_position_t) - 1]
@@ -166,14 +166,14 @@ type
   protected
     fLoaded: boolean;
   public
-    ft_font_create:  Thb_ft_font_create;
-    font_destroy:    Thb_font_destroy;
-    buffer_create:   Thb_buffer_create;
-    buffer_destroy:  Thb_buffer_destroy;
+    ft_font_create: Thb_ft_font_create;
+    font_destroy: Thb_font_destroy;
+    buffer_create: Thb_buffer_create;
+    buffer_destroy: Thb_buffer_destroy;
     buffer_add_utf16: Thb_buffer_add_utf16;
     buffer_set_direction: Thb_buffer_set_direction;
     buffer_guess_segment_properties: Thb_buffer_guess_segment_properties;
-    shape:           Thb_shape;
+    shape: Thb_shape;
     buffer_get_glyph_infos: Thb_buffer_get_glyph_infos;
     buffer_get_glyph_positions: Thb_buffer_get_glyph_positions;
     // the script runs of a mixed text - all available since HarfBuzz 0.9.2
