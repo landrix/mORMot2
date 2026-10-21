@@ -420,8 +420,10 @@ begin
     if SameTextU(AMap[i].FamilyName, AFaceName) then
     begin
       s := 0;
-      if AMap[i].Bold = ABold then inc(s, 2);
-      if AMap[i].Italic = AItalic then inc(s, 2);
+      if AMap[i].Bold = ABold then
+        inc(s, 2);
+      if AMap[i].Italic = AItalic then
+        inc(s, 2);
       if s > score then
       begin
         score := s;
