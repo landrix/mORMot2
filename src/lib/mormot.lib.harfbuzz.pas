@@ -776,64 +776,65 @@ var
   data: PAnsiChar;
   len: cardinal;
   i: PtrInt;
+  lib: THarfBuzzSubsetLib;
+  core: THarfBuzzSubsetCoreLib;
 begin
   result := false;
   Output := '';
   if not HbSubset.Loaded or
      not IsEmbeddableOutlines(Face) then
     exit;
-  with HbSubset, HbSubset.Core do
-  begin
-    // READONLY: Face outlives the blob, which is destroyed below
-    blob := blob_create(pointer(Face), length(Face), HB_MEMORY_MODE_READONLY,
-      nil, nil);
-    face_ := face_create(blob, 0); // a .ttc face was already extracted
-    input := input_create_or_fail;
-    subface := nil;
-    try
-      if input = nil then
-        exit;
-      s := input_unicode_set(input);
-      for i := 0 to high(Request.Unicodes) do
-        set_add(s, Request.Unicodes[i]);
-      s := input_glyph_set(input);
-      set_add(s, 0); // .notdef is always part of a TrueType font
-      for i := 0 to high(Request.Glyphs) do
-        set_add(s, Request.Glyphs[i]);
-      input_set_flags(input, HbSubsetFlags or HB_SUBSET_FLAGS_RETAIN_GIDS);
-      if HbSubsetDropLayoutTables then
-      begin
-        s := input_set(input, HB_SUBSET_SETS_DROP_TABLE_TAG);
-        set_add(s, HB_TAG_GSUB);
-        set_add(s, HB_TAG_GPOS);
-        set_add(s, HB_TAG_GDEF);
-      end;
-      subface := subset_or_fail(face_, input);
-      if subface = nil then
-        exit;
-      subblob := face_reference_blob(subface);
-      try
-        len := 0;
-        data := blob_get_data(subblob, len);
-        // HarfBuzz < 10.0 returns an sfnt without tables instead of nil for a
-        // face without glyphs: no table means failure, so the face goes whole
-        if (data = nil) or
-           (len < 12) or
-           (((ord(data[4]) shl 8) or ord(data[5])) = 0) then
-          exit;
-        FastSetRawByteString(Output, data, len);
-        result := true;
-      finally
-        blob_destroy(subblob);
-      end;
-    finally
-      if subface <> nil then
-        face_destroy(subface);
-      if input <> nil then
-        input_destroy(input);
-      face_destroy(face_);
-      blob_destroy(blob);
+  lib := HbSubset;
+  core := HbSubset.Core;
+  // READONLY: Face outlives the blob, which is destroyed below
+  blob := core.blob_create(pointer(Face), length(Face), HB_MEMORY_MODE_READONLY,
+    nil, nil);
+  face_ := core.face_create(blob, 0); // a .ttc face was already extracted
+  input := lib.input_create_or_fail;
+  subface := nil;
+  try
+    if input = nil then
+      exit;
+    s := lib.input_unicode_set(input);
+    for i := 0 to high(Request.Unicodes) do
+      core.set_add(s, Request.Unicodes[i]);
+    s := lib.input_glyph_set(input);
+    core.set_add(s, 0); // .notdef is always part of a TrueType font
+    for i := 0 to high(Request.Glyphs) do
+      core.set_add(s, Request.Glyphs[i]);
+    lib.input_set_flags(input, HbSubsetFlags or HB_SUBSET_FLAGS_RETAIN_GIDS);
+    if HbSubsetDropLayoutTables then
+    begin
+      s := lib.input_set(input, HB_SUBSET_SETS_DROP_TABLE_TAG);
+      core.set_add(s, HB_TAG_GSUB);
+      core.set_add(s, HB_TAG_GPOS);
+      core.set_add(s, HB_TAG_GDEF);
     end;
+    subface := lib.subset_or_fail(face_, input);
+    if subface = nil then
+      exit;
+    subblob := core.face_reference_blob(subface);
+    try
+      len := 0;
+      data := core.blob_get_data(subblob, len);
+      // HarfBuzz < 10.0 returns an sfnt without tables instead of nil for a
+      // face without glyphs: no table means failure, so the face goes whole
+      if (data = nil) or
+         (len < 12) or
+         (((ord(data[4]) shl 8) or ord(data[5])) = 0) then
+        exit;
+      FastSetRawByteString(Output, data, len);
+      result := true;
+    finally
+      core.blob_destroy(subblob);
+    end;
+  finally
+    if subface <> nil then
+      core.face_destroy(subface);
+    if input <> nil then
+      lib.input_destroy(input);
+    core.face_destroy(face_);
+    core.blob_destroy(blob);
   end;
 end;
 
