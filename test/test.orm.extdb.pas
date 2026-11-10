@@ -32,6 +32,8 @@ uses
   mormot.db.nosql.bson,
   mormot.db.raw.sqlite3,
   mormot.db.raw.sqlite3.static,
+  mormot.db.raw.duckdb,
+  mormot.db.sql.duckdb,
   mormot.db.proxy,
   mormot.orm.base,
   mormot.orm.core,
@@ -64,6 +66,12 @@ type
   protected
     fExternalModel: TOrmModel;
     fPeopleData: TOrmTable;
+    /// regular Engine*() from another thread during a BATCH of this thread
+    procedure BatchFromOtherThread(Sender: TObject);
+    /// test an external DuckDB database via direct REST calls
+    // - DuckDB is an OLAP engine, very slow for single row INSERT/UPDATE: this
+    // is a small test, and the Virtual Table (one row per statement) is not used
+    procedure ExternalDuckDB(Sender: TObject);
     /// called by ExternalViaREST/ExternalViaVirtualTable and
     // ExternalViaRESTWithChangeTracking tests method
     procedure Test(StaticVirtualTableDirect, TrackChanges: boolean);
@@ -79,8 +87,6 @@ type
     procedure NewStatementFailure;
     /// EngineLockedNextID() when 'select max(ID)' fails (e.g. connection lost)
     procedure NextIDSelectMaxFailure;
-    /// regular Engine*() from another thread during a BATCH of this thread
-    procedure BatchFromOtherThread;
     /// SharedTransaction() when the actual Commit fails
     procedure SharedTransactionCommitFailure;
     /// initialize needed RESTful client (and server) instances
@@ -731,6 +737,129 @@ begin
   Test(true, true);
 end;
 
+procedure TTestExternalDatabase.ExternalDuckDB;
+const
+  COUNT = 2000;
+  BLOB_COUNT = 100;
+var
+  props: TSqlDBConnectionProperties;
+  client: TRestClientDB;
+  ext: TOrmPeopleExt;
+  blob: TOrmOnlyBlob;
+  ids: TIDDynArray;
+  i: integer;
+begin
+  if fExternalModel = nil then
+    exit; // avoid GPF if previous methods of TTestExternalDatabase were not run
+  props := nil;
+  {$ifdef CPU64}
+  // the DuckDB library should be within the main executable folder
+  if FileExists(Executable.ProgramFilePath + DuckDBLibraryName) then
+  begin
+    TSynLog.Family.ExceptionIgnoreCurrentThread := true;
+    try
+      if DuckDBLibraryAvailable then
+        props := TSqlDBDuckDBConnectionProperties.Create(':memory:', '', '', '');
+    finally
+      TSynLog.Family.ExceptionIgnoreCurrentThread := false;
+    end;
+  end;
+  {$endif CPU64}
+  if props = nil then
+  begin
+    NotifyProgress(['DuckDB library not available - test skipped']);
+    exit;
+  end;
+  // map the same tables as Test(): TOrmPeopleExt has renamed fields, so its
+  // batch uses the multi-values INSERT, whereas TOrmOnlyBlob may use the Appender
+  Check(OrmMapExternal(fExternalModel, TOrmPeopleExt, props, 'PeopleExternal').
+    MapField('ID', 'Key').
+    MapField('YearOfDeath', 'YOD').
+    MapAutoKeywordFields <> nil);
+  Check(OrmMapExternal(fExternalModel, TOrmOnlyBlob, props, 'OnlyBlobExternal') <> nil);
+  Check(OrmMapExternal(fExternalModel, TOrmTestJoin, props, 'TestJoinExternal') <> nil);
+  Check(OrmMapExternal(fExternalModel, TOrmASource,  props, 'SourceExternal')   <> nil);
+  Check(OrmMapExternal(fExternalModel, TOrmADest,    props, 'DestExternal')     <> nil);
+  Check(OrmMapExternal(fExternalModel, TOrmADests,   props, 'DestsExternal')    <> nil);
+  DeleteFile('testExternal.db3');
+  client := TRestClientDB.Create(
+    fExternalModel, nil, 'testExternal.db3', TRestServerDB);
+  try
+    client.Server.Server.SetStaticVirtualTableDirect(true);
+    client.Server.Server.CreateMissingTables;
+    ext := TOrmPeopleExt.Create;
+    blob := TOrmOnlyBlob.Create;
+    try
+      // batch insert
+      CheckEqual(client.Orm.TableRowCount(TOrmPeopleExt), 0);
+      client.Client.BatchStart(TOrmPeopleExt);
+      for i := 1 to COUNT do
+      begin
+        ext.FirstName := FormatUtf8('First%', [i]);
+        ext.LastName := FormatUtf8('Last%', [i mod 10]);
+        ext.YearOfBirth := 1800 + i mod 100;
+        ext.YearOfDeath := 1900 + i mod 100;
+        ext.Value := ValuesToVariantDynArray(['text', i]);
+        client.Client.BatchAdd(ext, true);
+      end;
+      CheckEqual(client.Client.BatchSend(ids), HTTP_SUCCESS);
+      CheckEqual(length(ids), COUNT);
+      CheckEqual(ids[0], 1);
+      CheckEqual(ids[COUNT - 1], COUNT);
+      CheckEqual(client.Orm.TableRowCount(TOrmPeopleExt), COUNT);
+      CheckEqual(client.Orm.TableMaxID(TOrmPeopleExt), COUNT);
+      // retrieve
+      for i := 1 to COUNT do
+        if i mod 97 = 0 then
+        begin
+          ext.ClearProperties;
+          Check(client.Orm.Retrieve(i, ext));
+          CheckEqual(ext.FirstName, FormatUtf8('First%', [i]));
+          CheckEqual(ext.YearOfBirth, 1800 + i mod 100);
+          CheckEqual(VariantDynArrayToJson(ext.Value),
+            FormatUtf8('["text",%]', [i]));
+        end;
+      // query
+      ext.FillPrepare(client.Orm, 'LastName=? and YearOfBirth=?', ['Last3', 1803]);
+      CheckEqual(ext.FillTable.RowCount, COUNT div 100); // i mod 100 = 3 -> mod 10 = 3
+      // update and delete
+      Check(client.Orm.Retrieve(10, ext));
+      ext.YearOfBirth := 1;
+      Check(client.Orm.Update(ext));
+      ext.ClearProperties;
+      Check(client.Orm.Retrieve(10, ext));
+      CheckEqual(ext.YearOfBirth, 1);
+      CheckEqual(ext.YearOfDeath, 1910);
+      Check(client.Orm.Delete(TOrmPeopleExt, 10));
+      Check(not client.Orm.Retrieve(10, ext));
+      CheckEqual(client.Orm.TableRowCount(TOrmPeopleExt), COUNT - 1);
+      // BLOB batch
+      client.Client.ForceBlobTransfertTable[TOrmOnlyBlob] := true;
+      client.Client.BatchStart(TOrmOnlyBlob);
+      for i := 1 to BLOB_COUNT do
+      begin
+        blob.Data := Int32ToUtf8(i);
+        client.Client.BatchAdd(blob, true, false, ALL_FIELDS); // include the BLOB
+      end;
+      CheckEqual(client.Client.BatchSend(ids), HTTP_SUCCESS);
+      CheckEqual(length(ids), BLOB_COUNT);
+      for i := 1 to BLOB_COUNT do
+        if i mod 7 = 0 then
+        begin
+          blob.ClearProperties;
+          Check(client.Orm.Retrieve(i, blob));
+          CheckEqual(GetInteger(pointer(blob.Data)), i);
+        end;
+    finally
+      blob.Free;
+      ext.Free;
+    end;
+  finally
+    client.Free;
+    props.Free;
+  end;
+end;
+
 {$ifdef OSWINDOWS}
 {$ifdef USEZEOS}
 
@@ -1110,6 +1239,8 @@ var
 const
   ADDR = '127.0.0.1:' + HTTP_DEFAULTPORT;
 begin
+  Run(BatchFromOtherThread, self, 'BatchFromOtherThread', true, false);
+  Run(ExternalDuckDB, self, 'External DuckDB', true, false);
   Props := TSqlDBSQLite3ConnectionProperties.Create('test.db3', '', '', '');
   try
     DoTest(Props, 'raw Props');
@@ -1190,7 +1321,7 @@ var
   begin
     with props.Execute(FormatUtf8('select count(*) from %', [table]), []) do
     begin
-      Check(Step, table);
+      CheckUtf8(Step, table);
       result := ColumnInt(0);
     end;
   end;
@@ -1316,10 +1447,56 @@ var
   model: TOrmModel;
   server: TRestServerFullMemory;
   props: TSqlDBConnectionProperties;
-  ext: TRestStorageExternalHook;
-  ndx: PtrInt;
-  th: TBatchOtherThreadUpdate;
-  i: integer;
+
+  procedure DoTests;
+  var
+    ext: TRestStorageExternalHook;
+    ndx: PtrInt;
+    th: TBatchOtherThreadUpdate;
+    rows: ISqlDBRows;
+    i: integer;
+  begin
+    OrmMapExternal(model, TOrmPeopleExt, props, 'BatchThread');
+    ext := TRestStorageExternalHook.Create(
+      TOrmPeopleExt, server.OrmInstance as TRestOrmServer);
+    try
+      ndx := model.GetTableIndexExisting(TOrmPeopleExt);
+      props.ExecuteNoResult(
+        'insert into BatchThread (ID,FirstName) values (?,?)', [10, 'before']);
+      th := nil;
+      Check(ext.InternalBatchStart(encPost, []), 'batch');
+      try
+        // the BATCH thread itself still appends its own rows
+        CheckEqual(ext.EngineAdd(ndx, '{"ID":20,"FirstName":"batch"}'), 20, 'add');
+        th := TBatchOtherThreadUpdate.Create(ext, ndx);
+        try
+          for i := 1 to 20 do
+            if th.Done then
+              break
+            else
+              SleepHiRes(10);
+          // the other thread waits for the storage lock, as a regular update
+          Check(not th.Done, 'other thread waits for the batch');
+        finally
+          ext.InternalBatchStop;
+        end;
+        th.WaitFor;
+        Check(th.Updated, 'update from other thread after the batch');
+      finally
+        th.Free;
+      end;
+      rows := props.Execute('select FirstName from BatchThread where ID=?', [10]);
+      Check(rows.Step, 'row 10');
+      CheckEqual(rows.ColumnUtf8(0), 'after', 'updated');
+      rows := props.Execute('select count(*) from BatchThread', []);
+      Check(rows.Step, 'count');
+      CheckEqual(rows.ColumnInt(0), 2, 'batch row');
+      rows := nil; // to avoid GPF when exiting this method
+    finally
+      ext.Free;
+    end;
+  end;
+
 begin
   // EngineAdd/Update/Delete/DeleteWhere did check fBatchMethod BEFORE the
   // storage lock: during a BATCH POST of one thread, a regular Update from
@@ -1332,48 +1509,8 @@ begin
       props := TSqlDBSQLite3ConnectionProperties.Create(
         'batchthread.db3', '', '', '');
       try
-        OrmMapExternal(model, TOrmPeopleExt, props, 'BatchThread');
-        ext := TRestStorageExternalHook.Create(
-          TOrmPeopleExt, server.OrmInstance as TRestOrmServer);
-        try
-          ndx := model.GetTableIndexExisting(TOrmPeopleExt);
-          props.ExecuteNoResult(
-            'insert into BatchThread (ID,FirstName) values (?,?)', [10, 'before']);
-          th := nil;
-          Check(ext.InternalBatchStart(encPost, []), 'batch');
-          try
-            // the BATCH thread itself still appends its own rows
-            CheckEqual(ext.EngineAdd(ndx, '{"ID":20,"FirstName":"batch"}'), 20, 'add');
-            th := TBatchOtherThreadUpdate.Create(ext, ndx);
-            try
-              for i := 1 to 20 do
-                if th.Done then
-                  break
-                else
-                  SleepHiRes(10);
-              // the other thread waits for the storage lock, as a regular update
-              Check(not th.Done, 'other thread waits for the batch');
-            finally
-              ext.InternalBatchStop;
-            end;
-            th.WaitFor;
-            Check(th.Updated, 'update from other thread after the batch');
-          finally
-            th.Free;
-          end;
-          with props.Execute('select FirstName from BatchThread where ID=?', [10]) do
-          begin
-            Check(Step, 'row 10');
-            CheckEqual(ColumnUtf8(0), 'after', 'updated');
-          end;
-          with props.Execute('select count(*) from BatchThread', []) do
-          begin
-            Check(Step, 'count');
-            CheckEqual(ColumnInt(0), 2, 'batch row');
-          end;
-        finally
-          ext.Free;
-        end;
+        // local sub-procedure to ensure all local interfaces are cleared
+        DoTests;
       finally
         props.Free;
         DeleteFile('batchthread.db3');

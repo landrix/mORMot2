@@ -22,6 +22,7 @@ uses
   mormot.crypt.other,
   mormot.crypt.openssl,
   mormot.crypt.secure,
+  mormot.crypt.factory,
   mormot.crypt.ecc256r1,
   mormot.core.perf,
   mormot.core.test,
@@ -34,7 +35,8 @@ uses
   mormot.crypt.ecc,
   mormot.crypt.rsa,
   mormot.crypt.x509,
-  mormot.crypt.win;
+  mormot.crypt.win,
+  mormot.misc.pecoff;
 
 type
   /// regression tests for mormot.crypt.core and mormot.crypt.jwt features
@@ -84,6 +86,8 @@ type
     procedure _RSA;
     /// X509 Certificates
     procedure _X509;
+    /// Authenticode signature of Windows executables
+    procedure _Authenticode;
     /// stream-oriented cryptography
     procedure Streams;
     /// Base64/Base58/Base32 encoding/decoding functions
@@ -3753,6 +3757,37 @@ var
   dig: TDigestAuthServerFile;
   users, pwds, users2: TRawUtf8DynArray;
   bak: RawByteString;
+
+  function ValueOf(const resp, name: RawUtf8): RawUtf8;
+  var
+    i, j: PtrInt;
+  begin
+    result := '';
+    i := PosEx(name, resp);
+    if i = 0 then
+      exit;
+    inc(i, length(name));
+    j := PosEx('"', resp, i);
+    if j > i then
+      result := copy(resp, i, j - i);
+  end;
+
+  procedure CheckVoidValue(const challenge, aRealm, aNonce: RawUtf8);
+  var
+    resp, expected: RawUtf8;
+  begin
+    CheckEqual(DigestRealm(challenge), aRealm, 'void realm');
+    resp := DigestClient(daMD5, challenge, 'POST', '/onvif/device_service',
+      'admin', 'pass');
+    CheckUtf8(resp <> '', 'void value in %', [challenge]);
+    CheckEqual(ValueOf(resp, ',nonce="'), aNonce, 'void nonce');
+    // RFC 7616 3.4.1 with qop=auth
+    expected := Md5(Join([Md5(Join(['admin:', aRealm, ':pass'])), ':', aNonce,
+      ':00000001:', ValueOf(resp, ',cnonce="'), ':auth:',
+      Md5('POST:/onvif/device_service')]));
+    CheckEqual(ValueOf(resp, ',response="'), expected, 'void response');
+  end;
+
 begin
   // validate raw client-server Digest access authentication
   Check(DigestServerInit(daUndefined, '', '', '', 0) = '');
@@ -3788,6 +3823,18 @@ begin
     end;
   end;
   Check(DigestServerInit(daUndefined, realm, '', '', opaque) = '');
+  // a parameter value may be void (RFC 9110 5.6.4 quoted-string), e.g. the
+  // opaque="" of the WWW-Authenticate header sent by some IP cameras - with
+  // their exact layout, but anonymized realm and nonce values
+  CheckVoidValue('realm="Login to 0123456789ABCDEF",qop="auth",' +
+    'nonce="A4C123B1612DD272D1371C17149D439536B3216FDAEEB975729FAE923D5A4FD", ' +
+    'opaque="", stale="false"', 'Login to 0123456789ABCDEF',
+    'A4C123B1612DD272D1371C17149D439536B3216FDAEEB975729FAE923D5A4FD');
+  CheckVoidValue('realm="Login to 0123456789abcdef0123456789abcdef",qop="auth", ' +
+    'algorithm="MD5", nonce="b252aWYtZGlnZXN0OjEyMzQ1Njc4OTAx", opaque="", ' +
+    'stale="false"', 'Login to 0123456789abcdef0123456789abcdef',
+    'b252aWYtZGlnZXN0OjEyMzQ1Njc4OTAx');
+  CheckVoidValue('realm="r",opaque="",nonce="n"', 'r', 'n');
   // validate TDigestAuthServerFile
   SetLength(users, 100);
   SetLength(pwds, length(users));
@@ -4153,7 +4200,7 @@ var
   n, s: RawByteString;
   timer: TPrecisionTimer;
 begin
-  Check(mormot.crypt.secure.Asym(asy.AlgoName) = asy);
+  Check(mormot.crypt.factory.Asym(asy.AlgoName) = asy);
   if (asy.KeyAlgo in CKA_RSA) and
      not fCatalogAllGenerate then
   begin
@@ -4739,7 +4786,7 @@ begin
   begin
     rnd := alg[a] as TCryptRandom;
     NotifyProgress([rnd.AlgoName]);
-    Check(mormot.crypt.secure.Rnd(rnd.AlgoName) = rnd);
+    Check(mormot.crypt.factory.Rnd(rnd.AlgoName) = rnd);
     timer.Start;
     cprev := 0;
     dprev := 0;
@@ -4777,7 +4824,7 @@ begin
   begin
     hsh := alg[a] as TCryptHasher;
     NotifyProgress([hsh.AlgoName]);
-    Check(mormot.crypt.secure.Hasher(hsh.AlgoName) = hsh);
+    Check(mormot.crypt.factory.Hasher(hsh.AlgoName) = hsh);
     h := hsh.Full(n);
     for i := 1 to length(n) do
     begin
@@ -4793,7 +4840,7 @@ begin
   begin
     sig := alg[a] as TCryptSigner;
     NotifyProgress([sig.AlgoName]);
-    Check(mormot.crypt.secure.Signer(sig.AlgoName) = sig);
+    Check(mormot.crypt.factory.Signer(sig.AlgoName) = sig);
     h := sig.Full('key', n);
     for i := 1 to length(n) do
     begin
@@ -4816,7 +4863,7 @@ begin
   begin
     cip := alg[a] as TCryptCipherAlgo;
     NotifyProgress([cip.AlgoName]);
-    Check(mormot.crypt.secure.CipherAlgo(cip.AlgoName) = cip);
+    Check(mormot.crypt.factory.CipherAlgo(cip.AlgoName) = cip);
     if cip.IsAead then
       aead := cip.AlgoName
     else
@@ -6111,6 +6158,74 @@ procedure TTestCoreCrypto._X509;
     CheckEqual(y.AsDNText, s);
   end;
 
+  procedure CheckPkcs8;
+  const
+    // openssl ecparam -name prime256v1 -genkey | openssl pkcs8 -topk8 -nocrypt
+    PLAIN =
+      '-----BEGIN PRIVATE KEY-----'#13#10 +
+      'MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgL+IJzqADgkK/dKJQ'#13#10 +
+      '0BhnJXk3NLjzl1bGFdHTGoKvc8ahRANCAAQMuf8uzGKxan691Ya9r1r0lR6MHQ4A'#13#10 +
+      '5CeNET6n6mDpQy/az73fpul5azOdTZm8GRftdpys1ILLzdSkewAvnXC+'#13#10 +
+      '-----END PRIVATE KEY-----'#13#10;
+    // openssl pkcs8 -topk8 -v2 aes256 -passout pass:mORMot
+    // i.e. PBES2 + PBKDF2 hmacWithSHA256 2048 rounds + aes-256-cbc
+    AES256 =
+      '-----BEGIN ENCRYPTED PRIVATE KEY-----'#13#10 +
+      'MIHsMFcGCSqGSIb3DQEFDTBKMCkGCSqGSIb3DQEFDDAcBAgDOk7oWWdhRQICCAAw'#13#10 +
+      'DAYIKoZIhvcNAgkFADAdBglghkgBZQMEASoEEKWNbINuOw7sxZWVHakCRn8EgZDJ'#13#10 +
+      'Qrg3osAb7FtbJOcHlZ6DZ2hPm7FqCqybDmeMaiCwr7PEA7EUfUMrozMohx7jgG/B'#13#10 +
+      'G+QOw62Y15qpuASAfKj8Eisnra8sOPMxDz7btpi6p9KQHhMa/7s1ei//ucfrPBCT'#13#10 +
+      'YSqb1a4I/Mqy5GpBJxaYLYlC0gDguzBlek6Yf6ZkdjGCCK0vjvaMsdMScGmTdag='#13#10 +
+      '-----END ENCRYPTED PRIVATE KEY-----'#13#10;
+    // openssl pkcs8 -topk8 -v2 aes128 -v2prf hmacWithSHA1 -iter 1000
+    // i.e. PBES2 + PBKDF2 with default prf (SHA-1) + aes-128-cbc
+    AES128 =
+      '-----BEGIN ENCRYPTED PRIVATE KEY-----'#13#10 +
+      'MIHeMEkGCSqGSIb3DQEFDTA8MBsGCSqGSIb3DQEFDDAOBAiGl/GZEHIuugICA+gw'#13#10 +
+      'HQYJYIZIAWUDBAECBBDhzRcd2uZZA5KywGKgrr/YBIGQp5ZNuWRl+kCnVmXvyPBI'#13#10 +
+      'gWVewTFkGXh1I04bnqU5XHvJgpsGcy+60J6uIUoIJqmOn7ORZiNJV78pCRCgaTfd'#13#10 +
+      'j2YsW3ms9hZAz9uA2bLEDPi7XpjE+pI0tXXxEPLn6QAe6stFsl7NUcgM/DnEfx5/'#13#10 +
+      '0+jKs6Rir7wavUFYDQQ01GkDIZKP3cJrfQusuXml9vDo'#13#10 +
+      '-----END ENCRYPTED PRIVATE KEY-----'#13#10;
+  var
+    der8, dec: RawByteString;
+    k1, k2: ICryptPrivateKey;
+  begin
+    der8 := PemToDer(PLAIN);
+    Check(der8 <> '', 'plain');
+    Check(IsPemEncrypted(AES256), 'enc');
+    dec := Pkcs8DecryptPrivateKey(AES256, 'mORMot');
+    CheckEqual(dec, der8, 'aes256');
+    dec := Pkcs8DecryptPrivateKey(PemToDer(AES256), 'mORMot');
+    CheckEqual(dec, der8, 'aes256der');
+    dec := Pkcs8DecryptPrivateKey(AES128, 'mORMot');
+    CheckEqual(dec, der8, 'aes128');
+    CheckEqual(Pkcs8DecryptPrivateKey(AES256, 'mormot'), '', 'wrongpwd');
+    CheckEqual(Pkcs8DecryptPrivateKey(AES128, ''), '', 'nopwd');
+    CheckEqual(Pkcs8DecryptPrivateKey(PLAIN, 'mORMot'), '', 'notenc');
+    // TCryptPrivateKey.Load should now support OpenSSL encrypted keys
+    k1 := TCryptPrivateKeyEcc.Create;
+    Check(k1.Load(ckaEcc256, nil, AES256, 'mORMot'), 'load256');
+    k2 := TCryptPrivateKeyEcc.Create;
+    Check(k2.Load(ckaEcc256, nil, PLAIN, ''), 'loadplain');
+    CheckEqual(k1.ToDer, k2.ToDer, 'toder');
+    k1 := TCryptPrivateKeyEcc.Create;
+    Check(not k1.Load(ckaEcc256, nil, AES128, 'wrong'), 'loadwrong');
+    // PKCS#8 encryption round-trip
+    dec := Pkcs8EncryptPrivateKey(der8, 'mORMot', 1000);
+    Check(dec <> '', 'encrypt');
+    CheckEqual(Pkcs8DecryptPrivateKey(dec, 'mORMot'), der8, 'roundtrip');
+    CheckEqual(Pkcs8DecryptPrivateKey(dec, 'mormot'), '', 'roundtripwrong');
+    CheckEqual(Pkcs8EncryptPrivateKey(der8, ''), '', 'encnopwd');
+    // TCryptPrivateKey.Save should now generate standard PKCS#8 by default
+    Check(PrivateKeySavePkcs8, 'savepkcs8');
+    dec := k2.Save({aspem=}true, 'mORMot');
+    Check(IdemPChar(pointer(dec), '-----BEGIN ENCRYPTED PRIVATE KEY-----'), 'pem');
+    k1 := TCryptPrivateKeyEcc.Create;
+    Check(k1.Load(ckaEcc256, nil, dec, 'mORMot'), 'reload');
+    CheckEqual(k1.ToDer, k2.ToDer, 'resave');
+  end;
+
 var
   bin, der: RawByteString;
   pem, sav, sn: RawUtf8;
@@ -6130,6 +6245,8 @@ var
   utc: TDateTime;
   timer: TPrecisionTimer;
 begin
+  // validate standard PKCS#8 encrypted private keys
+  CheckPkcs8;
   // validate XName 500 normalization and escaping
   Check(TextToXa('') = xaNone);
   for a1 := succ(low(a1)) to high(a1) do
@@ -6670,6 +6787,57 @@ begin
   Check(st.IsRevoked(chain[1]) = crrNotRevoked);
   Check(st.IsRevoked(chain[2]) = crrServerCompromised);
 end;
+
+procedure TTestCoreCrypto._Authenticode;
+var
+  fn: TFileName;
+  {$ifdef OSWINDOWS}
+  wvs: TWinVerifyStatus;
+  exe: TFileName;
+  sig, bin: RawByteString;
+  {$endif OSWINDOWS}
+begin
+  // cross-platform PE certificate table parsing
+  fn := WorkDir + 'authenticode.dll';
+  Check(FileFromString('this is not a PE executable', fn));
+  try
+    CheckEqual(GetExeSignature(fn), '', 'not PE');
+    Check(not IsExeSigned(fn), 'not PE');
+    Check(not IsExeSigned(fn + '.missing'), 'missing');
+    {$ifdef OSWINDOWS}
+    // genuine verification via WinVerifyTrust()
+    Check(WinVerifyExeSignature('') = wvsError, 'empty');
+    Check(WinVerifyExeSignature(fn + '.missing') = wvsError, 'missing');
+    Check(WinVerifyExeSignature(fn) <> wvsValid, 'not PE');
+    // kernel32.dll is likely to have an embedded signature (i.e. not from a
+    // catalog), in the PE32 or PE32+ format matching the current bitness
+    exe := GetEnvironmentVariable('SystemRoot') + '\System32\kernel32.dll';
+    wvs := WinVerifyExeSignature(exe);
+    if wvs <> wvsValid then
+      AddConsole('% returned % - skipped', [exe, ToText(wvs)^])
+    else
+    begin
+      sig := GetExeSignature(exe);
+      Check((sig <> '') and
+            (sig[1] = #$30), 'kernel32 PKCS#7'); // DER ASN.1 SEQUENCE
+      Check(IsExeSigned(exe), 'kernel32 IsExeSigned');
+      Check(IsExeSignatureValid(exe), 'kernel32 IsExeSignatureValid');
+      // tampered content is detected, even if the signature itself is intact
+      bin := StringFromFile(exe);
+      if not CheckUtf8(bin <> '', '% load', [exe]) then
+        exit;
+      PByteArray(bin)[length(bin) shr 2] := PByteArray(bin)[length(bin) shr 2] xor $ff;
+      Check(FileFromString(bin, fn), 'fn');
+      CheckEqual(GetExeSignature(fn), sig, 'tampered GetExeSignature');
+      Check(WinVerifyExeSignature(fn) = wvsBadDigest, 'tampered WinVerifyExeSignature');
+      Check(not IsExeSignatureValid(fn), 'tampered IsExeSignatureValid');
+    end;
+    {$endif OSWINDOWS}
+  finally
+    DeleteFile(fn);
+  end;
+end;
+
 (*
 var
   i, v, v2, n, c, d: PtrInt;

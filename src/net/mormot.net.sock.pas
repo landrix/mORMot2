@@ -382,6 +382,19 @@ type
     function RecvFrom(Buf: pointer; len: integer; out addr: TNetAddr): integer; overload;
     /// low-level UDP receiving from an address of some data into a RawByteString
     function RecvFrom(out addr: TNetAddr): RawByteString; overload;
+    /// enable UDP packet information for RecvFromIf()
+    // - supported on Linux, macOS and NetBSD; nrNotImplemented elsewhere
+    function SetPacketInfo(enable: boolean): TNetResult;
+    /// low-level UDP receiving of some data, with its receiving interface
+    // - ifindex is the TMacAddress.IfIndex of the network interface which
+    // received this frame, or 0 if unknown, e.g. with no SetPacketInfo(true)
+    function RecvFromIf(Buf: pointer; len: integer; out addr: TNetAddr;
+      out ifindex: integer): integer;
+    /// low-level UDP sending of some data through a given network interface
+    // - e.g. a 255.255.255.255 broadcast follows the default route otherwise
+    // - ifindex = 0 just calls SendTo(), i.e. let the routing table decide
+    function SendToIf(Buf: pointer; len: integer; const addr: TNetAddr;
+      ifindex: integer): TNetResult;
     /// wait for the socket to a given set of receiving/sending state
     // - using poll() on POSIX (as required), and select() on Windows
     // - ms < 0 means an infinite timeout (blocking until events happen)
@@ -1064,9 +1077,14 @@ type
     /// input: opaque pointer containing a certificate to be used
     // - on OpenSSL client or server, calls SSL_CTX_use_certificate() API
     // expecting the pointer to be of PX509 type
-    // - on SChannel server, expects a PCCERT_CONTEXT with an accessible
-    // CAPI/CNG private key; AfterBind duplicates the certificate context
-    // - not used on SChannel client
+    // - on SChannel client or server, expects a PCCERT_CONTEXT with an
+    // accessible CAPI/CNG private key, e.g. ICryptCertCng.WinContext
+    // - Schannel duplicates the context reference during AfterConnection or
+    // AfterBind; the caller retains ownership of this borrowed input and
+    // must keep it valid until the respective call returns - especially
+    // if an ICryptCertCng owns a temporary persisted PFX key (created by
+    // LoadPkcs12(ForSchannel=true)), keep that interface alive for the entire
+    // TLS session: a duplicated certificate context does not own its key file
     CertificateRaw: pointer;
     /// input: PEM file name containing a private key to be loaded
     // - (Delphi) warning: encoded as UTF-8 not UnicodeString/TFileName
@@ -3779,6 +3797,35 @@ begin
     len := 0; // return '' on error
   FastSetRawByteString(result, @tmp, len);
 end;
+
+{$ifndef HAS_IP_PKTINFO}
+// - Windows UDP socket bound to a particular local IPv4 receives broadcasts
+// - see mormot.net.sock.posix.inc for the Linux version
+// - macOS and NetBSD can easily follow the IP_PKTINFO socket option
+// - FreeBSD has a specific IP_ONESBCAST option and OpenBSD seems out of reach
+
+function TNetSocketWrap.SetPacketInfo(enable: boolean): TNetResult;
+begin
+  result := nrNotImplemented;
+end;
+
+function TNetSocketWrap.RecvFromIf(Buf: pointer; len: integer;
+  out addr: TNetAddr; out ifindex: integer): integer;
+begin
+  ifindex := 0; // unknown
+  result := RecvFrom(Buf, len, addr);
+end;
+
+function TNetSocketWrap.SendToIf(Buf: pointer; len: integer;
+  const addr: TNetAddr; ifindex: integer): TNetResult;
+begin
+  if ifindex = 0 then
+    result := SendTo(Buf, len, addr)
+  else
+    result := nrNotImplemented;
+end;
+
+{$endif HAS_IP_PKTINFO}
 
 function TNetSocketWrap.RecvPending(out pending: integer): TNetResult;
 begin
